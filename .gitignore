@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+envs/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large artifacts (stored separately at /mnt/d/condiag-artifacts/)
+workspaces/
+*.docx
+*.pdf
+
+# Secrets / env
+.env
+*.key
+
+# Temporary scripts (not part of ConDiag core)
+scripts_tmp/
+
+# Docker images / caches
+*.tar
+*.tar.gz
+
+# External repos / submodules
+ContextBench/
+
+# Jupyter
+.ipynb_checkpoints/

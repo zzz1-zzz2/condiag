@@ -1,0 +1,40 @@
+flowchart LR
+    classDef host fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px,color:#0d47a1
+    classDef condiag fill:#fef7e0,stroke:#f9ab00,stroke-width:3px,color:#b06000
+    classDef artifact fill:#e6f4ea,stroke:#137333,stroke-width:1px,color:#0d652d
+    classDef external fill:#f3e8fd,stroke:#9334e6,stroke-width:1px,color:#5e1a8e
+
+    subgraph HA["Host Agent Pipeline"]
+        direction TB
+        Issue["Issue / Task"]:::external
+        A1["Attempt 1\n(explore + edit + test)"]:::host
+        FT["Failure Trajectory\n.traj.json"]:::artifact
+        Patch1["Candidate Patch"]:::artifact
+        Test1["Local Test Log"]:::artifact
+
+        Issue --> A1
+        A1 --> FT
+        A1 --> Patch1
+        A1 --> Test1
+    end
+
+    subgraph CD["ConDiag Middleware (failure-triggered)"]
+        direction TB
+        Trigger["Trigger Layer\n(hard fail / validation fail / shape anomaly)"]:::condiag
+        Diag["Pathology Diagnoser\n(7-class taxonomy → 5R action)"]:::condiag
+        Exec["Retrieval / Guard Executor\n(repo@base_commit, runtime-visible only)"]:::condiag
+        CP["ContextPacket\n(structured evidence + retry intent)"]:::artifact
+
+        Trigger --> Diag --> Exec --> CP
+    end
+
+    A2["Attempt 2\n(retry with ContextPacket)"]:::host
+    Result["Final Patch\n+ Process Metrics"]:::artifact
+
+    FT --> Trigger
+    Patch1 --> Trigger
+    Test1 --> Trigger
+    CP --> A2
+    A2 --> Result
+
+    class A2,Result host

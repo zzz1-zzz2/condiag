@@ -1,0 +1,52 @@
+flowchart LR
+    classDef data fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px,color:#0d47a1
+    classDef step fill:#fef7e0,stroke:#f9ab00,stroke-width:2px,color:#b06000
+    classDef eval fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#0d652d
+    classDef out fill:#f3e8fd,stroke:#9334e6,stroke-width:1px,color:#5e1a8e
+    classDef isolate fill:#fce8e6,stroke:#c5221f,stroke-width:1px,color:#a50e0e,stroke-dasharray:5
+
+    subgraph STAGE1["Stage 1: Agent Trajectory"]
+        direction TB
+        IMG["50 Docker images<br/>(sweb.eval.x86_64.*_1776_*)"]:::data
+        AGENT["mini-SWE-agent × 50<br/>(DeepSeek V4 Pro, step_limit=250)"]:::step
+        TRAJ["raw_trajectory.json × 50"]:::data
+
+        IMG --> AGENT --> TRAJ
+    end
+
+    subgraph STAGE2["Stage 2: Case Bundle"]
+        direction TB
+        BCB["build_case_bundle<br/>(parser: runtime-visible only)"]:::step
+        CB["case_bundle/<instance>/ × 50<br/>{runtime_signals, patch.diff,<br/>local_test_outputs, final_patch_context,<br/>build_report}"]:::data
+
+        TRAJ --> BCB --> CB
+    end
+
+    subgraph STAGE3["Stage 3: ContextBench Eval (offline)"]
+        direction TB
+        EVAL["ContextBench evaluate<br/>(gold_context reference,<br/>NOT fed to runtime)"]:::eval
+        METRICS["contextbench_metrics.json × 50<br/>{file/block/line F1,<br/>EditLoc recall,<br/>Evidence Drop,<br/>AUC + redundancy}"]:::out
+
+        CB --> EVAL --> METRICS
+    end
+
+    subgraph STAGE4["Stage 4: ConDiag Triage"]
+        direction TB
+        TRI["ConDiag auto triage<br/>(trigger + 5R scorer + miner,<br/>runtime_signals only)"]:::step
+        MATRIX["pilot50_triage_matrix.csv<br/>{predicted_pathology, predicted_5R,<br/>confidence, notes}"]:::out
+
+        CB --> TRI --> MATRIX
+    end
+
+    subgraph STAGE5["Stage 5: Manual + Agent-Retry"]
+        direction TB
+        MANUAL["Manual diagnosis on<br/>top 6-10 high-value cases<br/>(write manual_diagnosis.json)"]:::step
+        RETRY["Agent-Retry v0<br/>(mini-SWE + ContextPacket,<br/>10 selected cases)"]:::step
+        RES["resolved_rate / regression_rate<br/>token_cost / repair_iterations"]:::out
+
+        MATRIX --> MANUAL --> RETRY --> RES
+    end
+
+    LK1["LEAKAGE GUARD<br/>runtime_inputs ∩ gold_check = ∅"]:::isolate
+    LK1 -.-> STAGE4
+    LK1 -.->|"gold only in stage 3"| STAGE3

@@ -1,0 +1,53 @@
+flowchart LR
+    classDef seed fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#0d652d
+    classDef flow fill:#fef7e0,stroke:#f9ab00,stroke-width:2px,color:#b06000
+    classDef out fill:#f3e8fd,stroke:#9334e6,stroke-width:1px,color:#5e1a8e
+    classDef noop fill:#eceff1,stroke:#546e7a,stroke-width:2px,color:#263238
+
+    subgraph F1["Flow 1: RECONCILE"]
+        direction TB
+        S1["seed: sympy-16597<br/>REGRESSION_AFTER_PARTIAL_FIX"]:::seed
+        P1["retrieval_plan:<br/>5 actions<br/>(FIND_CALLERS + RECONCILE_*_CONSTRAINTS)"]:::flow
+        O1["7 outputs<br/>5 selected / 5 sections"]:::out
+        S1 --> P1 --> O1
+    end
+
+    subgraph F2["Flow 2: RESTRAIN"]
+        direction TB
+        S2["seed: sympy-13877<br/>OVER_EXPLORE_OVER_EDIT"]:::seed
+        P2["scope_guard:<br/>17 changed_files / 4 patterns<br/>1 supported + 3 weak + 13 unsupported"]:::flow
+        O2["8 outputs<br/>strong over-edit / 5 sections"]:::out
+        S2 --> P2 --> O2
+    end
+
+    subgraph F3["Flow 3: REHYDRATE"]
+        direction TB
+        S3["seed: astropy-13398<br/>EXPLORE_OK_EDIT_MISALIGNED"]:::seed
+        P3["retrieval_executor:<br/>4 actions<br/>(FIND_PARALLEL_IMPLEMENTATIONS<br/>+ FIND_IMPORTS + FIND_CALLERS)"]:::flow
+        O3["7 outputs<br/>8 selected / 5 sections"]:::out
+        S3 --> P3 --> O3
+    end
+
+    subgraph F4["Flow 4: RETRIEVE"]
+        direction TB
+        S4["seed: django-11400<br/>UNDER_EDIT_PARTIAL_FIX"]:::seed
+        P4["retrieval_executor:<br/>4 actions<br/>(sibling-class detector:<br/>FieldListFilter + BooleanFieldListFilter)"]:::flow
+        O4["7 outputs<br/>6 selected / 5 sections<br/>(low-confidence tone)"]:::out
+        S4 --> P4 --> O4
+    end
+
+    subgraph F5["Flow 5: NOOP (baseline)"]
+        direction TB
+        S5["seed: django-13195<br/>LIKELY_CORRECT_NOOP"]:::seed
+        P5["dispatch = noop<br/>(skip retrieval / guard)"]:::noop
+        O5["2 outputs only<br/>(context_packet.md + recovery_report.json)"]:::out
+        S5 --> P5 --> O5
+    end
+
+    REG["seed_regression.py<br/>5/5 PASS<br/>byte-identical to .locked_v0"]:::seed
+
+    F1 -.-> REG
+    F2 -.-> REG
+    F3 -.-> REG
+    F4 -.-> REG
+    F5 -.-> REG

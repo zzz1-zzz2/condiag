@@ -1,0 +1,80 @@
+flowchart TB
+    classDef core fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px,color:#0d47a1
+    classDef diag fill:#fef7e0,stroke:#f9ab00,stroke-width:2px,color:#b06000
+    classDef retr fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#0d652d
+    classDef guard fill:#fce8e6,stroke:#c5221f,stroke-width:2px,color:#a50e0e
+    classDef report fill:#f3e8fd,stroke:#9334e6,stroke-width:2px,color:#5e1a8e
+    classDef io fill:#eceff1,stroke:#546e7a,stroke-width:1px,color:#263238
+
+    subgraph IN["Inputs (read-only)"]
+        CB["case_bundle/<br/>runtime_signals.json"]:::io
+        MD["manual_diagnosis.json<br/>(seed)"]:::io
+        REPO["repo@base_commit"]:::io
+    end
+
+    subgraph CORE["Core / Schema"]
+        SCH["schemas.py"]:::core
+        LD["loader.py"]:::core
+        LK["leakage_guard.py<br/>(runtime vs gold_check isolation)"]:::core
+    end
+
+    subgraph DG["Trigger & Diagnose"]
+        TR["trigger.py<br/>(3-layer: hard / validation / shape)"]:::diag
+        SG["scope_guard.py<br/>(5 signals × 1pt)"]:::diag
+        DN["diagnosis_normalizer.py"]:::diag
+        AP["action_planner.py"]:::diag
+    end
+
+    subgraph RT["Retrieval Flow (RECONCILE / REHYDRATE / RETRIEVE / RELOCALIZE)"]
+        RR["repo_resolver.py"]:::retr
+        RI["repository_index.py<br/>(file + symbol + rg)"]:::retr
+        RE["retrieval_executor.py<br/>(8 ops + sibling-class detector)"]:::retr
+        ES["evidence_selector.py<br/>(budget + dedup + relations)"]:::retr
+        MR["manual_retrieval.py<br/>(10-stage orchestrator)"]:::retr
+    end
+
+    subgraph GR["Guard Flow (RESTRAIN)"]
+        PSA["patch_scope_analyzer.py"]:::guard
+        ESC["edit_support_checker.py<br/>(5 positive + pattern_only anti)"]:::guard
+        SGE["scope_guard_executor.py<br/>(4 control actions)"]:::guard
+        PPS["patch_prune_suggester.py"]:::guard
+        MG["manual_guard.py<br/>(10-stage orchestrator)"]:::guard
+    end
+
+    subgraph OUT["Output / Reporting"]
+        CPB["context_packet_builder.py<br/>(RECONCILE / RETRIEVE / REHYDRATE / RESTRAIN templates)"]:::report
+        RP["report.py"]:::report
+        CLI["cli.py<br/>(5 subcommands)"]:::report
+        SR["seed_regression.py<br/>(4-flow + NOOP diff .locked_v0)"]:::report
+    end
+
+    CB --> LD
+    MD --> LD
+    LD --> TR
+    TR --> SG
+    SG --> DN
+    DN --> AP
+    AP -->|"action_family=retrieval"| MR
+    AP -->|"action_family=guard"| MG
+    AP -->|"action_family=noop/abstain"| CPB
+
+    MR --> RR --> RI
+    MR --> RE
+    MR --> ES
+    RE <--> RI
+    ES --> CPB
+
+    MG --> PSA
+    PSA --> ESC
+    ESC --> SGE
+    SGE --> PPS
+    PPS --> CPB
+
+    CPB --> RP
+    CLI --> MR
+    CLI --> MG
+    CLI --> SR
+
+    LK -.->|"enforces"| TR
+    LK -.->|"enforces"| MR
+    LK -.->|"enforces"| MG

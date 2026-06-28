@@ -1,0 +1,32 @@
+flowchart TB
+    classDef noop fill:#eceff1,stroke:#546e7a,stroke-width:2px,color:#263238
+    classDef r5 fill:#fef7e0,stroke:#f9ab00,stroke-width:2px,color:#b06000
+    classDef seed fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#0d652d
+    classDef pending fill:#fce8e6,stroke:#c5221f,stroke-width:1px,color:#a50e0e
+
+    Trigger["Trajectory + Patch + Test Log"]:::external
+
+    Trigger --> Triage{"Pathology Triage"}
+
+    Triage -->|"no failure signal\nno shape anomaly"| P0["LIKELY_CORRECT_NOOP"]:::noop
+    Triage -->|"wrong file/symbol edited"| P1["MISS_CONTEXT_OR_\nWRONG_LOCALIZATION"]:::pending
+    Triage -->|"edited file viewed\nbut spans dropped"| P2["EXPLORE_OK_\nEDIT_MISALIGNED"]:::seed
+    Triage -->|"parallel impls / siblings\nnot audited"| P3["UNDER_EDIT_\nPARTIAL_FIX"]:::seed
+    Triage -->|"many files, pattern repeated,\nno test runs"| P4["OVER_EXPLORE_\nOVER_EDIT"]:::seed
+    Triage -->|"target fixed but\nregressions appear"| P5["REGRESSION_AFTER_\nPARTIAL_FIX"]:::seed
+    Triage -->|"runtime signals\ninsufficient"| P6["INSUFFICIENT_\nRUNTIME_EVIDENCE"]:::noop
+
+    P0 -->|"abstain"| R0["NO-OP GATE\n(do not trigger)"]:::noop
+    P1 -->|"+ Retrieve"| R1["RELOCALIZE\n+ Rerank locations"]:::r5
+    P2 -->|"Rehydrate"| R2["REHYDRATE_SEEN_EVIDENCE\n+ Find Imports / Callers"]:::r5
+    P3 -->|"Retrieve"| R3["FIND_PARALLEL_IMPLEMENTATIONS\n+ Neighbor tests"]:::r5
+    P4 -->|"Restrain"| R4["SCOPE_CONSTRAIN\n+ Patch Prune"]:::r5
+    P5 -->|"Reconcile"| R5["RECONCILE_TARGET_FIX\n+ Regression Constraints"]:::r5
+    P6 -->|"abstain"| R6["ABSTAIN\n(do not force-classify)"]:::noop
+
+    P0 -.->|"seed: django-13195"| seed0["5/5 PASS"]:::seed
+    P2 -.->|"seed: astropy-13398"| seed2["5/5 PASS"]:::seed
+    P3 -.->|"seed: django-11400"| seed3["5/5 PASS"]:::seed
+    P4 -.->|"seed: sympy-13877"| seed4["5/5 PASS"]:::seed
+    P5 -.->|"seed: sympy-16597"| seed5["5/5 PASS"]:::seed
+    P1 -.->|"seed: TBD (Pilot50 target)"| seed1["awaiting"]:::pending
