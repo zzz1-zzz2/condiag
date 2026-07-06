@@ -850,6 +850,21 @@ def handle_condiag_packet_only(
     repo_path = Path(repo_base_str) if repo_base_str and Path(repo_base_str).is_dir() else None
     base_commit = config.get("base_commit") or manifest_row.get("base_commit") or ""
 
+    # Fallback: derive repo_path from workspaces/ when manifest lacks it
+    if not repo_path:
+        ws = Path.home() / "condiag" / "workspaces" / instance_id / "repo_base"
+        if ws.is_dir():
+            repo_path = ws
+            if not base_commit:
+                # Try to read base_commit from SWE-bench metadata
+                try:
+                    from .manifest_builder import get_base_commit
+                    bc = get_base_commit(instance_id)
+                    if bc:
+                        base_commit = bc
+                except Exception:
+                    pass
+
     # Issue statement: prefer explicit config, then SWE-bench Verified lookup.
     # Mined for target_hints so REHYDRATE / FIND_NEIGHBOR_TESTS can match span
     # content against concept keywords (D4-7.1).
@@ -1061,12 +1076,123 @@ def _classify_condiag_packet_mode(
     return "condiag_diagnostic_only_no_actions"
 
 
+
+def handle_plain_rerun(
+    run_dir: Path,
+    instance_id: str,
+    mode: str,
+    adapter,
+    config: dict,
+) -> dict:
+    """Plain rerun: original issue only, no context, no feedback.
+
+    This is NOT a retry triggered by failure signals.  It is an
+    experimental-design baseline that re-runs the same Host Agent on the
+    same clean base with the same original issue, to measure the
+    second-chance / sampling effect.
+
+    Produces:
+      - intervention/intervention_report.json
+      - NO context_packet.md
+      - NO retry_trigger_result.json
+      - NO attempt_2 execution (handled by host_agent_retry_runner)
+    """
+    if mode == "dry-run":
+        return {
+            "handled": False,
+            "reason": "dry_run_skeleton_only",
+            "mode": mode,
+            "instance_id": instance_id,
+        }
+
+    run_dir = Path(run_dir)
+    attempt_1 = run_dir / "attempt_1"
+    intervention = run_dir / "intervention"
+    final = run_dir / "final"
+    attempt_1.mkdir(parents=True, exist_ok=True)
+    intervention.mkdir(parents=True, exist_ok=True)
+    final.mkdir(parents=True, exist_ok=True)
+
+    # Copy attempt_1 artifacts from base_miniswe
+    base_run_root = Path(config.get("base_run_root") or run_dir.parent.parent.parent)
+    base_attempt_1 = base_run_root / "miniswe" / "base_miniswe" / instance_id / "attempt_1"
+    if base_attempt_1.is_dir():
+        for src in base_attempt_1.iterdir():
+            if src.is_file():
+                import shutil
+                shutil.copyfile(src, attempt_1 / src.name)
+
+    # Minimal intervention_report
+    intervention_report = {
+        "schema_version": "condiag.intervention_report.v0",
+        "instance_id": instance_id,
+        "agent": adapter.name if hasattr(adapter, "name") else "miniswe",
+        "baseline": "plain_rerun",
+        "mode": "host_agent_retry",
+        "rerun_policy": "always_rerun_for_first_failed_pool",
+        "should_retry": True,
+        "should_retry_source": "experimental_design",
+        "trigger_type": "PLAIN_RERUN",
+        "packet_source": "none",
+        "failure_witness_used": False,
+        "context_packet_used": False,
+        "api_navigation_used": False,
+        "has_context_packet": False,
+        "context_packet_path": None,
+        "context_packet_kind": None,
+        "created_at": _now_iso(),
+    }
+    (intervention / "intervention_report.json").write_text(
+        json.dumps(intervention_report, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    # final = attempt_1
+    for sub in ["patch.diff", "runtime_signals.json"]:
+        src = attempt_1 / sub
+        if src.is_file():
+            import shutil
+            shutil.copyfile(src, final / sub)
+
+    final_report = {
+        "schema_version": "condiag.final_report.v0",
+        "instance_id": instance_id,
+        "agent": adapter.name if hasattr(adapter, "name") else "miniswe",
+        "baseline": "plain_rerun",
+        "mode": "host_agent_retry",
+        "selected_attempt": 1,
+        "selected_attempt_dir": "attempt_1",
+        "selection_reason": (
+            "plain_rerun: intervention artifacts generated; "
+            "attempt_2 execution delegated to host_agent_retry_runner"
+        ),
+        "has_final_patch": (final / "patch.diff").is_file() and (final / "patch.diff").stat().st_size > 0,
+        "finalized_at": _now_iso(),
+    }
+    (final / "final_report.json").write_text(
+        json.dumps(final_report, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    return {
+        "handled": True,
+        "reason": "plain_rerun_artifacts_generated",
+        "mode": mode,
+        "instance_id": instance_id,
+        "should_retry": True,
+        "should_retry_source": "experimental_design",
+        "packet_source": "none",
+        "attempt_1_status": "completed",
+        "attempt_2_status": "pending_host_agent_retry_runner",
+        "final_source": "attempt_1",
+    }
+
+
 BASELINE_HANDLERS: dict[str, HandlerFn] = {
     "base_miniswe": handle_base_miniswe,
     "feedback_retry": handle_feedback_retry,
     "broad_expansion": handle_broad_expansion,
     "condiag_packet_only": handle_condiag_packet_only,
     "condiag_retry": handle_condiag_retry,
+    "plain_rerun": handle_plain_rerun,
 }
 
 

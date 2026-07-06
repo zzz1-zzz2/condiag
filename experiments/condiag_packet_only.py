@@ -111,7 +111,7 @@ TRIGGER_TO_PATHOLOGY = {
 def _build_retrieval_plan(trigger_type: str, rs: cschemas.RuntimeSignals) -> list[dict]:
     """Default retrieval_plan per trigger_type.
 
-    Conservative v0: 2-3 ops that are safe to attempt when repo is available.
+    Conservative v0: 2-4 ops that are safe to attempt when repo is available.
     Each op falls back gracefully if its required input is missing.
     """
     if trigger_type == "NO_TRIGGER":
@@ -134,6 +134,13 @@ def _build_retrieval_plan(trigger_type: str, rs: cschemas.RuntimeSignals) -> lis
             "operation": "FIND_NEIGHBOR_TESTS",
             "target": "tests adjacent to edited files",
             "budget": 2,
+        })
+    # Always try symbol definition lookup when edited/viewed files exist
+    if rs.edited_files or rs.viewed_files_in_order:
+        plan.append({
+            "operation": "FIND_SYMBOL_DEFINITION",
+            "target": "key symbols from issue text and viewed files",
+            "budget": 3,
         })
     return plan
 
@@ -261,6 +268,11 @@ def _auto_target_hints(rs: cschemas.RuntimeSignals, issue: str = "") -> list[dic
     if issue:
         for tok in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", issue):
             add(tok, "concept")
+        # Also extract CamelCase/dotted names as symbol-kind hints (e.g. DeconstructableSerializer, _serialize_path)
+        for sym in re.findall(r"\b[A-Z][a-zA-Z0-9]+(?:[A-Z][a-z]+)+\b", issue):
+            add(sym, "symbol")
+        for dotted in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]+(?:\.[A-Za-z_][A-Za-z0-9_]+)+\b", issue):
+            add(dotted, "symbol")
 
     # 3. visible test names from test_failures (kind=test)
     for entry in (rs.test_failures or []):

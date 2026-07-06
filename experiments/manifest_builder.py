@@ -103,6 +103,14 @@ def get_problem_statement(instance_id: str) -> str:
     return (_load_swe_bench_verified().get(instance_id) or {}).get("problem_statement", "")
 
 
+def get_base_commit(instance_id: str) -> str:
+    """Look up the SWE-bench Verified base_commit for an instance.
+
+    Returns "" if instance_id is unknown or the arrow file is unavailable.
+    """
+    return (_load_swe_bench_verified().get(instance_id) or {}).get("base_commit", "")
+
+
 def get_gold_patch(instance_id: str) -> str:
     """Look up the SWE-bench Verified gold patch for an instance.
 
