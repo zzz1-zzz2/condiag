@@ -12,6 +12,199 @@ from typing import Any, Optional
 
 
 # =====================================================================
+# Adapter schemas (retry injection)
+# =====================================================================
+
+@dataclass
+class RetryRequest:
+    """Request payload for retry injection adapter."""
+    instance_id: str = ""
+    baseline_name: str = ""
+    repo_path: Optional[Path] = None
+    context_packet_path: Optional[Path] = None
+    issue_text: str = ""
+    max_steps: int = 60
+    timeout_sec: int = 1800
+    retry_reason: str = ""
+    should_retry: bool = True
+    attempt1_patch_path: Optional[Path] = None
+    attempt1_runtime_signals_path: Optional[Path] = None
+    intervention_report_path: Optional[Path] = None
+    base_commit: str = ""
+
+
+@dataclass
+class RetryInput:
+    """Output of retry injection adapter — ready to feed to mini-SWE runner."""
+    instance_id: str = ""
+    baseline_name: str = ""
+    repo_path: Optional[Path] = None
+    task_message: str = ""
+    context_packet_path: Optional[Path] = None
+    metadata: dict = field(default_factory=dict)
+    run_dir: Optional[Path] = None
+    command: list = field(default_factory=list)
+
+
+# =====================================================================
+# Post-validation / CI-Feedback schemas (Task 3-5)
+# =====================================================================
+
+# Hint-source boundaries — canonical copy lives in
+# experiments/experiment_settings.py (ALLOWED_HINT_SOURCES /
+# FORBIDDEN_HINT_SOURCES).  The tuples here provide fast membership
+# checks without a cross-package import.
+_ALLOWED_HINT_SOURCES = frozenset({
+    "public_api_signature",
+    "repo_source_signature",
+    "issue_keyword_api_match",
+    "runtime_introspection",
+})
+
+_FORBIDDEN_HINT_SOURCES = frozenset({
+    "gold_patch",
+    "feedback_success_patch",
+    "manual_hindsight_only",
+    "contextbench_oracle",
+    "gold_context",
+    "resolved_label",
+})
+
+
+@dataclass
+class FailureWitness:
+    """Structured record of post-validation failure output (v2).
+
+    Stage-aware: separates failure_observed (ground truth) from
+    eligible_for_condiag (whether the failure is a code-context deficiency
+    vs. infrastructure / patch-apply / timeout).
+
+    Fields:
+        instance_id: SWE-bench instance identifier.
+        has_failure_witness: True if any failure signal was captured
+            (legacy field, kept for backwards compatibility).
+        failure_observed: True if official eval confirmed failure
+            (ground truth, independent of parsing success).
+        failure_stage: High-level stage of failure.
+            "validation_failure" = tests ran and failed;
+            "patch_apply_failure" = patch didn't apply;
+            "test_collection_failure" = tests couldn't be collected;
+            "dependency_or_environment_failure" = infra/dep missing;
+            "timeout" = eval timed out;
+            "unknown_failure" = cannot determine.
+        failure_type: Categorisation of the failure (e.g. "AssertionError").
+        test_framework: Detected test framework.
+            One of: "pytest", "unittest", "go_test", "cargo_test",
+            "catch2", "gtest", "junit", "jest", "mocha",
+            "ansible_custom", "autoconf_make", "cmake", "generic",
+            "unknown".
+        failed_tests: List of failing test identifiers.
+        error_message: Raw error message from validation run.
+        stack_trace: Full stack trace frames.
+        top_repo_frames: Frames from the target repository (not test infra).
+        expected: Expected value (nullable).
+        actual: Actual value (nullable).
+        validation_command: Command used to run validation.
+        eligible_for_condiag: True if this failure is a code-context
+            deficiency suitable for ConDiag diagnosis.
+        quality: Evidence quality rating.
+            "strong" = structured failure data extracted;
+            "moderate" = partial structure + error text;
+            "weak" = error text only, no structured evidence;
+            "none" = no evidence.
+        parser_name: Name of the parser that produced this witness.
+        parser_version: Version of the parser.
+        matched_patterns: List of regex / pattern names that matched.
+        mode: How the witness was obtained (e.g. "post_validation_failure",
+            "post_validation_output_unparseable",
+            "diagnostic_only_no_failure_witness").
+        source: Provenance of the failure data.
+            "post_validation_output" = from raw harness/eval output;
+            "none" = no raw post-validation output;
+            "attempt1_runtime_artifacts" = auxiliary metadata only.
+            Default "none" to prevent accidental misattribution.
+        source_type: Specific sub-type of the raw source.
+            One of: "harness_report", "harness_log", "per_instance_report",
+            "per_instance_log", "attempt1_runtime_artifacts", "none".
+        raw_output_path: Path to the raw post-validation output file
+            that was parsed, if available.
+        missing_reason: If has_failure_witness is False and the reason
+            is not captured by mode alone, additional explanation
+            (e.g. "post_validation_log_missing", "no_parseable_failure").
+        oracle_labels_hidden: MUST be True.  Signals that F2P/P2P / resolved
+            labels are NOT exposed in agent-facing contexts.
+        version: Schema version.
+    """
+    instance_id: str
+    has_failure_witness: bool
+    failure_observed: bool = False
+    failure_stage: str = "unknown_failure"
+    failure_type: str = ""
+    test_framework: str = "unknown"
+    failed_tests: list = field(default_factory=list)
+    error_message: str = ""
+    stack_trace: list = field(default_factory=list)
+    top_repo_frames: list = field(default_factory=list)
+    expected: str | None = None
+    actual: str | None = None
+    validation_command: str = ""
+    eligible_for_condiag: bool = False
+    quality: str = "none"
+    parser_name: str = ""
+    parser_version: str = ""
+    matched_patterns: list = field(default_factory=list)
+    mode: str = "diagnostic_only_no_failure_witness"
+    source: str = "none"
+    source_type: str = "none"
+    raw_output_path: str = ""
+    missing_reason: str = ""
+    oracle_labels_hidden: bool = True
+    version: str = "v2.0"
+
+
+@dataclass
+class ApiNavigationHint:
+    """A hint pointing the Host Agent toward a relevant API surface.
+
+    Fields:
+        hint_text: Natural-language description of what to look up / use.
+        hint_source: MUST be one of ALLOWED_HINT_SOURCES.
+        supporting_artifact: Path or reference to the evidence file.
+        target_symbol: Specific function / class / method name.
+        confidence: Score in [0.0, 1.0].
+        generation_method: How this hint was produced (e.g. "symbol_extraction").
+        version: Schema version.
+    """
+    hint_text: str
+    hint_source: str
+    supporting_artifact: str
+    target_symbol: str
+    confidence: float
+    generation_method: str
+    version: str = "v1"
+
+
+def validate_api_hint_source(hint_source: str) -> bool:
+    """Check that *hint_source* is allowed.
+
+    Returns True on success.
+    Raises ValueError if the source is forbidden or unknown.
+    """
+    if hint_source in _FORBIDDEN_HINT_SOURCES:
+        raise ValueError(
+            f"forbidden hint_source '{hint_source}'. "
+            f"Allowed: {sorted(_ALLOWED_HINT_SOURCES)}. "
+            f"Forbidden: {sorted(_FORBIDDEN_HINT_SOURCES)}."
+        )
+    if hint_source not in _ALLOWED_HINT_SOURCES:
+        raise ValueError(
+            f"unknown hint_source '{hint_source}'. "
+            f"Must be one of {sorted(_ALLOWED_HINT_SOURCES)}."
+        )
+    return True
+
+
+# =====================================================================
 # Inputs
 # =====================================================================
 
@@ -190,8 +383,17 @@ class ActionPlan:
 
 @dataclass
 class NormalizedDiagnosis:
-    """Output of diagnosis_normalizer.py — manual_diagnosis with derived fields."""
+    """Output of diagnosis_normalizer.py — manual_diagnosis with derived fields.
+
+    context_deficiency_type is the primary ConDiag diagnosis output: what type
+    of context the agent was missing. This replaces pathology as the main
+    diagnosis axis. pathology/5r are kept for backward compatibility.
+    """
     instance_id: str = ""
+    # Primary diagnosis: what context was the agent missing?
+    context_deficiency_type: str = ""
+    context_deficiency_secondary: list = field(default_factory=list)
+    # Legacy fields (kept for backward compat)
     pathology: str = ""
     action_family: str = ""
     primary_5r_action: Optional[str] = None

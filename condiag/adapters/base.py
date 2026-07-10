@@ -2,21 +2,31 @@
 
 Each subclass binds a specific repair agent (mini-SWE / Agentless /
 OpenHands / SWE-agent / ...) into the ConDiag framework by translating the
-agent's raw outputs into ConDiag's unified case_bundle, and translating
-ConDiag's context_packet.md back into the agent's retry input.
+agent's raw outputs into ConDiag's unified case_bundle.
+
+Architecture boundary (v0.2, 2026-06-29):
+  Agent Adapter = input side only:
+    Host Agent Attempt 1 raw logs -> unified case_bundle (runtime_signals,
+    patch.diff, final_patch_context, local_test_outputs).
+
+  Retry Injection Adapter = separate concern:
+    ContextPacket -> Host Agent Attempt 2 input.
+    See adapters/miniswe_retry_injection.py for the mini-SWE implementation.
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Optional
 
 
 class AgentAdapter(ABC):
-    """Abstract base for all agent adapters.
+    """Abstract base for agent adapters (input side: attempt_1 -> case_bundle).
 
     ConDiag Core only consumes the artifacts produced by these methods; it
     never reads agent-specific formats directly.
+
+    This class does NOT handle retry injection.  That is the responsibility
+    of a separate RetryInjectionAdapter (see miniswe_retry_injection.py).
     """
 
     name: str = ""                # short identifier, used in runs/pilot50/<agent>/...
@@ -60,22 +70,6 @@ class AgentAdapter(ABC):
     @abstractmethod
     def extract_final_patch_context(self, raw_run_dir: Path) -> dict:
         """Return final declared PATCH_CONTEXT as a dict (machine-readable)."""
-        ...
-
-    # ----- output side: ConDiag context_packet -> agent retry input -----
-
-    @abstractmethod
-    def build_retry_input(
-        self,
-        context_packet_path: Path,
-        task_metadata: dict,
-    ) -> dict:
-        """Translate ConDiag context_packet.md into agent-specific retry input.
-
-        The returned dict shape is agent-specific (e.g. mini-SWE wants a
-        user-message string; Agentless wants localized file/span candidates).
-        ConDiag Core does not interpret this dict; the agent runner does.
-        """
         ...
 
 

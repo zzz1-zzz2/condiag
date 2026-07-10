@@ -43,6 +43,10 @@ def normalize(md: ManualDiagnosis, taxonomy: PathologyTaxonomy) -> NormalizedDia
 
     nd = NormalizedDiagnosis(
         instance_id=md.instance_id,
+        # Primary diagnosis axis
+        context_deficiency_type=diag.get("context_deficiency_type", ""),
+        context_deficiency_secondary=diag.get("context_deficiency_secondary", []),
+        # Legacy axes
         pathology=pathology,
         action_family=action_family,
         primary_5r_action=action_5r,

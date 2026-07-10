@@ -88,6 +88,18 @@ REQUIRED_ARTIFACTS: dict[str, list[str]] = {
         "cost.json",
         "run_report.json",
     ],
+    "plain_rerun": [
+        "attempt_1/raw_trajectory.json",
+        "attempt_1/patch.diff",
+        "attempt_1/runtime_signals.json",
+        "intervention/intervention_report.json",
+        "attempt_2/raw_trajectory.json",
+        "attempt_2/attempt_report.json",
+        # attempt_2/patch.diff and final/patch.diff are conditional:
+        # required when retry_no_change=false, optional when true
+        "final/final_report.json",
+        "run_report.json",
+    ],
 }
 
 
@@ -165,6 +177,26 @@ def validate_run(
             pass  # malformed intervention_report: just skip dynamic extension
 
     missing = [r for r in required if not (run_dir / r).is_file()]
+
+    # Conditional patch rule: if retry_no_change=true, patch.diff is optional
+    attempt_report_path = run_dir / "attempt_2" / "attempt_report.json"
+    if attempt_report_path.is_file():
+        try:
+            ar = json.loads(attempt_report_path.read_text(encoding="utf-8"))
+            retry_no_change = bool(ar.get("retry_no_change", False))
+        except Exception:
+            retry_no_change = False
+        if retry_no_change:
+            for patch_rel in ("attempt_2/patch.diff", "final/patch.diff"):
+                if patch_rel in missing:
+                    missing.remove(patch_rel)
+            # Also remove empty-string-if-patch-missing entries from missing
+            # so that an intentionally absent diff doesn't fail validation
+            for patch_rel in ("attempt_2/patch.diff", "final/patch.diff"):
+                p = run_dir / patch_rel
+                if p.is_file() and p.stat().st_size == 0:
+                    # empty patch is acceptable when retry_no_change
+                    pass
 
     # 2. gold leakage scan
     leakage_hits: list[dict] = []

@@ -1,4 +1,4 @@
-"""mini-SWE-Agent adapter (current v0 first-class adapter).
+"""Mini-SWE-Agent adapter — Agent Adapter (input side: attempt_1 -> case_bundle).
 
 Wraps condiag.tools.build_case_bundle so the existing case_bundle pipeline
 becomes an AgentAdapter implementation without refactor.
@@ -8,6 +8,11 @@ Mini-SWE raw run layout (per traj.json):
     - messages: assistant/user/tool-call stream (-> runtime_signals.json)
     - <EXPLORE_CONTEXT> / <PATCH_CONTEXT>: structured context markers
     - test command outputs (-> local_test_outputs.md)
+
+Architecture boundary (v0.2, 2026-06-29):
+    This class ONLY handles attempt_1 -> runtime_signals (Agent Adapter role).
+    For retry injection (ContextPacket -> attempt_2 input), see:
+        condiag.adapters.miniswe_retry_injection.MinisweRetryInjectionAdapter
 """
 from __future__ import annotations
 
@@ -23,6 +28,10 @@ class MinisweAdapter(AgentAdapter):
     name = "miniswe"
     display_name = "mini-SWE-Agent"
     status = "implemented"
+
+    # =========================================================================
+    # Agent Adapter: attempt_1 raw logs -> unified case_bundle
+    # =========================================================================
 
     def build_case_bundle(
         self,
@@ -80,35 +89,34 @@ class MinisweAdapter(AgentAdapter):
             "files_count": rs.get("final_patch_context_files_count") or 0,
         }
 
-    def build_retry_input(
-        self,
-        context_packet_path: Path,
-        task_metadata: dict,
-    ) -> dict:
-        """Translate ConDiag ContextPacket into mini-SWE retry user-message.
+    # =========================================================================
+    # Deprecated: retry injection methods moved to MinisweRetryInjectionAdapter
+    # =========================================================================
 
-        Mini-SWE accepts a free-form user message; we wrap the packet as
-        a system-augmented retry instruction.
-        """
-        packet_md = Path(context_packet_path).read_text(encoding="utf-8")
-        instance_id = task_metadata.get("instance_id", "<unknown>")
-        user_msg = (
-            f"## ConDiag Recovery Context for {instance_id}\n\n"
-            f"{packet_md}\n\n"
-            f"---\n"
-            f"Using the context above, revise your previous patch. Focus on the "
-            f"evidence flagged by the diagnosis and avoid re-introducing the "
-            f"same edits."
-        )
-        return {
-            "agent": "miniswe",
-            "retry_input_kind": "user_message",
-            "user_message": user_msg,
-            "context_packet_path": str(context_packet_path),
-        }
+    def build_retry_input(self, request):
+        """DEPRECATED: use MinisweRetryInjectionAdapter.build_retry_input()."""
+        from .miniswe_retry_injection import MinisweRetryInjectionAdapter
+        return MinisweRetryInjectionAdapter().build_retry_input(request)
+
+    def build_retry_command(self, retry_input):
+        """DEPRECATED: use MinisweRetryInjectionAdapter.build_retry_command()."""
+        from .miniswe_retry_injection import MinisweRetryInjectionAdapter
+        return MinisweRetryInjectionAdapter().build_retry_command(retry_input)
+
+    def collect_retry_artifacts(self, run_dir, repo_dir):
+        """DEPRECATED: use MinisweRetryInjectionAdapter.collect_attempt2_artifacts()."""
+        from .miniswe_retry_injection import MinisweRetryInjectionAdapter
+        return MinisweRetryInjectionAdapter().collect_attempt2_artifacts(run_dir, repo_dir)
+
+    def has_valid_tool_loop(self, trajectory_path):
+        """DEPRECATED: use MinisweRetryInjectionAdapter.validate_host_agent_run()."""
+        from .miniswe_retry_injection import MinisweRetryInjectionAdapter
+        return MinisweRetryInjectionAdapter().validate_host_agent_run(trajectory_path)
 
 
-# ===== helpers =====
+# =========================================================================
+# Helpers
+# =========================================================================
 
 def _resolve_traj_path(raw_run_dir: Path, instance_id: Optional[str] = None) -> Path:
     """Find the traj.json file under raw_run_dir.
