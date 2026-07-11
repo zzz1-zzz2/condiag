@@ -4,3 +4,7 @@ __pycache__/
 logs/
 *.log
 .DS_Store
+ContextBench/
+*.json
+tmp_*.py
+D:*

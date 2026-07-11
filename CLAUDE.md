@@ -74,9 +74,11 @@ Host Agent attempt_1
 ├── experiments/      # Experiment orchestration: baseline_handlers, retry_runner,
 │                     #   failure_witness_builder, instance_manifest, experiment_settings
 ├── scripts/          # Stable CLI entry points
-├── scripts_tmp/      # Legacy temp scripts (to be archived)
+├── scripts_tmp/      # → archive/scripts_tmp/ (moved 2026-07-11)
 ├── docs/             # ADR, plans
 └── archive/          # Frozen legacy code
+    ├── condiag_v1/   # Old architecture (~23 files)
+    └── scripts_tmp/  # Temp scripts (~80 files)
 
 /mnt/d/condiag-artifacts/condiag/
 ├── manifests/        # instance_v1.jsonl, legacy_inventory
@@ -247,9 +249,10 @@ trajectory_signals.py
 ### Phase 0 — Core Modules (offline, no network needed)
 ```
 Task 0: Update CLAUDE.md, memory, plan  ← DONE 2026-07-08
-Task 1: Write trajectory_signals.py (runtime signals + oracle audit)
-Task 2: Write search_contract_builder.py (runtime-only sources)
-Task 3: Write contract_compliance_analyzer.py
+Task 1: Write trajectory_signals.py     ← DONE
+Task 2: Write search_contract_builder.py ← DONE
+Task 3: Write context_deficiency_diagnoser.py ← DONE (v2.1-dev)
+Task 4: Write contract_compliance_analyzer.py ← TODO
 ```
 
 **Phase 0 Gate:** Offline verification on 5 dev cases (django-11820, django-12125, django-13513, django-16454, sympy-20428)
@@ -259,31 +262,44 @@ Task 3: Write contract_compliance_analyzer.py
 - Check search_contract generates specific required_inspections/searches
 - Check gold timeline only appears in eval-only oracle_audit
 
-### Phase 1 — Data & Baseline
+### Phase 1 — Data & Baseline (DONE)
 ```
-Task 4: Build instance manifest (52 instances → 99 instances)
-Task 5: Run ContextBench eval on 52 Attempt-1 trajs → Table 2
-Task 6: Split solved / first-failed by official eval
-Task 7: Complete Batch5 remaining instances (~40 more, needs Clash TUN)
-Task 8: Run Attempt-1 traj + ContextBench eval for new instances
+Task 5: Build instance manifest (52 instances → 99 instances)  ← DONE
+Task 6: Run ContextBench eval on 99 Attempt-1 trajs              ← DONE
+Task 7: Split solved / first-failed by official eval             ← DONE
+Task 8: Input normalization (FailureWitness v2.0)                ← DONE
 ```
 
-### Phase 2 — ConDiag Experiment
+### Phase 2 — Project Cleanup + Quality Polish (CURRENT)
 ```
-Task 9: Run 4 core baselines × first-failed instances
-        (plain_rerun, feedback_retry, broad_expansion, condiag_contract)
-Task 10: Run 2 ablation baselines (random_expansion, rehydrate_only)
-Task 11: ContextBench trajectory metrics on all Attempt-2 trajs
-Task 12: Contract compliance analysis
-Task 13: Build rescue matrix + paper figures/tables
+Task 9:  Archive old-architecture files                        ← DONE 2026-07-11
+Task 10: Implement missing context_deficiency_diagnoser.py     ← DONE
+Task 11: Update CLAUDE.md + git commit                        ← CURRENT
+Task 12: Freeze FailureWitness Builder v2.0                   ← PENDING
+Task 13: Dev / Held-out pool split                             ← PENDING
+Task 14: Batch generate all 16 eligible diagnoses + contracts ← PENDING
+```
+
+### Phase 3 — Audit + Pilot
+```
+Task 15: Diagnosis + Contract quality audit                    ← BLOCKED
+Task 16: Implement contract_compliance_analyzer.py              ← BLOCKED
+Task 17: Dev Pilot (6 instances × 4 baselines)                 ← BLOCKED
+```
+
+### Phase 4 — Main Experiment
+```
+Task 18: Held-out run (10 instances × 6 baselines)             ← BLOCKED
+Task 19: ContextBench trajectory metrics + ablation             ← BLOCKED
+Task 20: Build rescue matrix + paper figures/tables             ← BLOCKED
 ```
 
 ### Gate Dependencies
 ```
-Task 0 DONE → Task 1/2/3 UNBLOCKED
-Phase 0 verification PASS → Phase 1 UNBLOCKED
-Task 6 NOT complete → Phase 2 CANNOT start
-Task 9 NOT complete → Task 10-13 blocked
+Phase 0 (Tasks 0-3) DONE → Phase 1 UNBLOCKED
+Phase 1 (Tasks 5-8) DONE → Phase 2 UNBLOCKED
+Phase 2 (Tasks 9-14) NOT complete → Phase 3 BLOCKED
+Phase 3 (Tasks 15-16) NOT complete → Phase 4 BLOCKED
 ```
 
 ## Pre-Task Protocol (MANDATORY Before Every Task)
@@ -329,43 +345,39 @@ Memory update summary: [...]
 
 ## Key File Map
 
-| Module | Path |
-|---|---|
+| Module | Path | Status |
+|---|---|---|
 | Trajectory Signals | `condiag/trajectory_signals.py` | DONE |
+| Context Deficiency Diagnoser | `condiag/context_deficiency_diagnoser.py` | DONE (v2.1-dev) |
 | Search Contract Builder | `condiag/search_contract_builder.py` | DONE |
-| Context Deficiency Diagnoser | `condiag/context_deficiency_diagnoser.py` | DONE |
-| Contract Renderer | `condiag/contract_renderer.py` |
-| Contract Compliance Analyzer | `experiments/contract_compliance_analyzer.py` |
-| Experiment Settings | `experiments/experiment_settings.py` |
-| Instance Manifest | `experiments/instance_manifest.py` |
-| Baseline Handlers | `experiments/baseline_handlers.py` |
-| Retry Runner | `experiments/host_agent_retry_runner.py` |
-| Schemas | `condiag/schemas.py` |
-| Leakage Guard | `condiag/leakage_guard.py` |
-| Failure Witness Builder | `experiments/failure_witness_builder.py` | DONE |
-| Canonical Matrix | `$CANONICAL_MATRIX_PATH` |
-| Eval Script | `scripts_tmp/smoke_eval_matrix.py` |
+| Contract Renderer | `condiag/contract_renderer.py` | DONE |
+| Schemas | `condiag/schemas.py` | DONE |
+| Failure Witness Builder | `experiments/failure_witness_builder.py` | DONE (v2.0 frozen) |
+| Contract Compliance Analyzer | `experiments/contract_compliance_analyzer.py` | TODO |
+| Experiment Settings | `experiments/experiment_settings.py` | DONE |
+| Instance Manifest | `experiments/instance_manifest.py` | DONE |
+| Baseline Handlers | `experiments/baseline_handlers.py` | DONE |
+| Retry Runner | `experiments/host_agent_retry_runner.py` | DONE |
+| Canonical Matrix | `$CANONICAL_MATRIX_PATH` | — |
+| Eval Script | `scripts/eval_matrix.py` | — |
 
-### Removed (replaced by new architecture)
-| Old Module | Replacement |
-|---|---|
-| `condiag/api_navigation.py` | (retrieval → agent tool loop) |
-| `condiag/retrieval_executor.py` | (retrieval → agent tool loop) |
-| `condiag/context_packet_builder.py` v1-v2 | `search_contract_builder.py` |
-| `condiag/diagnosis_generator.py` | (to be replaced by structured diagnosis) |
+### Removed (archived to `archive/condiag_v1/`)
 
 ## Canonical State
 
 | Artifact | Location | Status |
 |---|---|---|
-| CLAUDE.md | `/home/swelite/condiag/CLAUDE.md` | UPDATED 2026-07-10 |
+| CLAUDE.md | `D:\condiag\CLAUDE.md` | UPDATED 2026-07-11 |
 | Instance Manifest | `manifests/instances_v1.jsonl` | DONE (99 instances) |
 | Experiment Settings | `experiments/experiment_settings.py` | DONE |
 | Trajectory Signals | `condiag/trajectory_signals.py` | DONE |
+| Context Deficiency Diagnoser | `condiag/context_deficiency_diagnoser.py` | DONE (v2.1-dev) |
 | Search Contract Builder | `condiag/search_contract_builder.py` | DONE |
-| Context Deficiency Diagnoser | `condiag/context_deficiency_diagnoser.py` | DONE |
 | Contract Renderer | `condiag/contract_renderer.py` | DONE |
 | Contract Compliance Analyzer | `experiments/contract_compliance_analyzer.py` | TODO |
+| FailureWitness Builder | `experiments/failure_witness_builder.py` | DONE (v2.0 frozen) |
+| Old Architecture | `archive/condiag_v1/` | ARCHIVED (23 files, 2026-07-11) |
+| Scripts (old) | `archive/scripts_tmp/` | ARCHIVED (~80 files, 2026-07-11) |
 | Migration | `manifests/migration_log_v1.json` | DONE |
 | Legacy Inventory | `manifests/legacy_inventory.json` | DONE (frozen) |
 

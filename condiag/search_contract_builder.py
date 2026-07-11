@@ -25,8 +25,18 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Optional
 
-from condiag.diagnosis_generator import classify_deficiency
-from condiag.diagnosis_generator import classify_deficiency
+from condiag.context_deficiency_diagnoser import (
+    CDTYPE_API_DEFINITION,
+    CDTYPE_CALLER_CALLEE,
+    CDTYPE_DEPENDENCY,
+    CDTYPE_INTERFACE_CONSTRAINT,
+    CDTYPE_REGRESSION_CONSTRAINT,
+    CDTYPE_RELATED_TEST,
+    CDTYPE_ROOT_CAUSE,
+    ContextDeficiencyDiagnoser,
+    ContextDeficiencyDiagnosis,
+    PatchBehavior,
+)
 from condiag.trajectory_signals import (
     FailureWitnessLoader,
     RuntimeSignals,
@@ -58,6 +68,8 @@ class RequiredInspection:
     file: str = ""
     lines: list[int] = field(default_factory=list)
     reason: str = ""
+    source: str = ""           # "stack_frame" / "failed_test" / "cdtype_driven_action" / etc.
+    diagnosis_type: str = ""   # CDType if source="cdtype_driven_action", else ""
 
 
 @dataclass
@@ -65,6 +77,8 @@ class RequiredSearch:
     query: str = ""
     type: str = ""  # symbol_definition / grep / caller_search / file_search
     scope: str = ""
+    source: str = ""           # "error_symbol" / "issue_term" / "cdtype_driven_action" / etc.
+    diagnosis_type: str = ""   # CDType if source="cdtype_driven_action", else ""
 
 
 @dataclass
@@ -90,13 +104,12 @@ class DiagnosticSearchContract:
     instance_id: str = ""
     failure_summary: FailureSummary = field(default_factory=FailureSummary)
     trajectory_signals: TrajectorySignalSnapshot = field(default_factory=TrajectorySignalSnapshot)
+    context_deficiency_diagnosis: ContextDeficiencyDiagnosis = field(default_factory=ContextDeficiencyDiagnosis)
     required_inspections: list[RequiredInspection] = field(default_factory=list)
     required_searches: list[RequiredSearch] = field(default_factory=list)
     anti_patterns: list[str] = field(default_factory=list)
     validation_target: ValidationTarget = field(default_factory=ValidationTarget)
     evidence_provenance: EvidenceProvenance = field(default_factory=EvidenceProvenance)
-    context_deficiency_diagnosis: dict[str, Any] = field(default_factory=dict)
-    context_deficiency_diagnosis: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict matching plan schema."""
@@ -116,12 +129,12 @@ class DiagnosticSearchContract:
             "instance_id": self.instance_id,
             "failure_summary": asdict(self.failure_summary),
             "trajectory_signals": asdict(self.trajectory_signals),
+            "context_deficiency_diagnosis": asdict(self.context_deficiency_diagnosis),
             "required_inspections": [asdict(i) for i in self.required_inspections],
             "required_searches": [asdict(s) for s in self.required_searches],
             "anti_patterns": list(self.anti_patterns),
             "validation_target": asdict(self.validation_target),
             "evidence_provenance": asdict(self.evidence_provenance),
-            "context_deficiency_diagnosis": dict(self.context_deficiency_diagnosis),
         }
 
 
@@ -179,57 +192,17 @@ class DiagnosticSearchContractBuilder:
 
         contract.failure_summary = self._build_failure_summary()
         contract.trajectory_signals = self._build_signal_snapshot(signals)
+        contract.context_deficiency_diagnosis = self._build_diagnosis(signals)
         contract.required_inspections = self._build_required_inspections(signals)
         contract.required_searches = self._build_required_searches(signals)
-        contract.anti_patterns = self._build_anti_patterns(signals)
+        # CDType-driven actions: append targeted actions based on CDType profile
+        self._add_cdtype_driven_actions(contract, signals, contract.context_deficiency_diagnosis)
+        # Re-dedup and re-limit after CDType additions
+        contract.required_inspections = self._post_process_inspections(contract.required_inspections)
+        contract.required_searches = self._post_process_searches(contract.required_searches)
+        contract.anti_patterns = self._build_anti_patterns(signals, contract.context_deficiency_diagnosis)
         contract.validation_target = self._build_validation_target()
         contract.evidence_provenance = self._build_evidence_provenance(signals)
-
-        # Classify context deficiency type from runtime signals
-        try:
-            # Map RuntimeSignals field names -> classify_deficiency expected format
-            rs_fields = asdict(signals) if hasattr(signals, '__dataclass_fields__') else {}
-            # Compute patch line count
-            patch_text = self.parser.submission_patch
-            changed_lines = patch_text.count('\n') if patch_text else 0
-            # Derive trigger_type from error_edit_alignment
-            align = signals.error_edit_alignment
-            if align in ('viewed_not_edited', 'edited_elsewhere', 'error_file_never_viewed'):
-                derived_trigger = 'EVIDENCE_EDIT_MISMATCH'
-            elif align == 'aligned':
-                derived_trigger = 'PARTIAL_FIX_SUSPICION'
-            else:
-                derived_trigger = 'UNKNOWN'
-            # Build adapted signal dict matching _patch_shape_signals expectations
-            adapted_signals = {
-                'edited_files_count': signals.unique_files_edited,
-                'changed_lines_total': changed_lines,
-                'viewed_files_count': signals.unique_files_visited,
-                'viewed_but_not_final_files_count': len(signals.viewed_then_dropped_files),
-                'test_runs_count': signals.total_test_commands,
-                'test_failures_count': signals.test_runs,
-            }
-            trigger_reason = []
-            if self.witness and self.witness.has_failure():
-                frames = self.witness.all_stack_source_files()
-                trigger_reason = [f.get('func', '') for f in frames if f.get('func')]
-            cdtype_primary, cdtype_secondary, cdtype_confidence = classify_deficiency(
-                trigger_type=derived_trigger,
-                trigger_reason=trigger_reason,
-                runtime_signals=adapted_signals,
-                issue=self.issue_text,
-            )
-            contract.context_deficiency_diagnosis = {
-                'scores': {cdtype_primary: cdtype_confidence},
-                'explanation': f'Diagnosed {cdtype_primary} from trajectory signals and failure witness',
-                'action': f'Guide search toward resolving {cdtype_primary} deficiency',
-            }
-        except Exception as exc:
-            contract.context_deficiency_diagnosis = {
-                'scores': {'unknown': 0.0},
-                'explanation': f'Classification failed: {exc}',
-                'action': 'Fall back to general search guidance',
-            }
 
         return contract
 
@@ -283,6 +256,344 @@ class DiagnosticSearchContractBuilder:
             error_edit_alignment=signals.error_edit_alignment,
             exploration_mode=signals.exploration_mode,
         )
+
+    # ------------------------------------------------------------------
+    # Context Deficiency Diagnosis (CDType)
+    # ------------------------------------------------------------------
+
+    def _compute_patch_behavior(self) -> PatchBehavior:
+        """Extract PatchBehavior from Attempt-1 submission patch."""
+        patch = self.parser.submission_patch
+        if not patch or not patch.strip():
+            return PatchBehavior(has_edit=False)
+
+        # Count files edited from diff headers
+        files = re.findall(r"^\+\+\+ b/(.+)$", patch, re.MULTILINE)
+        files_edited = len(files)
+
+        # Count patch size (lines added + removed)
+        added = len(re.findall(r"^\+", patch, re.MULTILINE))
+        removed = len(re.findall(r"^\-", patch, re.MULTILINE))
+        # Subtract the ---/+++ header lines
+        patch_size = max(0, added + removed - files_edited * 2)
+
+        return PatchBehavior(
+            has_edit=True,
+            files_edited_count=files_edited,
+            multi_file_edit=files_edited > 1,
+            patch_size=patch_size,
+        )
+
+    def _build_diagnosis(
+        self, signals: RuntimeSignals
+    ) -> ContextDeficiencyDiagnosis:
+        """Run CDType diagnosis from error_type + signals + patch behavior."""
+        error_type = self.witness.failure_type if self.witness else ""
+        patch_behavior = self._compute_patch_behavior()
+        diagnoser = ContextDeficiencyDiagnoser()
+        return diagnoser.diagnose(error_type, signals, patch_behavior)
+
+    # ------------------------------------------------------------------
+    # CDType-driven actions (inspections/searches by CDType profile)
+    # ------------------------------------------------------------------
+
+    def _add_cdtype_driven_actions(
+        self,
+        contract: DiagnosticSearchContract,
+        signals: RuntimeSignals,
+        diagnosis: ContextDeficiencyDiagnosis,
+    ) -> None:
+        """Append CDType-specific inspections/searches to contract.
+
+        CDType determines the *type* of action to add (the action profile).
+        Runtime signals determine the specific *target* (symbol, file, query).
+
+        Each added action carries:
+          source="cdtype_driven_action"
+          diagnosis_type=<the CDType>
+        """
+        cdtype = diagnosis.primary_cdtype
+        if cdtype == "unknown":
+            return
+
+        # Noise terms — defined early as _add_cdtype_driven_actions uses them below
+        _NOISE_TERMS = frozenset({
+            "Collecting", "Downloading", "Installing", "Successfully",
+            "WARNING", "Running", "FAILED", "ERROR", "Traceback",
+            "Skipping", "System", "Docs", "Found", "Total",
+            "Short", "Ran", "DeprecationWarning", "PytestConfigWarning",
+            "Unknown", "Warning", "Config",
+        })
+        _ENV_VAR_PREFIXES = ("CONDA_", "PYTHON_", "PIP_", "LD_", "DYLD_", "PKG_", "LC_")
+        _ENV_VAR_EXACT = {"CPython", "PYTHONHASHSEED", "HOSTNAME", "PLATFORM"}
+        _PYTHON_KEYWORDS = {"True", "False", "None"}
+        def _is_noise(term: str) -> bool:
+            if term in _NOISE_TERMS or term in _ENV_VAR_EXACT or term in _PYTHON_KEYWORDS:
+                return True
+            if term.endswith("Warning"):
+                return True
+            if any(term.startswith(p) for p in _ENV_VAR_PREFIXES):
+                return True
+            return False
+
+        # Collect runtime-available evidence for targeting
+        error_symbols: list[str] = []
+        error_terms: list[str] = []
+        edited_short: set[str] = set()
+        visited_short: set[str] = set()
+        stack_file_names: list[str] = []
+
+        if self.witness and self.witness.has_failure():
+            error_symbols = self.witness.error_symbols()
+            err_msg = self.witness.error_message
+            for m in re.finditer(r"\b[A-Z][a-zA-Z0-9_]+\b", err_msg):
+                term = m.group()
+                if len(term) > 4 and term not in error_symbols and not _is_noise(term):
+                    error_terms.append(term)
+
+        for f in self.parser.edited_files():
+            edited_short.add(f.split("/")[-1])
+
+        for f in self.parser.visited_files_fullpath():
+            visited_short.add(f.split("/")[-1])
+
+        if self.witness and self.witness.has_failure():
+            for sf in self.witness.all_stack_source_files():
+                stack_file_names.append(sf["file"])
+                visited_short.add(sf["file"])
+
+        issue_text = self.issue_text or ""
+        issue_terms = set(re.findall(r"\b[A-Z][a-zA-Z0-9_]+\b", issue_text))
+        issue_terms = {t for t in issue_terms if len(t) > 4}
+
+        # Build short→full path map for resolving inspection targets
+        _short_to_full: dict[str, str] = {}
+        for fp in sorted(self.parser.visited_files_fullpath(), key=lambda p: (p.count("/"), p)):
+            sn = fp.split("/")[-1]
+            if sn not in _short_to_full:
+                _short_to_full[sn] = fp
+        if self.witness and self.witness.has_failure():
+            for frame in self.witness.stack_trace:
+                fpath = frame.get("file", "")
+                if fpath:
+                    sn = fpath.split("/")[-1]
+                    if sn not in _short_to_full:
+                        _short_to_full[sn] = fpath
+
+        def _resolve_path(fpath: str) -> str:
+            """Try to resolve a short file name to full path."""
+            if "/" in fpath or "\\" in fpath:
+                return fpath
+            return _short_to_full.get(fpath, fpath)
+
+        def _add_inspection(
+            fpath: str, reason: str,
+        ):
+            """Append CDType-driven inspection (resolves short→full path)."""
+            fpath = _resolve_path(fpath)
+            if not fpath:
+                return
+            contract.required_inspections.append(RequiredInspection(
+                file=fpath,
+                reason=f"[{cdtype}] {reason}",
+                source="cdtype_driven_action",
+                diagnosis_type=cdtype,
+            ))
+
+        def _add_search(
+            query: str, stype: str, reason: str, scope: str = "",
+        ):
+            """Append CDType-driven search."""
+            if not query or len(query) < 2:
+                return
+            contract.required_searches.append(RequiredSearch(
+                query=query,
+                type=stype,
+                scope=scope,
+                source="cdtype_driven_action",
+                diagnosis_type=cdtype,
+            ))
+
+        # === API_DEFINITION_CONTEXT ===
+        if cdtype == CDTYPE_API_DEFINITION:
+            # Search: symbol definition for error symbols (more targeted)
+            for sym in error_symbols[:2]:
+                _add_search(sym, "symbol_definition", f"{cdtype}: definition of {sym}")
+            # Search: grep import path / class pattern
+            for sym in error_symbols[:1]:
+                if sym and sym != "<module>":
+                    _add_search(sym.split(".")[0], "grep", f"{cdtype}: import/class {sym}")
+            # Inspection: search for symbol usage in visited files
+            if error_symbols and stack_file_names:
+                # Find the definition-like file from visited files
+                for vf in sorted(visited_short):
+                    if vf.endswith(".py") and "test" not in vf.lower():
+                        _add_inspection(
+                            vf, f"{cdtype}: candidate definition file for {error_symbols[0]}",
+                        )
+                        break
+
+        # === INTERFACE_CONSTRAINT_CONTEXT ===
+        elif cdtype == CDTYPE_INTERFACE_CONSTRAINT:
+            # Search: caller_search for the error function
+            for sym in error_symbols[:1]:
+                if sym and sym != "<module>":
+                    _add_search(sym, "caller_search", f"{cdtype}: callers of {sym}")
+            # Search: grep function signature
+            for sym in error_symbols[:1]:
+                if sym and sym != "<module>":
+                    _add_search(f"{sym}(", "grep", f"{cdtype}: signature/usage of {sym}")
+            # Inspection: function signature file from visited stack frames
+            for sf_name in stack_file_names[:1]:
+                _add_inspection(
+                    sf_name, f"{cdtype}: inspect function signature at error location",
+                )
+
+        # === RELATED_TEST_CONTEXT ===
+        elif cdtype == CDTYPE_RELATED_TEST:
+            # Search: grep assertion terms in test file
+            failed_test = self._build_failure_summary().failing_test
+            test_file = failed_test.split("::")[0] if "::" in failed_test else ""
+            if test_file:
+                _add_inspection(
+                    test_file, f"{cdtype}: inspect failed test and neighboring tests",
+                )
+            for et in error_terms[:2]:
+                _add_search(et, "grep", f"{cdtype}: assertion term {et}")
+            # Also search the failed test method name
+            if "::" in failed_test:
+                test_method = failed_test.split("::")[-1]
+                _add_search(test_method, "grep", f"{cdtype}: test method for assertion")
+
+        # === ROOT_CAUSE_RELOCALIZATION ===
+        elif cdtype == CDTYPE_ROOT_CAUSE:
+            # Search: issue terms globally (not in test files)
+            for it in list(issue_terms)[:2]:
+                _add_search(it, "grep", f"{cdtype}: root cause term {it}")
+            # Search: top stack frame symbol
+            if stack_file_names:
+                _add_search(
+                    stack_file_names[0].split("/")[-1].replace(".py", ""),
+                    "grep", f"{cdtype}: top stack frame symbol",
+                )
+            # Inspection: top repo stack frame (force re-inspection)
+            if self.witness and self.witness.has_failure():
+                top_file = self.witness.top_error_file_fullpath() or self.witness.top_error_file()
+                if top_file:
+                    _add_inspection(
+                        top_file, f"{cdtype}: re-inspect top error frame for root cause",
+                    )
+
+        # === CALLER_CALLEE_CONTEXT ===
+        elif cdtype == CDTYPE_CALLER_CALLEE:
+            # Search: caller_search for error function
+            for sym in error_symbols[:1]:
+                if sym and sym != "<module>":
+                    _add_search(sym, "caller_search", f"{cdtype}: callers of {sym}")
+            # Search: usages of edited symbol
+            for ef in sorted(edited_short)[:1]:
+                if ef.endswith(".py"):
+                    sym = ef.replace(".py", "")
+                    _add_search(f"{sym}(", "grep", f"{cdtype}: usage of edited file {ef}")
+            # Inspection: edited symbol definition
+            for ef in sorted(edited_short)[:1]:
+                if ef.endswith(".py"):
+                    _add_inspection(
+                        ef, f"{cdtype}: inspect definition of edited symbol {ef}",
+                    )
+
+        # === REGRESSION_CONSTRAINT_CONTEXT ===
+        elif cdtype == CDTYPE_REGRESSION_CONSTRAINT:
+            # Search: tests touching edited symbols
+            for ef in sorted(edited_short)[:1]:
+                sym = ef.replace(".py", "")
+                _add_search(sym, "grep", f"{cdtype}: tests around edited {ef}")
+            # Inspection: newly failing test
+            failed_test = self._build_failure_summary().failing_test
+            test_file = failed_test.split("::")[0] if "::" in failed_test else ""
+            if test_file:
+                _add_inspection(
+                    test_file, f"{cdtype}: inspect newly failing test",
+                )
+            # Search: regression term
+            for et in error_terms[:1]:
+                _add_search(et, "grep", f"{cdtype}: regression term {et}")
+
+        # === DEPENDENCY_CONTEXT ===
+        elif cdtype == CDTYPE_DEPENDENCY:
+            # Search: grep import for module
+            for sym in error_symbols[:1]:
+                if sym and sym != "<module>":
+                    _add_search(
+                        f"import {sym.split('.')[0]}", "grep",
+                        f"{cdtype}: dependency import for {sym}",
+                    )
+            # Inspection: __init__.py if in visited files
+            for vf in sorted(visited_short):
+                if vf == "__init__.py" or vf.endswith("/__init__.py"):
+                    _add_inspection(
+                        vf, f"{cdtype}: inspect module exports",
+                    )
+                    break
+            # Search: config/registration terms in error message
+            config_terms = {"setup", "config", "registry", "install", "plugin"}
+            matching = {t for t in config_terms if any(t in e.lower() for e in error_terms)}
+            for ct in matching:
+                _add_search(ct, "grep", f"{cdtype}: config term {ct}")
+
+    @staticmethod
+    def _post_process_inspections(
+        inspections: list[RequiredInspection],
+    ) -> list[RequiredInspection]:
+        """Re-dedup and re-limit inspections, prioritizing CDType actions."""
+        seen: set[str] = set()
+        deduped: list[RequiredInspection] = []
+
+        # CDType-driven actions first — they carry diagnostic priority
+        cdtype_actions = [i for i in inspections if i.source == "cdtype_driven_action"]
+        base_actions = [i for i in inspections if i.source != "cdtype_driven_action"]
+
+        for action_list in [cdtype_actions, base_actions]:
+            for insp in action_list:
+                key = insp.file
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(insp)
+
+        # Keep up to 10 (expandable to 12 if CDType actions present)
+        limit = min(len(inspections), 12) if cdtype_actions else 10
+        return deduped[:limit]
+
+    @staticmethod
+    def _post_process_searches(
+        searches: list[RequiredSearch],
+    ) -> list[RequiredSearch]:
+        """Re-dedup and re-limit searches, prioritizing CDType actions."""
+        seen: set[str] = set()
+        deduped: list[RequiredSearch] = []
+
+        cdtype_actions = [s for s in searches if s.source == "cdtype_driven_action"]
+        base_actions = [s for s in searches if s.source != "cdtype_driven_action"]
+
+        for action_list in [cdtype_actions, base_actions]:
+            for s in action_list:
+                key = f"{s.type}:{s.query}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(s)
+
+        # Sort: cdtype_driven caller_search/symbol_definition first, then by type
+        deduped.sort(key=lambda x: (
+            0 if (x.source == "cdtype_driven_action" and x.type in ("caller_search", "symbol_definition")) else
+            1 if x.type == "symbol_definition" else
+            2 if x.type == "caller_search" else
+            3
+        ))
+
+        limit = min(len(searches), 12) if cdtype_actions else 10
+        return deduped[:limit]
 
     # ------------------------------------------------------------------
     # Required Inspections (core output — 6 runtime-only sources)
@@ -381,11 +692,28 @@ class DiagnosticSearchContractBuilder:
                 )
 
         # Source 4: Viewed-then-dropped evidence
+        # Build short-name → full-path map to resolve ambiguous short names
+        short_to_full: dict[str, str] = {}
+        for full_path in sorted(self.parser.visited_files_fullpath(), key=lambda p: (p.count("/"), p)):
+            short = full_path.split("/")[-1]
+            if short not in short_to_full:
+                short_to_full[short] = full_path
+        # Also add stack trace frames' full paths (from witness)
+        if self.witness and self.witness.has_failure():
+            for frame in self.witness.stack_trace:
+                fpath = frame.get("file", "")
+                if fpath:
+                    short = fpath.split("/")[-1]
+                    if short not in short_to_full:
+                        short_to_full[short] = fpath
+
         for dropped in signals.viewed_then_dropped_files:
             # Parse out the filename (may have " (stack frame, unvisited)" suffix)
             fname = dropped.split(" (stack")[0].strip()
             if fname:
-                _add(fname, 0, "viewed but not utilized by agent")
+                # Resolve short name to full path when available
+                full = short_to_full.get(fname, fname)
+                _add(full, 0, "viewed but not utilized by agent")
 
         # Source 5: Edited files not in stack trace
         if self.witness and self.witness.has_failure():
@@ -452,13 +780,21 @@ class DiagnosticSearchContractBuilder:
                 "Short", "Ran", "DeprecationWarning", "PytestConfigWarning",
                 "Unknown", "Warning", "Config",
             })
-            # Also skip terms ending in "Warning" (noisy deprecation messages)
+            # Environment variable terms — useless as code search terms
+            _ENV_VAR_PREFIXES = ("CONDA_", "PYTHON_", "PIP_", "LD_", "DYLD_", "PKG_", "LC_")
+            _ENV_VAR_EXACT = {"CPython", "PYTHONHASHSEED", "HOSTNAME", "PLATFORM"}
+            # Python built-in constants — too generic for grep
+            _PYTHON_KEYWORDS = {"True", "False", "None"}
             def _is_noise(term: str) -> bool:
                 if term in _NOISE_TERMS:
                     return True
                 if term.endswith("Warning"):
                     return True
-                if term in ("Config", "Unknown"):
+                if term in _PYTHON_KEYWORDS:
+                    return True
+                if term in _ENV_VAR_EXACT:
+                    return True
+                if any(term.startswith(p) for p in _ENV_VAR_PREFIXES):
                     return True
                 return False
             # Extract distinctive capitalized terms (class names, type names)
@@ -514,14 +850,53 @@ class DiagnosticSearchContractBuilder:
     # ------------------------------------------------------------------
 
     def _build_anti_patterns(
-        self, signals: RuntimeSignals
+        self, signals: RuntimeSignals,
+        diagnosis: Optional[ContextDeficiencyDiagnosis] = None,
     ) -> list[str]:
-        """Generate anti-pattern warnings based on trajectory signals.
+        """Generate anti-pattern warnings based on trajectory signals and CDType.
 
         Each anti-pattern targets a specific failure mode observed in the
         Attempt-1 trajectory. Warnings are concrete and actionable.
         """
         patterns: list[str] = []
+
+        # Anti-pattern 0: CDType-specific (always included when diagnosis available)
+        if diagnosis and diagnosis.primary_cdtype != "unknown":
+            cdtype_patterns = {
+                CDTYPE_API_DEFINITION: (
+                    "Look up class/function definitions before editing. "
+                    "Use symbol_definition search for unknown APIs."
+                ),
+                CDTYPE_INTERFACE_CONSTRAINT: (
+                    "Check function signatures and type expectations before calling. "
+                    "Use caller_search to find usage patterns."
+                ),
+                CDTYPE_RELATED_TEST: (
+                    "Run the specific failing test, not full test suite. "
+                    "Check test assertions for expected behavior."
+                ),
+                CDTYPE_CALLER_CALLEE: (
+                    "Trace the call chain from test to error location. "
+                    "Don't jump between files without understanding the call flow."
+                ),
+                CDTYPE_ROOT_CAUSE: (
+                    "The edit location was aligned but the fix was incomplete. "
+                    "Look deeper at the root cause near the error location."
+                ),
+                CDTYPE_REGRESSION_CONSTRAINT: (
+                    "Preserve existing behavior. "
+                    "Check that other tests depending on this code still pass."
+                ),
+                CDTYPE_DEPENDENCY: (
+                    "Verify imports, __init__.py exports, and dependency setup. "
+                    "Check that the required module is installed and importable."
+                ),
+            }
+            msg = cdtype_patterns.get(diagnosis.primary_cdtype)
+            if msg:
+                patterns.append(
+                    f"[{diagnosis.primary_cdtype}] {msg}"
+                )
 
         # Anti-pattern 1: Exploration-mode specific
         if signals.exploration_mode == "oscillating":
@@ -566,14 +941,6 @@ class DiagnosticSearchContractBuilder:
                 "Revisit the viewed-but-dropped files — they may contain relevant "
                 "context that was overlooked."
             )
-
-        # Anti-pattern: CDType-specific anti-patterns
-        cdtype = contract.context_deficiency_diagnosis.get('primary_cdtype', 'unknown') if hasattr(self, 'contract') else 'unknown'
-        # (CDType anti-patterns added when self.contract is set)
-
-        # Anti-pattern: CDType-specific anti-patterns
-        cdtype = contract.context_deficiency_diagnosis.get('primary_cdtype', 'unknown') if hasattr(self, 'contract') else 'unknown'
-        # (CDType anti-patterns added when self.contract is set)
 
         # Anti-pattern 4: Default — always include general guardrails
         patterns.append(
@@ -726,7 +1093,7 @@ def contract_to_file(
     output_path: str | Path,
 ) -> None:
     """Serialize a contract to JSON file."""
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(contract.to_dict(), f, indent=2, ensure_ascii=False)
     print(f"Contract written to {output_path}")
 
@@ -750,7 +1117,7 @@ if __name__ == "__main__":
 
     issue_text = ""
     if args.issue:
-        with open(args.issue) as f:
+        with open(args.issue, encoding="utf-8", errors="replace") as f:
             issue_text = f.read()
 
     witness_path = args.witness or None
