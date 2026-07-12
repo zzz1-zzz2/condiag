@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from condiag.instance_identity import instance_artifact_filename
 
 HandlerFn = Callable[[Path, str, str, Any, dict], dict]
 
@@ -1116,19 +1117,31 @@ def handle_condiag_contract_retry(
         config.get("contracts_root")
         or "/mnt/d/condiag-artifacts/condiag/pool/dev10_contracts"
     )
-    safe_id = instance_id.replace("/", "__")
-    contract_path = contracts_root / f"{safe_id}.json"
+    safe_name = instance_artifact_filename(instance_id)
+    contract_path = contracts_root / f"{safe_name}.json"
 
     contract_exists = contract_path.is_file()
     if contract_exists:
         from condiag.contract_renderer import render_contract_to_markdown
-        contract_md = render_contract_to_markdown(contract_path)
-        # Save rendered markdown as context_packet
-        (intervention / "context_packet.md").write_text(contract_md, encoding="utf-8")
-        # Save original contract JSON
-        shutil.copyfile(contract_path, intervention / "contract.json")
-        intervention_status = "condiag_contract_built"
-        should_retry = True
+        import json as _json
+        _raw = _json.loads(contract_path.read_text(encoding="utf-8"))
+        _cid = _raw.get("instance_id", "")
+        if _cid != instance_id:
+            _msg = (
+                f"Contract instance_id mismatch: file {contract_path.name} has "
+                f"instance_id={_cid!r} but expected {instance_id!r}. "
+                f"Refusing to load mismatched contract."
+            )
+            print(f"  ERROR: {_msg}")
+            intervention_status = f"contract_instance_id_mismatch:{_msg}"
+            should_retry = False
+            contract_exists = False
+        else:
+            contract_md = render_contract_to_markdown(contract_path)
+            (intervention / "context_packet.md").write_text(contract_md, encoding="utf-8")
+            shutil.copyfile(contract_path, intervention / "contract.json")
+            intervention_status = "condiag_contract_built"
+            should_retry = True
     else:
         intervention_status = f"contract_not_found:{contract_path}"
         should_retry = False
