@@ -275,12 +275,29 @@ def handle_feedback_retry(
     patch_summary = _summarize_previous_patch(attempt_1)
     test_feedback = _extract_test_feedback(attempt_1)
 
-    # Frozen-eligible override: force retry regardless of old trigger
-    force_retry = config.get("force_feedback_retry", False)
-    if force_retry and not trigger_result.should_retry:
-        trigger_result.should_retry = True
+    # Resolve execution policy (frozen-eligible paired override)
+    from .execution_policy import resolve_retry_execution_policy
+    _policy = resolve_retry_execution_policy(
+        instance_id=instance_id,
+        raw_should_retry=trigger_result.should_retry,
+        raw_trigger_type=trigger_result.trigger_type,
+        override_requested=config.get("frozen_eligible_override", False),
+    )
 
-    if trigger_result.should_retry:
+    # Fail-closed: override requested but can't be applied
+    if _policy.fail_closed_reason:
+        print(f"  EXECUTION POLICY FAIL-CLOSED: {_policy.fail_closed_reason}")
+        return {
+            "handled": False,
+            "reason": f"execution_policy_fail_closed:{_policy.fail_closed_reason}",
+            "mode": mode,
+            "instance_id": instance_id,
+            "_policy": _policy.to_dict(),
+        }
+
+    _effective_should_retry = _policy.effective_should_retry
+
+    if _effective_should_retry:
         packet_md = _build_feedback_packet(
             instance_id=instance_id,
             trigger_result=trigger_result,
@@ -288,12 +305,16 @@ def handle_feedback_retry(
             test_feedback=test_feedback,
         )
         packet_path.write_text(packet_md, encoding="utf-8")
-        intervention_status = "feedback_packet_built" if not force_retry else "eligible_forced_retry"
-        packet_mode = "feedback_only" if not force_retry else "eligible_forced"
+        intervention_status = "feedback_packet_built"
+        packet_mode = "feedback_only"
     else:
         # No packet — intervention_report records why no retry
         intervention_status = "skipped_no_retry"
         packet_mode = "skipped_no_retry"
+
+    # Tag intervention_status when override was applied
+    if _policy.frozen_eligible_override_applied:
+        intervention_status = "frozen_eligible_forced_retry"
 
     intervention_report = {
         "schema_version": "condiag.intervention_report.v0",
@@ -303,12 +324,21 @@ def handle_feedback_retry(
         "mode": "packet_only",
         "status": intervention_status,
         "packet_mode": packet_mode,
-        "should_retry": trigger_result.should_retry,
-        "trigger_type": trigger_result.trigger_type,
+        "should_retry": _policy.effective_should_retry,
+        "trigger_type": _policy.raw_trigger_type,
         "trigger_reason": trigger_result.trigger_reason,
         "runtime_gap_status": trigger_result.runtime_gap_status,
         "confidence": trigger_result.confidence,
         "alternative_trigger_types": trigger_result.alternative_trigger_types,
+        # Execution policy metadata (frozen-eligible override)
+        "raw_trigger_type": _policy.raw_trigger_type,
+        "raw_should_retry": _policy.raw_should_retry,
+        "effective_should_retry": _policy.effective_should_retry,
+        "frozen_eligible_override_requested": _policy.frozen_eligible_override_requested,
+        "frozen_eligible_override_applied": _policy.frozen_eligible_override_applied,
+        "override_reason": _policy.override_reason,
+        "eligibility_source": _policy.eligibility_source,
+        "eligibility_manifest_hash": _policy.eligibility_manifest_hash,
         "has_context_packet": packet_path.is_file(),
         "context_packet_path": str(packet_path) if packet_path.is_file() else None,
         "context_packet_kind": "feedback_only" if packet_path.is_file() else None,
@@ -342,8 +372,9 @@ def handle_feedback_retry(
         ),
         "has_final_patch": (final / "patch.diff").is_file() and (final / "patch.diff").stat().st_size > 0,
         "contextbench_metrics_status": cbm_status,
-        "trigger_type": trigger_result.trigger_type,
-        "should_retry": trigger_result.should_retry,
+        "trigger_type": _policy.raw_trigger_type,
+        "should_retry": _policy.effective_should_retry,
+        "execution_policy": _policy.to_dict(),
         "finalized_at": _now_iso(),
     }
     (final / "final_report.json").write_text(
@@ -373,14 +404,14 @@ def handle_feedback_retry(
         "reason": "feedback_retry_packet_only",
         "mode": mode,
         "instance_id": instance_id,
-        "trigger_type": trigger_result.trigger_type,
-        "should_retry": trigger_result.should_retry,
+        "trigger_type": _policy.raw_trigger_type,
+        "should_retry": _policy.effective_should_retry,
         "intervention_status": intervention_status,
         "has_context_packet": packet_path.is_file(),
         "source_attempt_1": str(base_attempt_1) if base_exists else traj_source,
         # fields consumed by baseline_runner to update run_report.json
         "attempt_1_status": "completed",
-        "attempt_2_status": "skipped_packet_only_mode",
+        "attempt_2_status": "pending_host_agent_retry_runner" if _policy.effective_should_retry else "skipped_packet_only_mode",
         "final_source": "attempt_1",
     }
 
@@ -1146,6 +1177,30 @@ def handle_condiag_contract_retry(
         intervention_status = f"contract_not_found:{contract_path}"
         should_retry = False
 
+    # 2b. Resolve execution policy (frozen-eligible override)
+    from .execution_policy import resolve_retry_execution_policy
+    _policy = resolve_retry_execution_policy(
+        instance_id=instance_id,
+        raw_should_retry=should_retry,
+        raw_trigger_type="CONTRACT_AVAILABILITY",
+        override_requested=config.get("frozen_eligible_override", False),
+    )
+
+    # Fail-closed: override requested but can't be applied
+    if _policy.fail_closed_reason:
+        print(f"  EXECUTION POLICY FAIL-CLOSED: {_policy.fail_closed_reason}")
+        return {
+            "handled": False,
+            "reason": f"execution_policy_fail_closed:{_policy.fail_closed_reason}",
+            "mode": mode,
+            "instance_id": instance_id,
+            "_policy": _policy.to_dict(),
+        }
+
+    should_retry = _policy.effective_should_retry
+    if _policy.frozen_eligible_override_applied:
+        intervention_status = "frozen_eligible_forced_retry"
+
     # 3. Intervention report
     intervention_report = {
         "schema_version": "condiag.intervention_report.v0",
@@ -1157,6 +1212,15 @@ def handle_condiag_contract_retry(
         "should_retry": should_retry,
         "contract_path": str(contract_path) if contract_exists else None,
         "contract_loaded": contract_exists,
+        # Execution policy metadata (frozen-eligible override)
+        "raw_should_retry": _policy.raw_should_retry,
+        "effective_should_retry": _policy.effective_should_retry,
+        "raw_trigger_type": _policy.raw_trigger_type,
+        "frozen_eligible_override_requested": _policy.frozen_eligible_override_requested,
+        "frozen_eligible_override_applied": _policy.frozen_eligible_override_applied,
+        "override_reason": _policy.override_reason,
+        "eligibility_source": _policy.eligibility_source,
+        "eligibility_manifest_hash": _policy.eligibility_manifest_hash,
         "has_context_packet": contract_exists,
         "context_packet_path": str(intervention / "context_packet.md") if contract_exists else None,
         "context_packet_kind": "condiag_contract" if contract_exists else None,
@@ -1190,6 +1254,7 @@ def handle_condiag_contract_retry(
         ) + "attempt_2 delegated to host_agent_retry_runner",
         "has_final_patch": (final / "patch.diff").is_file() and (final / "patch.diff").stat().st_size > 0,
         "contextbench_metrics_status": "pending_evaluation",
+        "execution_policy": _policy.to_dict(),
         "finalized_at": _now_iso(),
     }
     (final / "final_report.json").write_text(
@@ -1221,6 +1286,7 @@ def handle_condiag_contract_retry(
         "contract_loaded": contract_exists,
         "intervention_status": intervention_status,
         "should_retry": should_retry,
+        "execution_policy": _policy.to_dict(),
         "has_context_packet": contract_exists,
         "source_attempt_1": str(base_attempt_1) if base_exists else traj_source,
         "attempt_1_status": "completed",
