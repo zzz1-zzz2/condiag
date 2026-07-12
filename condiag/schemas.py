@@ -32,6 +32,14 @@ class RetryRequest:
     intervention_report_path: Optional[Path] = None
     base_commit: str = ""
 
+    def to_dict(self) -> dict:
+        """Serialize to dict (for JSON logging). Converts Path to str."""
+        d = asdict(self)
+        for k, v in d.items():
+            if isinstance(v, Path):
+                d[k] = str(v)
+        return d
+
 
 @dataclass
 class RetryInput:
@@ -44,6 +52,14 @@ class RetryInput:
     metadata: dict = field(default_factory=dict)
     run_dir: Optional[Path] = None
     command: list = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """Serialize to dict (for JSON logging). Converts Path to str."""
+        d = asdict(self)
+        for k, v in d.items():
+            if isinstance(v, Path):
+                d[k] = str(v)
+        return d
 
 
 # =====================================================================

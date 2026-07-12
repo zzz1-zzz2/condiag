@@ -70,6 +70,12 @@ class RequiredInspection:
     reason: str = ""
     source: str = ""           # "stack_frame" / "failed_test" / "cdtype_driven_action" / etc.
     diagnosis_type: str = ""   # CDType if source="cdtype_driven_action", else ""
+    severity: str = ""         # "required" / "recommended" / "informational"
+    action_role: str = ""      # "caller" / "callee" / "definition" / "usage" /
+                               # "failed_test" / "neighbor_test" /
+                               # "interface_producer" / "interface_consumer" /
+                               # "error_frame" / "edit_target"
+    action_group_id: str = ""  # Shared between paired actions (e.g. "pair_1" for caller+callee)
 
 
 @dataclass
@@ -79,6 +85,9 @@ class RequiredSearch:
     scope: str = ""
     source: str = ""           # "error_symbol" / "issue_term" / "cdtype_driven_action" / etc.
     diagnosis_type: str = ""   # CDType if source="cdtype_driven_action", else ""
+    severity: str = ""         # "required" / "recommended" / "informational"
+    action_role: str = ""
+    action_group_id: str = ""
 
 
 @dataclass
@@ -94,22 +103,45 @@ class EvidenceProvenance:
 
 
 @dataclass
+class StructuredConstraint:
+    """A structured constraint for agent behavior during attempt-2.
+
+    Each constraint has a concrete type, severity level, and resolved
+    parameters. The compliance analyzer evaluates constraints individually
+    rather than parsing natural-language anti_patterns.
+
+    Types:
+      FORBID_TEST_EDITS            — required  — no params
+      REQUIRE_INSPECTION_BEFORE_EDIT — required — {target_path, target_provenance}
+      AVOID_REPETITIVE_TEST_RUNS   — recommended — {min_gap_actions}
+      REVISIT_DROPPED_FILES        — recommended — {file_paths}
+      PREFER_SINGLE_FILE_FIX       — informational — {max_files}
+    """
+    constraint_type: str = ""
+    severity: str = ""              # required / recommended / informational
+    parameters: dict = field(default_factory=dict)
+    display_text: str = ""          # Natural language for agent rendering
+
+
+@dataclass
 class DiagnosticSearchContract:
     """Structured diagnostic search contract.
 
     Serializes to the JSON schema defined in condiag_plan_v2_search_contract.md.
     Every field is generated from runtime-only sources — no gold leakage.
     """
-    contract_version: str = "1.0"
+    contract_version: str = "1.1"
     instance_id: str = ""
     failure_summary: FailureSummary = field(default_factory=FailureSummary)
     trajectory_signals: TrajectorySignalSnapshot = field(default_factory=TrajectorySignalSnapshot)
     context_deficiency_diagnosis: ContextDeficiencyDiagnosis = field(default_factory=ContextDeficiencyDiagnosis)
     required_inspections: list[RequiredInspection] = field(default_factory=list)
     required_searches: list[RequiredSearch] = field(default_factory=list)
+    structured_constraints: list[StructuredConstraint] = field(default_factory=list)
     anti_patterns: list[str] = field(default_factory=list)
     validation_target: ValidationTarget = field(default_factory=ValidationTarget)
     evidence_provenance: EvidenceProvenance = field(default_factory=EvidenceProvenance)
+    contract_mode: str = "legacy"  # typed / abstain / degraded / legacy
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict matching plan schema."""
@@ -132,15 +164,342 @@ class DiagnosticSearchContract:
             "context_deficiency_diagnosis": asdict(self.context_deficiency_diagnosis),
             "required_inspections": [asdict(i) for i in self.required_inspections],
             "required_searches": [asdict(s) for s in self.required_searches],
+            "structured_constraints": [asdict(sc) for sc in self.structured_constraints],
             "anti_patterns": list(self.anti_patterns),
             "validation_target": asdict(self.validation_target),
             "evidence_provenance": asdict(self.evidence_provenance),
+            "contract_mode": self.contract_mode,
         }
 
 
 def dataclasses_is_dataclass(obj):
     """Check if obj is a dataclass without importing the full inspect module."""
     return hasattr(obj, "__dataclass_fields__")
+
+
+# =====================================================================
+# ContractAnchorResolver — unified anchor resolution
+# =====================================================================
+
+class ContractAnchorResolver:
+    """Unified resolver for contract anchors from all available sources.
+
+    Parses FailureWitness + TrajParser + RuntimeSignals + issue_text once,
+    produces structured anchors that CDType branches select from.
+
+    Centralizes all edge-case parsing (non-Python stacks, import errors,
+    panic locations, multi-language test references) so each CDType branch
+    only needs to select from pre-resolved anchors -- no inline parsing.
+
+    Outputs:
+      files:    [{path, line, func, source, is_test}] -- all known repo files
+      symbols:  [{symbol, source}] -- error/issue/assertion symbols
+      tests:    [{test_id, source}] -- test references from all sources
+      modules:  [{module, attribute, source}] -- import-time module refs
+    """
+
+    # Non-Python error location patterns (ordered by specificity)
+    _LOCATION_PATTERNS = [
+        (r"panicked at\s+'([^']+)':(\d+)", "rust_panic"),
+        (r"panicked at\s+([^,\s]+):(\d+)", "rust_panic"),
+        (r"at\s+([^\s]+?)\.(?:js|ts|jsx|tsx):(\d+)", "js_location"),
+        (r"at\s+([^\s]+?)\.(?:rs|go|rb|php):(\d+)", "source_location"),
+        (r"([^\s]+?)\.go:(\d+)", "go_location"),
+        (r"([^\s]+?)\.(?:rs|rb|php):(\d+)", "generic_location"),
+    ]
+
+    # Noise symbols -- filtered from symbol resolution
+    _NOISE_SYMBOLS = frozenset({
+        "True", "False", "None", "Error", "Warning",
+        "AttributeError", "TypeError", "ValueError", "KeyError",
+        "ImportError", "ModuleNotFoundError", "RuntimeError",
+        "NameError", "AssertionError", "SyntaxError",
+        "IndexError", "StopIteration", "OSError",
+        "DeprecationWarning", "PytestConfigWarning",
+        "Collecting", "Downloading", "Installing", "Successfully",
+        "WARNING", "Running", "FAILED", "ERROR", "Traceback",
+        "Skipping", "System", "Docs", "Found", "Total",
+        "Short", "Ran", "Unknown", "Warning", "Config",
+    })
+
+    _IMPORT_PATTERNS = [
+        r"cannot import name\s+'(\w+)'\s+from\s+'([\w.]+)'",
+        r"cannot import name\s+(\w+)\s+from\s+([\w.]+)",
+        r"module\s+'([\w.]+)'\s+has no attribute\s+'(\w+)'",
+        r"'([\w.]+)'\s+has no attribute\s+'(\w+)'",
+        r"undefined\s+(?:symbol|name)\s+'?(\w+)'?",
+        r"cannot find\s+(?:module|class)\s+'?([\w.]+)'?",
+    ]
+
+    def __init__(
+        self,
+        witness,
+        parser,
+        signals,
+        issue_text: str = "",
+    ):
+        self.witness = witness
+        self.parser = parser
+        self.signals = signals
+        self.issue_text = issue_text or ""
+
+        # Resolved anchor collections
+        self.files: list[dict] = []
+        self.symbols: list[dict] = []
+        self.tests: list[dict] = []
+        self.modules: list[dict] = []
+
+        self._resolve_all()
+
+    def _resolve_all(self):
+        self._resolve_stack_files()
+        self._resolve_non_python_locations()
+        self._resolve_visited_and_edited()
+        self._resolve_symbols()
+        self._resolve_import_errors()
+        self._resolve_tests()
+
+    # ------------------------------------------------------------------
+    # File resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_stack_files(self):
+        """Resolve Python-format stack frames."""
+        if not self.witness or not self.witness.has_failure():
+            return
+        seen_paths = {f["path"] for f in self.files}
+        for sf in self.witness.all_stack_source_files():
+            fpath = sf.get("fullpath") or sf.get("file", "")
+            if fpath and fpath not in seen_paths:
+                self.files.append({
+                    "path": fpath,
+                    "line": sf.get("line", 0),
+                    "func": sf.get("func", ""),
+                    "source": "stack_frame",
+                    "is_test": "test" in fpath.lower(),
+                })
+                seen_paths.add(fpath)
+
+    def _resolve_non_python_locations(self):
+        """Parse non-Python error locations from stack strings + error_message.
+
+        Covers: Rust panicked at, JS/TS at file.js:N, Go file.go:N
+        Only fires when no structured frames found (pure fallback).
+        """
+        if not self.witness or not self.witness.has_failure():
+            return
+        has_stack_frames = any(f["source"] == "stack_frame" for f in self.files)
+        if has_stack_frames:
+            return
+
+        raw_st = self.witness._data.get("stack_trace", [])
+        msg = self.witness.error_message
+        seen_paths = {f["path"] for f in self.files}
+
+        for source_str in list(raw_st) + [msg]:
+            if not isinstance(source_str, str):
+                continue
+            for pat, source_name in self._LOCATION_PATTERNS:
+                m = re.search(pat, source_str)
+                if m:
+                    fpath = m.group(1).strip()
+                    line = int(m.group(2))
+                    if fpath and fpath not in seen_paths:
+                        self.files.append({
+                            "path": fpath,
+                            "line": line,
+                            "func": "",
+                            "source": source_name,
+                            "is_test": "test" in fpath.lower(),
+                        })
+                        seen_paths.add(fpath)
+
+    def _resolve_visited_and_edited(self):
+        """Resolve files from trajectory visited/edited sources."""
+        seen_paths = {f["path"] for f in self.files}
+        for fp in sorted(self.parser.visited_files_fullpath(),
+                         key=lambda p: (p.count("/"), p)):
+            if fp and fp not in seen_paths:
+                self.files.append({
+                    "path": fp, "line": 0, "func": "",
+                    "source": "visited", "is_test": "test" in fp.lower(),
+                })
+                seen_paths.add(fp)
+        for fp in self.parser.edited_files():
+            if fp and fp not in seen_paths:
+                self.files.append({
+                    "path": fp, "line": 0, "func": "",
+                    "source": "edited", "is_test": "test" in fp.lower(),
+                })
+                seen_paths.add(fp)
+
+    # ------------------------------------------------------------------
+    # Symbol resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_symbols(self):
+        """Resolve symbols from error, issue, and assertion sources."""
+        seen = {s["symbol"] for s in self.symbols}
+
+        def _add(sym: str, source: str):
+            sym = sym.strip()
+            if sym and sym not in seen and sym not in self._NOISE_SYMBOLS:
+                self.symbols.append({"symbol": sym, "source": source})
+                seen.add(sym)
+
+        # Source 1: error_symbols from witness
+        if self.witness and self.witness.has_failure():
+            for sym in self.witness.error_symbols():
+                _add(sym, "error_symbol")
+
+        # Source 2: issue terms from issue_text
+        for m in re.finditer(r"\b[A-Z][a-zA-Z0-9_]+\b", self.issue_text):
+            term = m.group()
+            if len(term) > 4:
+                _add(term, "issue_term")
+
+        # Source 3: capitalized terms from error_message (non-noise)
+        if self.witness and self.witness.has_failure():
+            msg = self.witness.error_message
+            for m in re.finditer(r"\b[A-Z][a-zA-Z0-9_]{2,}\b", msg):
+                _add(m.group(), "error_term")
+
+    # ------------------------------------------------------------------
+    # Module / import-error resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_import_errors(self):
+        """Parse import-time errors for module/attribute resolution."""
+        if not self.witness or not self.witness.has_failure():
+            return
+        msg = self.witness.error_message
+        for pat in self._IMPORT_PATTERNS:
+            m = re.search(pat, msg)
+            if m:
+                groups = m.groups()
+                if len(groups) >= 2:
+                    self.modules.append({
+                        "module": groups[1], "attribute": groups[0],
+                        "source": "import_error",
+                    })
+                elif len(groups) == 1:
+                    self.modules.append({
+                        "module": "", "attribute": groups[0],
+                        "source": "import_error",
+                    })
+                break  # first match only
+
+    # ------------------------------------------------------------------
+    # Test resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_tests(self):
+        """Resolve test references from all sources, prioritized."""
+        if not self.witness:
+            return
+
+        def _add(tid: str, source: str):
+            if tid and tid not in {t["test_id"] for t in self.tests}:
+                self.tests.append({"test_id": tid, "source": source})
+
+        # Source 1: failed_tests list from witness
+        if self.witness and self.witness.has_failure():
+            for ft in self.witness._data.get("failed_tests", []):
+                _add(ft, "failed_tests")
+
+        # Source 2: FAILED line in error_message
+        if self.witness and self.witness.has_failure():
+            for m in re.finditer(r"FAILED\s+(\S+)", self.witness.error_message):
+                _add(m.group(1), "error_message")
+
+        # Source 3: test files from resolved file anchors
+        for f in self.files:
+            if f["is_test"]:
+                _add(f["path"], f["source"])
+
+    # ------------------------------------------------------------------
+    # High-level accessors
+    # ------------------------------------------------------------------
+
+    def top_error_file(self) -> str:
+        """Resolve top error source file with priority chain.
+
+        1. Stack frame files
+        2. Non-Python parsed locations (panic/at)
+        3. Error_message file:line regex (last resort)
+        """
+        for f in self.files:
+            if f["source"] == "stack_frame":
+                return f["path"]
+        for f in self.files:
+            if f["source"] not in ("visited", "edited"):
+                return f["path"]
+        if self.witness and self.witness.has_failure():
+            m = re.search(r"([^\s]+?)\.\w+:(\d+)", self.witness.error_message)
+            if m:
+                return m.group(1)
+        return ""
+
+    def top_error_file_provenance(self) -> tuple[str, str]:
+        """Resolve top error file WITH provenance source.
+
+        Returns (file_path, provenance) where provenance is one of:
+          stack_frame, rust_panic, js_location, go_location,
+          source_location, generic_location, error_message, unknown
+        """
+        for f in self.files:
+            if f["source"] == "stack_frame":
+                return (f["path"], "stack_frame")
+        for f in self.files:
+            if f["source"] not in ("visited", "edited"):
+                return (f["path"], f["source"])
+        if self.witness and self.witness.has_failure():
+            m = re.search(r"([^\s]+?)\.\w+:(\d+)", self.witness.error_message)
+            if m:
+                return (m.group(1), "error_message")
+        return ("", "unknown")
+
+    def test_file_path(self) -> str:
+        """Resolve best test file path from all test references."""
+        for t in self.tests:
+            tid = t["test_id"]
+            if "::" in tid:
+                return tid.split("::")[0]
+            if ":" in tid:
+                return tid.split(":")[0]
+            return tid
+        return ""
+
+    def test_method_name(self) -> str:
+        """Extract test method name from best test reference."""
+        for t in self.tests:
+            tid = t["test_id"]
+            if "::" in tid:
+                return tid.split("::")[-1]
+            if ":" in tid and not tid.startswith("/"):
+                parts = tid.split(":")
+                if len(parts) > 1:
+                    return parts[-1].strip()
+        return ""
+
+    def stack_file_names(self) -> list[str]:
+        return [f["path"] for f in self.files if f["source"] == "stack_frame"]
+
+    def has_import_error(self) -> bool:
+        return any(m["source"] == "import_error" for m in self.modules)
+
+    def import_modules(self) -> list[str]:
+        return [m["module"] for m in self.modules if m.get("module")]
+
+    def import_attributes(self) -> list[str]:
+        return [m["attribute"] for m in self.modules if m.get("attribute")]
+
+    def short_to_full_path(self, short_name: str) -> str:
+        """Resolve a short filename to its best full path from known files."""
+        candidates = [f for f in self.files if f["path"].endswith("/" + short_name)]
+        if candidates:
+            return candidates[0]["path"]
+        return short_name
 
 
 # =====================================================================
@@ -170,7 +529,36 @@ class DiagnosticSearchContractBuilder:
         self.witness: Optional[FailureWitnessLoader] = None
         if witness_path and Path(witness_path).exists():
             self.witness = FailureWitnessLoader(witness_path)
-        self.issue_text = issue_text
+        if issue_text:
+            self.issue_text = issue_text
+        else:
+            self.issue_text = self._extract_issue_from_trajectory()
+
+    def _extract_issue_from_trajectory(self) -> str:
+        """Extract the PR description / issue text from trajectory messages.
+
+        The issue is embedded in the first user message inside <pr_description> tags.
+        Falls back to the first user message content if no tags found.
+        """
+        try:
+            traj_data = getattr(self.parser, "_data", None)
+            if not traj_data:
+                return ""
+            msgs = traj_data.get("messages", [])
+            for msg in msgs:
+                if msg.get("role") != "user":
+                    continue
+                content = msg.get("content", "")
+                if not isinstance(content, str):
+                    continue
+                # Try <pr_description> tag first
+                m = re.search(r"<pr_description>\s*(.*?)\s*</pr_description>", content, re.DOTALL)
+                if m:
+                    return m.group(1).strip()
+                # Fallback: use the full message
+                return content[:2000].strip()
+        except Exception:
+            return ""
 
     # ------------------------------------------------------------------
     # Public API
@@ -186,7 +574,7 @@ class DiagnosticSearchContractBuilder:
             DiagnosticSearchContract with all fields populated from runtime evidence.
         """
         contract = DiagnosticSearchContract(
-            contract_version="1.0",
+            contract_version="1.1",
             instance_id=self.parser.instance_id,
         )
 
@@ -195,14 +583,31 @@ class DiagnosticSearchContractBuilder:
         contract.context_deficiency_diagnosis = self._build_diagnosis(signals)
         contract.required_inspections = self._build_required_inspections(signals)
         contract.required_searches = self._build_required_searches(signals)
-        # CDType-driven actions: append targeted actions based on CDType profile
-        self._add_cdtype_driven_actions(contract, signals, contract.context_deficiency_diagnosis)
+        # CDType-driven actions: use ContractAnchorResolver for unified anchor resolution
+        resolver = ContractAnchorResolver(
+            self.witness, self.parser, signals, self.issue_text,
+        )
+        self._add_cdtype_driven_actions(contract, resolver, contract.context_deficiency_diagnosis)
         # Re-dedup and re-limit after CDType additions
         contract.required_inspections = self._post_process_inspections(contract.required_inspections)
         contract.required_searches = self._post_process_searches(contract.required_searches)
-        contract.anti_patterns = self._build_anti_patterns(signals, contract.context_deficiency_diagnosis)
+        # Build structured constraints then derive anti_patterns from them
+        structured = self._build_structured_constraints(
+            signals, contract.context_deficiency_diagnosis, resolver,
+        )
+        contract.structured_constraints = structured
+        contract.anti_patterns = self._build_anti_patterns(
+            signals, contract.context_deficiency_diagnosis, structured,
+        )
         contract.validation_target = self._build_validation_target()
         contract.evidence_provenance = self._build_evidence_provenance(signals)
+
+        # Set contract_mode based on CDType availability
+        diagnosis = contract.context_deficiency_diagnosis
+        if diagnosis and diagnosis.primary_cdtype != "unknown":
+            contract.contract_mode = "typed"
+        else:
+            contract.contract_mode = "abstain"
 
         return contract
 
@@ -289,9 +694,10 @@ class DiagnosticSearchContractBuilder:
     ) -> ContextDeficiencyDiagnosis:
         """Run CDType diagnosis from error_type + signals + patch behavior."""
         error_type = self.witness.failure_type if self.witness else ""
+        error_message = self.witness.error_message if self.witness else ""
         patch_behavior = self._compute_patch_behavior()
         diagnoser = ContextDeficiencyDiagnoser()
-        return diagnoser.diagnose(error_type, signals, patch_behavior)
+        return diagnoser.diagnose(error_type, signals, patch_behavior, error_message=error_message)
 
     # ------------------------------------------------------------------
     # CDType-driven actions (inspections/searches by CDType profile)
@@ -300,96 +706,37 @@ class DiagnosticSearchContractBuilder:
     def _add_cdtype_driven_actions(
         self,
         contract: DiagnosticSearchContract,
-        signals: RuntimeSignals,
+        resolver: ContractAnchorResolver,
         diagnosis: ContextDeficiencyDiagnosis,
     ) -> None:
-        """Append CDType-specific inspections/searches to contract.
+        """Append CDType-specific inspections/searches using resolved anchors.
 
-        CDType determines the *type* of action to add (the action profile).
-        Runtime signals determine the specific *target* (symbol, file, query).
+        CDType determines the *type* of action (the action profile).
+        ContractAnchorResolver provides pre-resolved anchors from all sources
+        (stack frames, visited/edited files, symbols, tests, import errors).
 
         Each added action carries:
-          source="cdtype_driven_action"
+          source='cdtype_driven_action'
           diagnosis_type=<the CDType>
         """
         cdtype = diagnosis.primary_cdtype
         if cdtype == "unknown":
             return
 
-        # Noise terms — defined early as _add_cdtype_driven_actions uses them below
-        _NOISE_TERMS = frozenset({
-            "Collecting", "Downloading", "Installing", "Successfully",
-            "WARNING", "Running", "FAILED", "ERROR", "Traceback",
-            "Skipping", "System", "Docs", "Found", "Total",
-            "Short", "Ran", "DeprecationWarning", "PytestConfigWarning",
-            "Unknown", "Warning", "Config",
-        })
-        _ENV_VAR_PREFIXES = ("CONDA_", "PYTHON_", "PIP_", "LD_", "DYLD_", "PKG_", "LC_")
-        _ENV_VAR_EXACT = {"CPython", "PYTHONHASHSEED", "HOSTNAME", "PLATFORM"}
-        _PYTHON_KEYWORDS = {"True", "False", "None"}
-        def _is_noise(term: str) -> bool:
-            if term in _NOISE_TERMS or term in _ENV_VAR_EXACT or term in _PYTHON_KEYWORDS:
-                return True
-            if term.endswith("Warning"):
-                return True
-            if any(term.startswith(p) for p in _ENV_VAR_PREFIXES):
-                return True
-            return False
-
-        # Collect runtime-available evidence for targeting
-        error_symbols: list[str] = []
-        error_terms: list[str] = []
-        edited_short: set[str] = set()
-        visited_short: set[str] = set()
-        stack_file_names: list[str] = []
-
-        if self.witness and self.witness.has_failure():
-            error_symbols = self.witness.error_symbols()
-            err_msg = self.witness.error_message
-            for m in re.finditer(r"\b[A-Z][a-zA-Z0-9_]+\b", err_msg):
-                term = m.group()
-                if len(term) > 4 and term not in error_symbols and not _is_noise(term):
-                    error_terms.append(term)
-
-        for f in self.parser.edited_files():
-            edited_short.add(f.split("/")[-1])
-
-        for f in self.parser.visited_files_fullpath():
-            visited_short.add(f.split("/")[-1])
-
-        if self.witness and self.witness.has_failure():
-            for sf in self.witness.all_stack_source_files():
-                stack_file_names.append(sf["file"])
-                visited_short.add(sf["file"])
-
-        issue_text = self.issue_text or ""
-        issue_terms = set(re.findall(r"\b[A-Z][a-zA-Z0-9_]+\b", issue_text))
-        issue_terms = {t for t in issue_terms if len(t) > 4}
-
-        # Build short→full path map for resolving inspection targets
-        _short_to_full: dict[str, str] = {}
-        for fp in sorted(self.parser.visited_files_fullpath(), key=lambda p: (p.count("/"), p)):
-            sn = fp.split("/")[-1]
-            if sn not in _short_to_full:
-                _short_to_full[sn] = fp
-        if self.witness and self.witness.has_failure():
-            for frame in self.witness.stack_trace:
-                fpath = frame.get("file", "")
-                if fpath:
-                    sn = fpath.split("/")[-1]
-                    if sn not in _short_to_full:
-                        _short_to_full[sn] = fpath
-
+        # Short-name to full-path resolver for inspection targets
         def _resolve_path(fpath: str) -> str:
-            """Try to resolve a short file name to full path."""
             if "/" in fpath or "\\" in fpath:
                 return fpath
-            return _short_to_full.get(fpath, fpath)
+            return resolver.short_to_full_path(fpath)
 
-        def _add_inspection(
-            fpath: str, reason: str,
-        ):
-            """Append CDType-driven inspection (resolves short→full path)."""
+        # Counter for paired action_group_id
+        _pair_counter = [0]
+
+        def _next_group_id() -> str:
+            _pair_counter[0] += 1
+            return f"pair_{_pair_counter[0]}"
+
+        def _add_inspection(fpath: str, reason: str, action_role: str = "", action_group_id: str = "", severity: str = "recommended"):
             fpath = _resolve_path(fpath)
             if not fpath:
                 return
@@ -398,12 +745,13 @@ class DiagnosticSearchContractBuilder:
                 reason=f"[{cdtype}] {reason}",
                 source="cdtype_driven_action",
                 diagnosis_type=cdtype,
+                severity=severity,
+                action_role=action_role,
+                action_group_id=action_group_id,
             ))
 
-        def _add_search(
-            query: str, stype: str, reason: str, scope: str = "",
-        ):
-            """Append CDType-driven search."""
+        def _add_search(query: str, stype: str, reason: str, scope: str = "",
+                        action_role: str = "", action_group_id: str = "", severity: str = "recommended"):
             if not query or len(query) < 2:
                 return
             contract.required_searches.append(RequiredSearch(
@@ -412,134 +760,165 @@ class DiagnosticSearchContractBuilder:
                 scope=scope,
                 source="cdtype_driven_action",
                 diagnosis_type=cdtype,
+                severity=severity,
+                action_role=action_role,
+                action_group_id=action_group_id,
             ))
+
+        # Convenience: resolved symbols, module attributes, edited short names
+        symbols = [s["symbol"] for s in resolver.symbols]
+        edited_files = list(self.parser.edited_files())
+        edited_short = [f.split("/")[-1] for f in edited_files]
 
         # === API_DEFINITION_CONTEXT ===
         if cdtype == CDTYPE_API_DEFINITION:
-            # Search: symbol definition for error symbols (more targeted)
-            for sym in error_symbols[:2]:
-                _add_search(sym, "symbol_definition", f"{cdtype}: definition of {sym}")
-            # Search: grep import path / class pattern
-            for sym in error_symbols[:1]:
+            # Search: symbol definition for known symbols
+            pgroup = _next_group_id()
+            for sym in symbols[:2]:
+                _add_search(sym, "symbol_definition", f"{cdtype}: definition of {sym}",
+                            action_role="definition", action_group_id=pgroup)
+            # Search: module import / class path
+            for sym in symbols[:1]:
                 if sym and sym != "<module>":
-                    _add_search(sym.split(".")[0], "grep", f"{cdtype}: import/class {sym}")
-            # Inspection: search for symbol usage in visited files
-            if error_symbols and stack_file_names:
-                # Find the definition-like file from visited files
-                for vf in sorted(visited_short):
-                    if vf.endswith(".py") and "test" not in vf.lower():
-                        _add_inspection(
-                            vf, f"{cdtype}: candidate definition file for {error_symbols[0]}",
-                        )
-                        break
+                    _add_search(sym.split(".")[0], "grep", f"{cdtype}: import/class {sym}",
+                                action_role="usage", action_group_id=pgroup)
+            # Import-time errors: search for the missing module/attribute
+            if resolver.has_import_error():
+                for attr in resolver.import_attributes()[:1]:
+                    _add_search(attr, "symbol_definition", f"{cdtype}: missing symbol {attr}")
+                for mod in resolver.import_modules()[:1]:
+                    _add_search(mod, "grep", f"{cdtype}: module/site of {mod}")
+            # Inspection: candidate definition file from stack or visited files
+            candidates = [f["path"] for f in resolver.files if not f["is_test"]]
+            if candidates:
+                _add_inspection(
+                    candidates[0],
+                    f"{cdtype}: candidate definition file for {symbols[0] if symbols else 'error symbol'}",
+                )
 
         # === INTERFACE_CONSTRAINT_CONTEXT ===
         elif cdtype == CDTYPE_INTERFACE_CONSTRAINT:
-            # Search: caller_search for the error function
-            for sym in error_symbols[:1]:
+            pgroup = _next_group_id()
+            for sym in symbols[:1]:
                 if sym and sym != "<module>":
-                    _add_search(sym, "caller_search", f"{cdtype}: callers of {sym}")
-            # Search: grep function signature
-            for sym in error_symbols[:1]:
-                if sym and sym != "<module>":
-                    _add_search(f"{sym}(", "grep", f"{cdtype}: signature/usage of {sym}")
-            # Inspection: function signature file from visited stack frames
-            for sf_name in stack_file_names[:1]:
+                    _add_search(sym, "caller_search", f"{cdtype}: callers of {sym}",
+                                action_role="caller", action_group_id=pgroup)
+                    _add_search(f"{sym}(", "grep", f"{cdtype}: signature/usage of {sym}",
+                                action_role="interface_producer", action_group_id=pgroup)
+            for f in resolver.stack_file_names()[:1]:
                 _add_inspection(
-                    sf_name, f"{cdtype}: inspect function signature at error location",
+                    f, f"{cdtype}: inspect function signature at error location",
+                    action_role="interface_consumer", action_group_id=pgroup,
                 )
 
         # === RELATED_TEST_CONTEXT ===
         elif cdtype == CDTYPE_RELATED_TEST:
-            # Search: grep assertion terms in test file
-            failed_test = self._build_failure_summary().failing_test
-            test_file = failed_test.split("::")[0] if "::" in failed_test else ""
+            test_file = resolver.test_file_path()
+            test_method = resolver.test_method_name()
+            pgroup = _next_group_id()
             if test_file:
                 _add_inspection(
-                    test_file, f"{cdtype}: inspect failed test and neighboring tests",
+                    test_file,
+                    f"{cdtype}: inspect failed test and neighboring tests",
+                    action_role="failed_test", action_group_id=pgroup,
                 )
-            for et in error_terms[:2]:
-                _add_search(et, "grep", f"{cdtype}: assertion term {et}")
-            # Also search the failed test method name
-            if "::" in failed_test:
-                test_method = failed_test.split("::")[-1]
-                _add_search(test_method, "grep", f"{cdtype}: test method for assertion")
+            # Search: assertion terms from resolved symbols
+            for sym in symbols[:2]:
+                _add_search(sym, "grep", f"{cdtype}: assertion term {sym}",
+                            action_role="neighbor_test", action_group_id=pgroup)
+            # Search: test method name
+            if test_method:
+                _add_search(test_method, "grep", f"{cdtype}: test method for assertion",
+                            action_role="neighbor_test", action_group_id=pgroup)
+            # Fallback: extract assertion expression from error_message
+            if not symbols and self.witness and self.witness.has_failure():
+                am = re.search(r"assert\s+(.+)", self.witness.error_message)
+                if am:
+                    for word in re.findall(
+                        r"\b([a-zA-Z_]\w+(?:\.\w+)*)\b", am.group(1)
+                    ):
+                        if len(word) > 2 and word.lower() not in {
+                            "is", "not", "in", "true", "false", "none"
+                        }:
+                            _add_search(word, "grep", f"{cdtype}: assertion term {word}")
+                            break
 
         # === ROOT_CAUSE_RELOCALIZATION ===
         elif cdtype == CDTYPE_ROOT_CAUSE:
-            # Search: issue terms globally (not in test files)
-            for it in list(issue_terms)[:2]:
+            # Search: resolved issue symbols globally
+            issue_syms = [s["symbol"] for s in resolver.symbols if s.get("source") == "issue_term"]
+            for it in issue_syms[:2]:
                 _add_search(it, "grep", f"{cdtype}: root cause term {it}")
             # Search: top stack frame symbol
-            if stack_file_names:
-                _add_search(
-                    stack_file_names[0].split("/")[-1].replace(".py", ""),
-                    "grep", f"{cdtype}: top stack frame symbol",
+            if resolver.stack_file_names():
+                top_file = resolver.stack_file_names()[0]
+                top_stem = Path(top_file).stem
+                _add_search(top_stem, "grep", f"{cdtype}: top stack frame symbol")
+            # Inspection: top error frame (priority chain handled by resolver)
+            top_file = resolver.top_error_file()
+            if top_file:
+                _add_inspection(
+                    top_file, f"{cdtype}: re-inspect top error frame for root cause",
                 )
-            # Inspection: top repo stack frame (force re-inspection)
-            if self.witness and self.witness.has_failure():
-                top_file = self.witness.top_error_file_fullpath() or self.witness.top_error_file()
-                if top_file:
-                    _add_inspection(
-                        top_file, f"{cdtype}: re-inspect top error frame for root cause",
-                    )
 
         # === CALLER_CALLEE_CONTEXT ===
         elif cdtype == CDTYPE_CALLER_CALLEE:
             # Search: caller_search for error function
-            for sym in error_symbols[:1]:
+            pgroup = _next_group_id()
+            for sym in symbols[:1]:
                 if sym and sym != "<module>":
-                    _add_search(sym, "caller_search", f"{cdtype}: callers of {sym}")
-            # Search: usages of edited symbol
-            for ef in sorted(edited_short)[:1]:
-                if ef.endswith(".py"):
-                    sym = ef.replace(".py", "")
-                    _add_search(f"{sym}(", "grep", f"{cdtype}: usage of edited file {ef}")
-            # Inspection: edited symbol definition
-            for ef in sorted(edited_short)[:1]:
-                if ef.endswith(".py"):
-                    _add_inspection(
-                        ef, f"{cdtype}: inspect definition of edited symbol {ef}",
-                    )
+                    _add_search(sym, "caller_search", f"{cdtype}: callers of {sym}",
+                                action_role="caller", action_group_id=pgroup)
+            # Search: usages of edited file symbol (any language)
+            for ef in edited_short[:1]:
+                sym = Path(ef).stem
+                if sym:
+                    _add_search(f"{sym}(", "grep", f"{cdtype}: usage of edited file {ef}",
+                                action_role="usage", action_group_id=pgroup)
+            # Inspection: edited file definition (no .py restriction)
+            for ef in edited_short[:1]:
+                _add_inspection(
+                    ef, f"{cdtype}: inspect definition of edited symbol {ef}",
+                    action_role="callee", action_group_id=pgroup,
+                )
 
         # === REGRESSION_CONSTRAINT_CONTEXT ===
         elif cdtype == CDTYPE_REGRESSION_CONSTRAINT:
-            # Search: tests touching edited symbols
-            for ef in sorted(edited_short)[:1]:
-                sym = ef.replace(".py", "")
+            for ef in edited_short[:1]:
+                sym = Path(ef).stem
                 _add_search(sym, "grep", f"{cdtype}: tests around edited {ef}")
-            # Inspection: newly failing test
-            failed_test = self._build_failure_summary().failing_test
-            test_file = failed_test.split("::")[0] if "::" in failed_test else ""
+            test_file = resolver.test_file_path()
             if test_file:
                 _add_inspection(
                     test_file, f"{cdtype}: inspect newly failing test",
                 )
-            # Search: regression term
-            for et in error_terms[:1]:
-                _add_search(et, "grep", f"{cdtype}: regression term {et}")
+            for sym in symbols[:1]:
+                _add_search(sym, "grep", f"{cdtype}: regression term {sym}")
 
         # === DEPENDENCY_CONTEXT ===
         elif cdtype == CDTYPE_DEPENDENCY:
-            # Search: grep import for module
-            for sym in error_symbols[:1]:
-                if sym and sym != "<module>":
+            # Search: import for module from symbols or import-error modules
+            import_targets = symbols[:1] + resolver.import_modules()
+            for target in import_targets[:1]:
+                if target:
                     _add_search(
-                        f"import {sym.split('.')[0]}", "grep",
-                        f"{cdtype}: dependency import for {sym}",
+                        f"import {target.split('.')[0]}", "grep",
+                        f"{cdtype}: dependency import for {target}",
                     )
-            # Inspection: __init__.py if in visited files
-            for vf in sorted(visited_short):
-                if vf == "__init__.py" or vf.endswith("/__init__.py"):
+            # Inspection: __init__.py if in known files
+            for f in resolver.files:
+                if f["path"].endswith("__init__.py"):
                     _add_inspection(
-                        vf, f"{cdtype}: inspect module exports",
+                        f["path"], f"{cdtype}: inspect module exports",
                     )
                     break
             # Search: config/registration terms in error message
-            config_terms = {"setup", "config", "registry", "install", "plugin"}
-            matching = {t for t in config_terms if any(t in e.lower() for e in error_terms)}
-            for ct in matching:
-                _add_search(ct, "grep", f"{cdtype}: config term {ct}")
+            if self.witness and self.witness.has_failure():
+                msg_lower = self.witness.error_message.lower()
+                config_terms = {"setup", "config", "registry", "install", "plugin"}
+                matching = {t for t in config_terms if t in msg_lower}
+                for ct in matching:
+                    _add_search(ct, "grep", f"{cdtype}: config term {ct}")
 
     @staticmethod
     def _post_process_inspections(
@@ -632,7 +1011,7 @@ class DiagnosticSearchContractBuilder:
                 or "/lib/python" in filepath
             )
 
-        def _add(filepath: str, line: int, reason: str):
+        def _add(filepath: str, line: int, reason: str, severity: str = "required"):
             """Add inspection if file is a repo file and not already covered."""
             if not _is_repo_file(filepath):
                 return
@@ -648,6 +1027,7 @@ class DiagnosticSearchContractBuilder:
                 file=filepath,
                 lines=[line] if line > 0 else [],
                 reason=reason,
+                severity=severity,
             ))
 
         # Source 1: Stack trace frames
@@ -713,7 +1093,7 @@ class DiagnosticSearchContractBuilder:
             if fname:
                 # Resolve short name to full path when available
                 full = short_to_full.get(fname, fname)
-                _add(full, 0, "viewed but not utilized by agent")
+                _add(full, 0, "viewed but not utilized by agent", severity="recommended")
 
         # Source 5: Edited files not in stack trace
         if self.witness and self.witness.has_failure():
@@ -723,7 +1103,7 @@ class DiagnosticSearchContractBuilder:
                 if ef_short not in stack_file_names:
                     # Check if it's a source file (not test)
                     if "test" not in ef_short.lower():
-                        _add(ef, 0, "edited file (not in error stack — verify relevance)")
+                        _add(ef, 0, "edited file (not in error stack — verify relevance)", severity="recommended")
 
         # Sort inspections: stack frames with explicit lines first, then by having a line number
         inspections.sort(key=lambda x: (
@@ -755,13 +1135,14 @@ class DiagnosticSearchContractBuilder:
         searches: list[RequiredSearch] = []
         seen_queries: set[str] = set()
 
-        def _add(query: str, typ: str, scope: str = ""):
+        def _add(query: str, typ: str, scope: str = "", severity: str = "recommended"):
             if query and query not in seen_queries:
                 seen_queries.add(query)
                 searches.append(RequiredSearch(
                     query=query,
                     type=typ,
                     scope=scope,
+                    severity=severity,
                 ))
 
         # Source 1: Error symbols (function/class names from stack trace)
@@ -849,18 +1230,127 @@ class DiagnosticSearchContractBuilder:
     # Anti-Patterns
     # ------------------------------------------------------------------
 
-    def _build_anti_patterns(
-        self, signals: RuntimeSignals,
-        diagnosis: Optional[ContextDeficiencyDiagnosis] = None,
-    ) -> list[str]:
-        """Generate anti-pattern warnings based on trajectory signals and CDType.
+    # ------------------------------------------------------------------
+    # Structured Constraints
+    # ------------------------------------------------------------------
 
-        Each anti-pattern targets a specific failure mode observed in the
-        Attempt-1 trajectory. Warnings are concrete and actionable.
+    def _build_structured_constraints(
+        self,
+        signals: RuntimeSignals,
+        diagnosis: Optional[ContextDeficiencyDiagnosis] = None,
+        resolver: Optional[ContractAnchorResolver] = None,
+    ) -> list[StructuredConstraint]:
+        """Build structured constraints from trajectory signals and CDType.
+
+        Each constraint has a concrete type, severity, and resolved parameters.
+        The compliance analyzer evaluates these individually rather than
+        parsing natural-language anti_patterns.
+        """
+        constraints: list[StructuredConstraint] = []
+
+        # FORBID_TEST_EDITS — blanket rule for all instances
+        constraints.append(StructuredConstraint(
+            constraint_type="FORBID_TEST_EDITS",
+            severity="required",
+            parameters={},
+            display_text=(
+                "Do not modify test files unless the fix specifically "
+                "requires test changes. Prefer minimal, targeted edits "
+                "over broad sweeping changes."
+            ),
+        ))
+
+        # REQUIRE_INSPECTION_BEFORE_EDIT — when error file was never viewed
+        if signals.error_edit_alignment == "error_file_never_viewed":
+            target_path = ""
+            target_provenance = "stack_frame"
+            if resolver is not None:
+                target_path, target_provenance = resolver.top_error_file_provenance()
+            elif self.witness and self.witness.has_failure():
+                target_path = self.witness.top_error_file_fullpath()
+            constraints.append(StructuredConstraint(
+                constraint_type="REQUIRE_INSPECTION_BEFORE_EDIT",
+                severity="required",
+                parameters={
+                    "target_path": target_path,
+                    "target_provenance": target_provenance,
+                },
+                display_text=(
+                    "The primary error source file was never viewed "
+                    "in attempt_1. Start by inspecting the error source "
+                    "file at the failing line, then trace the call to "
+                    "understand what needs to change."
+                ),
+            ))
+
+        # AVOID_REPETITIVE_TEST_RUNS — when oscillating
+        if signals.exploration_mode == "oscillating":
+            constraints.append(StructuredConstraint(
+                constraint_type="AVOID_REPETITIVE_TEST_RUNS",
+                severity="recommended",
+                parameters={"min_gap_actions": 1},
+                display_text=(
+                    "Avoid repetitive test runs without intervening edits. "
+                    "Each test run should follow a specific code change. "
+                    "If a test fails, inspect the error location before re-running."
+                ),
+            ))
+
+        # REVISIT_DROPPED_FILES — when ≥3 files viewed but not used
+        if len(signals.viewed_then_dropped_files) >= 3:
+            file_paths = signals.viewed_then_dropped_files[:5]
+            constraints.append(StructuredConstraint(
+                constraint_type="REVISIT_DROPPED_FILES",
+                severity="recommended",
+                parameters={"file_paths": file_paths},
+                display_text=(
+                    f"Several files were viewed but not used "
+                    f"({len(signals.viewed_then_dropped_files)} total). "
+                    "Revisit the viewed-but-dropped files — they may "
+                    "contain relevant context that was overlooked."
+                ),
+            ))
+
+        # PREFER_SINGLE_FILE_FIX — when many files were edited
+        if signals.unique_files_edited >= 4:
+            constraints.append(StructuredConstraint(
+                constraint_type="PREFER_SINGLE_FILE_FIX",
+                severity="informational",
+                parameters={"max_files": 1},
+                display_text=(
+                    f"Attempt-1 edited {signals.unique_files_edited} files. "
+                    "Focus on the root cause rather than making changes "
+                    "across many files. A single-file fix is often sufficient."
+                ),
+            ))
+
+        return constraints
+
+    # ------------------------------------------------------------------
+    # Anti-Patterns (derived from structured_constraints + extra patterns)
+    # ------------------------------------------------------------------
+
+    def _build_anti_patterns(
+        self,
+        signals: RuntimeSignals,
+        diagnosis: Optional[ContextDeficiencyDiagnosis] = None,
+        structured_constraints: Optional[list[StructuredConstraint]] = None,
+    ) -> list[str]:
+        """Generate anti-pattern warnings from constraints, CDType, and signals.
+
+        Derives text from structured_constraints.display_text first, then
+        adds CDType-specific guidance and trajectory-specific patterns that
+        are not constraint-mapped.
         """
         patterns: list[str] = []
 
-        # Anti-pattern 0: CDType-specific (always included when diagnosis available)
+        # Phase 1: Derive from structured_constraints.display_text
+        if structured_constraints:
+            for sc in structured_constraints:
+                if sc.display_text:
+                    patterns.append(sc.display_text)
+
+        # Phase 2: CDType-specific guidance (informational, not a constraint)
         if diagnosis and diagnosis.primary_cdtype != "unknown":
             cdtype_patterns = {
                 CDTYPE_API_DEFINITION: (
@@ -898,14 +1388,9 @@ class DiagnosticSearchContractBuilder:
                     f"[{diagnosis.primary_cdtype}] {msg}"
                 )
 
-        # Anti-pattern 1: Exploration-mode specific
-        if signals.exploration_mode == "oscillating":
-            patterns.append(
-                "Avoid repetitive test runs without intervening edits. "
-                "Each test run should follow a specific code change. "
-                "If a test fails, inspect the error location before re-running."
-            )
+        # Phase 3: Non-constraint trajectory patterns
 
+        # Jumping — general guidance, not a constraint
         if signals.exploration_mode == "jumping":
             patterns.append(
                 "Limit file browsing. Investigate the specific error "
@@ -913,7 +1398,7 @@ class DiagnosticSearchContractBuilder:
                 "Use the required_inspections list as your starting point."
             )
 
-        # Anti-pattern 2: Error-edit alignment specific
+        # Viewed-not-edited — weaker form of REQUIRE_INSPECTION_BEFORE_EDIT
         if signals.error_edit_alignment == "viewed_not_edited":
             patterns.append(
                 "The stack trace files were viewed but not modified in attempt_1. "
@@ -921,39 +1406,12 @@ class DiagnosticSearchContractBuilder:
                 "then trace the call to understand what needs to change."
             )
 
+        # Edited-elsewhere — general guidance about focus
         if signals.error_edit_alignment == "edited_elsewhere":
             patterns.append(
                 "The edit location in attempt_1 does not align with the error location. "
                 "The correct file was edited but at a different function or line. "
                 "Use required_inspections to find the exact error location before editing."
-            )
-
-        if signals.error_edit_alignment == "error_file_never_viewed":
-            patterns.append(
-                "The primary error source file was never viewed in attempt_1. "
-                "Use required_inspections to locate and inspect it before editing."
-            )
-
-        # Anti-pattern 3: Viewed-then-dropped
-        if len(signals.viewed_then_dropped_files) >= 3:
-            patterns.append(
-                f"Several files were viewed but not used ({len(signals.viewed_then_dropped_files)} total). "
-                "Revisit the viewed-but-dropped files — they may contain relevant "
-                "context that was overlooked."
-            )
-
-        # Anti-pattern 4: Default — always include general guardrails
-        patterns.append(
-            "Do not modify test files unless the fix specifically requires test changes. "
-            "Prefer minimal, targeted edits over broad sweeping changes."
-        )
-
-        # Check if agent edited many files for a small error
-        if signals.unique_files_edited >= 4:
-            patterns.append(
-                f"Attempt-1 edited {signals.unique_files_edited} files. "
-                "Focus on the root cause rather than making changes across many files. "
-                "A single-file fix is often sufficient."
             )
 
         return patterns

@@ -70,7 +70,6 @@ def _make_request(
         repo_path=None,
         base_commit="abc123",
         issue_text="Fix the bug in django-13513.",
-        attempt1_dir=None,
         attempt1_patch_path=None,
         attempt1_runtime_signals_path=None,
         context_packet_path=ctx,

@@ -28,6 +28,27 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+# -- Mutation detection patterns (for edit timing) --
+# These regex patterns detect file-mutation commands in trajectory assistant messages.
+# Used ONLY for edit timing, NOT for inspection evidence.
+
+_SED_MUTATION_RE = re.compile(
+    r"sed\s+-i(?:\s+\S+)?\s+(?:'[^']*'|\"[^\"]*\")\s+(\S+)"
+)
+_CAT_WRITE_RE = re.compile(
+    r"cat\s+(?:>\||>>|>)\s*(\S+)"
+)
+_ECHO_WRITE_RE = re.compile(
+    r"(?:echo|printf)\s+['\"].*?['\"]\s+(?:>\||>>|>)\s*(\S+)"
+)
+_PYTHON_WRITE_RE = re.compile(
+    r"""python\s+-c\s+['\"].*?open\(['\"](\S+)['\"]\s*,\s*['\"]w['\"]"""
+)
+_STRUCTURED_TOOL_RE = re.compile(
+    r"(?:apply_patch|write_file|replace)\s+(\S+)"
+)
+
+
 # =====================================================================
 # TrajParser — low-level trajectory access
 # =====================================================================
@@ -36,7 +57,7 @@ class TrajParser:
     """Parse and provide structured access to a mini-SWE-agent traj.json."""
 
     def __init__(self, traj_path: str | Path):
-        with open(traj_path) as f:
+        with open(traj_path, encoding="utf-8", errors="replace") as f:
             self._raw = json.load(f)
         self._parse_messages()
 
@@ -47,6 +68,7 @@ class TrajParser:
         self._bash_commands: list[dict] = []
         self._test_commands: list[dict] = []
         self._checkout_events: list[int] = []
+        self._mutation_events: list[dict] = []
 
         for i, msg in enumerate(self.messages):
             role = msg.get("role", "")
@@ -58,10 +80,10 @@ class TrajParser:
                 self._parse_user(i, content)
 
     def _parse_assistant(self, idx: int, content: str):
-        """Extract bash commands, test runs, checkouts from assistant messages."""
-        # Bash code blocks
-        for match in re.finditer(r"```bash\s*\n(.+?)```", content, re.DOTALL):
-            cmd = match.group(1).strip()
+        """Extract bash commands, test runs, checkouts, mutation events."""
+        cmds = self._extract_commands(content)
+
+        for cmd in cmds:
             entry = {"step": idx, "cmd": cmd}
             self._bash_commands.append(entry)
 
@@ -74,10 +96,66 @@ class TrajParser:
             if "git checkout" in cmd and "--" not in cmd:
                 self._checkout_events.append(idx)
 
+        # Detect mutations from all commands
+        for cmd in cmds:
+            self._detect_mutations(idx, cmd)
+
+    def _extract_commands(self, content: str) -> list[str]:
+        """Extract all commands from assistant message content.
+
+        Handles both ```bash code blocks and <command> tags inside
+        <tool_calls> blocks.
+        """
+        cmds = []
+        for match in re.finditer(r"```bash\s*\n(.+?)```", content, re.DOTALL):
+            cmds.append(match.group(1).strip())
+        for match in re.finditer(r"<command>(.+?)</command>", content, re.DOTALL):
+            cmds.append(match.group(1).strip())
+        return cmds
+
+    def _detect_mutations(self, step: int, cmd: str):
+        """Detect file mutation events from a command string.
+
+        Detects: sed -i, cat >, echo/printf >, python file writes,
+        and structured tools (apply_patch/write_file/replace).
+        Matches against module-level compiled regex patterns.
+        """
+        cmd_trunc = cmd[:300]
+
+        for m in _SED_MUTATION_RE.finditer(cmd):
+            self._mutation_events.append({
+                "step": step, "file": m.group(1),
+                "type": "sed_replace", "command": cmd_trunc,
+            })
+
+        for m in _CAT_WRITE_RE.finditer(cmd):
+            self._mutation_events.append({
+                "step": step, "file": m.group(1),
+                "type": "cat_write", "command": cmd_trunc,
+            })
+
+        for m in _ECHO_WRITE_RE.finditer(cmd):
+            self._mutation_events.append({
+                "step": step, "file": m.group(1),
+                "type": "echo_write", "command": cmd_trunc,
+            })
+
+        for m in _PYTHON_WRITE_RE.finditer(cmd):
+            self._mutation_events.append({
+                "step": step, "file": m.group(1),
+                "type": "python_write", "command": cmd_trunc,
+            })
+
+        for m in _STRUCTURED_TOOL_RE.finditer(cmd):
+            self._mutation_events.append({
+                "step": step, "file": m.group(1),
+                "type": "structured_tool", "command": cmd_trunc,
+            })
+
     def _parse_user(self, idx: int, content: str):
         """Extract explore_context events from user (tool output) messages."""
         for match in re.finditer(
-            r"<explore_context>\s*File:\s*(\S+)\s*Lines:\s*(\d+)-(\d+)",
+            r"(?i)<explore_context>\s*File:\s*(\S+)\s*Lines:\s*(\d+)-(\d+)",
             content,
         ):
             self._explore_events.append({
@@ -137,6 +215,71 @@ class TrajParser:
             files.append(match.group(1))
         return files
 
+    # -- Mutation Events (for edit timing, NOT inspection evidence) --
+
+    def mutation_events(self) -> list[dict]:
+        """Return list of file-mutation events from trajectory messages.
+
+        Each event: {"step": int, "file": str, "type": str, "command": str}
+        Mutation types: sed_replace, cat_write, echo_write,
+                        python_write, structured_tool.
+        Used ONLY for edit timing in contract compliance analysis.
+        """
+        return list(self._mutation_events)
+
+    def first_edit_step(self) -> int | None:
+        """Return the step index of the first detected mutation event."""
+        if not self._mutation_events:
+            return None
+        return min(e["step"] for e in self._mutation_events)
+
+    def last_edit_step(self) -> int | None:
+        """Return the step index of the last detected mutation event."""
+        if not self._mutation_events:
+            return None
+        return max(e["step"] for e in self._mutation_events)
+
+    def edited_files_by_step(self) -> dict[int, list[str]]:
+        """Return dict mapping step indices to files edited at that step."""
+        by_step: dict[int, list[str]] = {}
+        for e in self._mutation_events:
+            by_step.setdefault(e["step"], []).append(e["file"])
+        return by_step
+
+    def mutation_timing_reliable(self) -> bool:
+        """Check if mutation_events covers all files in the final patch.
+
+        Returns True when every file in edited_files() was detected as a
+        mutation event. A mismatch means some edits happened without
+        detectable mutation events, so before-edit / after-final-edit
+        timing for any result becomes UNDETERMINED.
+        """
+        mutated = {self._normalize_path(e["file"]) for e in self._mutation_events}
+        patch_files = set(self.edited_files())
+        if not patch_files:
+            return True
+        return patch_files.issubset(mutated)
+
+    def unmatched_final_patch_files(self) -> list[str]:
+        """Files in final patch but not detected as mutation events."""
+        mutated = {self._normalize_path(e["file"]) for e in self._mutation_events}
+        patch_files = set(self.edited_files())
+        return sorted(patch_files - mutated)
+
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        """Normalize a file path to repo-relative form.
+
+        Strips known prefixes (/testbed/, /workspace/, ./),
+        normalizes backslashes to forward slashes.
+        """
+        path = path.replace("\\", "/")
+        for prefix in ["/testbed/", "/workspace/", "./"]:
+            if path.startswith(prefix):
+                path = path[len(prefix):]
+                break
+        return path
+
 
 # =====================================================================
 # FailureWitnessLoader — load structured failure info
@@ -146,7 +289,7 @@ class FailureWitnessLoader:
     """Load and parse a FailureWitness JSON file."""
 
     def __init__(self, path: str | Path):
-        with open(path) as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             self._data = json.load(f)
 
     @property
@@ -165,22 +308,48 @@ class FailureWitnessLoader:
     def stack_trace(self) -> list[dict]:
         st = self._data.get("stack_trace", [])
         if st:
+            # Handle string-format stack traces (flat list of traceback lines)
+            if isinstance(st[0], str):
+                return self._parse_string_stack_trace(st)
             return st
         # Fallback: try to extract stack frames from error_message text
+        return self._parse_stack_from_error_message()
+
+    def _parse_string_stack_trace(self, lines: list[str]) -> list[dict]:
+        """Parse a list of traceback strings into structured dict frames.
+
+        Preserves ALL frames (no dedup — dedup is the responsibility of
+        callers like _build_required_inspections, which use full path keys).
+        """
+        frames = []
+        for line in lines:
+            # Standard:   File "path/to/file.py", line N, in func
+            m = re.match(r'\s*File "([^"]+)", line (\d+)(?:, in (\S+))?', line)
+            if m:
+                fpath = m.group(1)
+                is_repo = not fpath.startswith("/opt/") and not fpath.startswith("/usr/")
+                frames.append({
+                    "file": fpath,
+                    "line": int(m.group(2)),
+                    "func": m.group(3) or "",
+                    "repo_frame": is_repo,
+                })
+        if frames:
+            return frames
+        # If regex didn't match, try the error_message fallback
+        return self._parse_stack_from_error_message()
+
+    def _parse_stack_from_error_message(self) -> list[dict]:
+        """Fallback: extract stack frames from the error_message text."""
         err = self._data.get("error_message", "")
         if not err:
             return []
         frames = []
-        seen_files = set()
         # Fallback 1: standard Python traceback lines
         for match in re.finditer(
             r'  File "([^"]+)", line (\d+), in (\S+)', err
         ):
             fpath = match.group(1)
-            fname = fpath.split("/")[-1]
-            if fname in seen_files:
-                continue
-            seen_files.add(fname)
             is_repo = not fpath.startswith("/opt/") and not fpath.startswith("/usr/")
             frames.append({
                 "file": fpath,
@@ -191,15 +360,10 @@ class FailureWitnessLoader:
         if frames:
             return frames
         # Fallback 2: pytest FAILED line (contains test file and test name)
-        # Format: FAILED path/to/test_file.py::test_function - ErrorType
         for match in re.finditer(
             r"FAILED\s+(\S+)::(\S+)", err
         ):
             fpath = match.group(1)
-            fname = fpath.split("/")[-1]
-            if fname in seen_files:
-                continue
-            seen_files.add(fname)
             frames.append({
                 "file": fpath if "/" in fpath else f"tests/{fpath}",
                 "line": 0,
@@ -210,7 +374,10 @@ class FailureWitnessLoader:
 
     @property
     def top_repo_frames(self) -> list[dict]:
-        return self._data.get("top_repo_frames", [])
+        trf = self._data.get("top_repo_frames", [])
+        if trf and isinstance(trf[0], str):
+            return self._parse_string_stack_trace(trf)
+        return trf
 
     def has_failure(self) -> bool:
         return self._data.get("has_failure_witness", False)
@@ -255,13 +422,49 @@ class FailureWitnessLoader:
         return files
 
     def error_symbols(self) -> list[str]:
-        """Function/class names from stack trace frames."""
+        """Function/class names from stack trace frames or error message.
+
+        When stack trace frames don't include function names (e.g., Rust
+        or abbreviated Python traces), falls back to extracting likely
+        symbol names from the error_message text.
+        """
         symbols = []
         for frame in self.stack_trace:
             func = frame.get("func", "")
             if func and func not in symbols:
                 symbols.append(func)
-        return symbols
+        if symbols:
+            return symbols
+        # Fallback: extract capitalized symbols from error_message
+        return self._error_symbols_from_message()
+
+    def _error_symbols_from_message(self) -> list[str]:
+        """Extract likely symbol names from error_message as fallback."""
+        import re
+        err = self._data.get("error_message", "")
+        if not err:
+            return []
+        symbols = []
+        seen = set()
+        # Look for capitalized or dotted names (TypeError, module.Class, etc.)
+        for m in re.finditer(r"\b[A-Z][a-zA-Z0-9_]*(?:\.[a-zA-Z_]\w*)*", err):
+            name = m.group()
+            # Skip noise words and single chars
+            if len(name) <= 2 or name in _ERROR_MSG_NOISE:
+                continue
+            if name not in seen:
+                seen.add(name)
+                symbols.append(name)
+        return symbols[:6]
+
+
+_ERROR_MSG_NOISE = frozenset({
+    "True", "False", "None", "Error", "Warning", "Exception",
+    "Std", "Linux", "Windows", "Mac", "OSError", "Errno",
+    "Python", "File", "Line", "Raised", "During", "Handling",
+    "Collecting", "Installing", "Downloading", "Successfully",
+    "Short", "Total", "Config", "Found", "Ran", "Docs",
+})
 
 
 # =====================================================================

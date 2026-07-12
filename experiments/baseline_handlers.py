@@ -274,6 +274,11 @@ def handle_feedback_retry(
     patch_summary = _summarize_previous_patch(attempt_1)
     test_feedback = _extract_test_feedback(attempt_1)
 
+    # Frozen-eligible override: force retry regardless of old trigger
+    force_retry = config.get("force_feedback_retry", False)
+    if force_retry and not trigger_result.should_retry:
+        trigger_result.should_retry = True
+
     if trigger_result.should_retry:
         packet_md = _build_feedback_packet(
             instance_id=instance_id,
@@ -282,8 +287,8 @@ def handle_feedback_retry(
             test_feedback=test_feedback,
         )
         packet_path.write_text(packet_md, encoding="utf-8")
-        intervention_status = "feedback_packet_built"
-        packet_mode = "feedback_only"
+        intervention_status = "feedback_packet_built" if not force_retry else "eligible_forced_retry"
+        packet_mode = "feedback_only" if not force_retry else "eligible_forced"
     else:
         # No packet — intervention_report records why no retry
         intervention_status = "skipped_no_retry"
@@ -1031,6 +1036,186 @@ def handle_condiag_retry(
     }
 
 
+def handle_condiag_contract_retry(
+    run_dir: Path,
+    instance_id: str,
+    mode: str,
+    adapter,
+    config: dict,
+) -> dict:
+    """ConDiag contract retry handler -- reads pre-generated contract JSON.
+
+    This is the Task 17 handler for Attempt-2 smoke pilot. Unlike
+    condiag_packet_only, this handler does NOT run the auto-diagnoser.
+    Instead it reads a pre-generated DiagnosticSearchContract JSON from
+    a contracts directory, renders it to Markdown, and injects it as
+    the context_packet for the Host Agent's attempt_2.
+
+    Flow:
+      1. Resolve base_miniswe attempt_1
+      2. Copy attempt_1/* to this run's attempt_1/
+      3. Load contract JSON from <contracts_root>/<safe_id>.json
+      4. Render to Markdown via render_contract_to_markdown()
+      5. Save as intervention/context_packet.md + intervention/contract.json
+      6. Write intervention/intervention_report.json
+      7. final/* = attempt_1/* (attempt_2 executed by host_agent_retry_runner)
+      8. cost.json inherits from base
+
+    config keys consumed:
+        contracts_root   : Path or str  (dir containing pre-generated contract JSONs)
+        base_run_root    : Path or str  (root containing miniswe/base_miniswe/<instance>/)
+        manifest         : dict         (fallback if base_miniswe attempt_1 missing)
+    """
+    if mode == "dry-run":
+        return {
+            "handled": False,
+            "reason": "dry_run_skeleton_only",
+            "mode": mode,
+            "instance_id": instance_id,
+        }
+
+    run_dir = Path(run_dir)
+    attempt_1 = run_dir / "attempt_1"
+    intervention = run_dir / "intervention"
+    final = run_dir / "final"
+    attempt_1.mkdir(parents=True, exist_ok=True)
+    intervention.mkdir(parents=True, exist_ok=True)
+    final.mkdir(parents=True, exist_ok=True)
+
+    # 1. Resolve base_miniswe attempt_1
+    base_run_root = Path(config.get("base_run_root") or run_dir.parent.parent.parent)
+    base_attempt_1 = base_run_root / "miniswe" / "base_miniswe" / instance_id / "attempt_1"
+    base_cost = base_run_root / "miniswe" / "base_miniswe" / instance_id / "cost.json"
+
+    base_exists = base_attempt_1.is_dir() and (base_attempt_1 / "runtime_signals.json").is_file()
+
+    if base_exists:
+        for src in base_attempt_1.iterdir():
+            if src.is_file():
+                shutil.copyfile(src, attempt_1 / src.name)
+        traj_source = "base_miniswe_attempt_1"
+    else:
+        manifest = config.get("manifest") or {}
+        row = manifest.get(instance_id)
+        if row is None:
+            return {
+                "handled": False,
+                "reason": f"neither base_miniswe attempt_1 nor manifest row for {instance_id!r}",
+                "mode": mode, "instance_id": instance_id,
+            }
+        traj_path = Path(row["traj_path"])
+        adapter.build_case_bundle(
+            raw_run_dir=traj_path.parent,
+            instance_id=instance_id,
+            out_dir=attempt_1,
+        )
+        traj_source = f"manifest_fallback:{traj_path}"
+
+    # 2. Load pre-generated contract
+    contracts_root = Path(
+        config.get("contracts_root")
+        or "/mnt/d/condiag-artifacts/condiag/pool/dev10_contracts"
+    )
+    safe_id = instance_id.replace("/", "__")
+    contract_path = contracts_root / f"{safe_id}.json"
+
+    contract_exists = contract_path.is_file()
+    if contract_exists:
+        from condiag.contract_renderer import render_contract_to_markdown
+        contract_md = render_contract_to_markdown(contract_path)
+        # Save rendered markdown as context_packet
+        (intervention / "context_packet.md").write_text(contract_md, encoding="utf-8")
+        # Save original contract JSON
+        shutil.copyfile(contract_path, intervention / "contract.json")
+        intervention_status = "condiag_contract_built"
+        should_retry = True
+    else:
+        intervention_status = f"contract_not_found:{contract_path}"
+        should_retry = False
+
+    # 3. Intervention report
+    intervention_report = {
+        "schema_version": "condiag.intervention_report.v0",
+        "instance_id": instance_id,
+        "agent": adapter.name,
+        "baseline": "condiag_contract_retry",
+        "mode": "packet_only",
+        "status": intervention_status,
+        "should_retry": should_retry,
+        "contract_path": str(contract_path) if contract_exists else None,
+        "contract_loaded": contract_exists,
+        "has_context_packet": contract_exists,
+        "context_packet_path": str(intervention / "context_packet.md") if contract_exists else None,
+        "context_packet_kind": "condiag_contract" if contract_exists else None,
+        "attempts_planned": 2 if should_retry else 1,
+        "attempt_2_executed": False,
+        "source_attempt_1": str(base_attempt_1) if base_exists else traj_source,
+        "created_at": _now_iso(),
+    }
+    (intervention / "intervention_report.json").write_text(
+        json.dumps(intervention_report, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    # 4. final/* = attempt_1/* (packet_only: no real retry yet)
+    for sub in ["patch.diff", "runtime_signals.json"]:
+        src = attempt_1 / sub
+        if src.is_file():
+            shutil.copyfile(src, final / sub)
+
+    final_report = {
+        "schema_version": "condiag.final_report.v0",
+        "instance_id": instance_id,
+        "agent": adapter.name,
+        "baseline": "condiag_contract_retry",
+        "mode": "packet_only",
+        "selected_attempt": 1,
+        "selected_attempt_dir": "attempt_1",
+        "selection_reason": (
+            "condiag_contract_retry: contract rendered to context_packet; "
+            if contract_exists
+            else "condiag_contract_retry: contract not found; fallback to attempt_1"
+        ) + "attempt_2 delegated to host_agent_retry_runner",
+        "has_final_patch": (final / "patch.diff").is_file() and (final / "patch.diff").stat().st_size > 0,
+        "contextbench_metrics_status": "pending_evaluation",
+        "finalized_at": _now_iso(),
+    }
+    (final / "final_report.json").write_text(
+        json.dumps(final_report, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    # 5. cost.json inherits from base
+    if base_cost.is_file():
+        shutil.copyfile(base_cost, run_dir / "cost.json")
+    else:
+        manifest = config.get("manifest") or {}
+        row = manifest.get(instance_id)
+        if row:
+            from .cost_extractor import extract_cost_from_traj
+            cost_data = extract_cost_from_traj(
+                traj_path=Path(row["traj_path"]),
+                instance_id=instance_id,
+                agent=adapter.name,
+            )
+            (run_dir / "cost.json").write_text(
+                json.dumps(cost_data, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+
+    return {
+        "handled": True,
+        "reason": "condiag_contract_retry" if contract_exists else f"contract_not_found:{contract_path}",
+        "mode": mode,
+        "instance_id": instance_id,
+        "contract_loaded": contract_exists,
+        "intervention_status": intervention_status,
+        "should_retry": should_retry,
+        "has_context_packet": contract_exists,
+        "source_attempt_1": str(base_attempt_1) if base_exists else traj_source,
+        "attempt_1_status": "completed",
+        "attempt_2_status": "pending_host_agent_retry_runner",
+        "final_source": "attempt_1",
+    }
+
+
 # ============================================================================
 # ConDiag packet_mode classifier (6-class taxonomy, D4-8.5 Step 1)
 # ============================================================================
@@ -1193,6 +1378,7 @@ BASELINE_HANDLERS: dict[str, HandlerFn] = {
     "condiag_packet_only": handle_condiag_packet_only,
     "condiag_retry": handle_condiag_retry,
     "plain_rerun": handle_plain_rerun,
+    "condiag_contract_retry": handle_condiag_contract_retry,
 }
 
 

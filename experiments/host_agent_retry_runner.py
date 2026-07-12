@@ -184,6 +184,36 @@ def _render_e1_contract(instance_id: str) -> str:
 # ============================================================================
 
 
+def _extract_issue_from_trajectory(traj_path: Path) -> str:
+    """Extract PR description / issue text from trajectory first user message."""
+    import json, re
+    if not traj_path.is_file():
+        return ""
+    try:
+        traj = json.loads(traj_path.read_text(encoding="utf-8"))
+        for msg in traj.get("messages", []):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    # Extract between <pr_description> tags
+                    m = re.search(r"<pr_description>\s*(.+?)\s*</pr_description>", content, re.DOTALL)
+                    if m:
+                        return m.group(1).strip()
+                    return content[:500]
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text = part.get("text", "")
+                            m = re.search(r"<pr_description>\s*(.+?)\s*</pr_description>", text, re.DOTALL)
+                            if m:
+                                return m.group(1).strip()
+                            return text[:500]
+    except Exception:
+        pass
+    return ""
+
+
+
 def build_retry_request(
     instance_id: str,
     baseline: str,
@@ -253,10 +283,19 @@ def build_retry_request(
 
     # Issue text: try to get from manifest / SWE-bench
     if not issue_text and manifest_csv and manifest_csv.is_file():
-        from experiments.manifest_builder import get_problem_statement
-        issue = get_problem_statement(instance_id)
-        if issue:
-            issue_text = issue
+        try:
+            from experiments.manifest_builder import get_problem_statement
+            issue = get_problem_statement(instance_id)
+            if issue:
+                issue_text = issue
+        except ImportError:
+            pass
+
+    # Fallback: extract issue text from trajectory if still empty
+    if not issue_text:
+        traj_issue = _extract_issue_from_trajectory(base_run / "attempt_1" / "trajectory.json")
+        if traj_issue:
+            issue_text = traj_issue
 
     if not issue_text:
         issue_text = f"Fix the bug in {instance_id}."
@@ -267,7 +306,6 @@ def build_retry_request(
         repo_path=repo_path,
         base_commit=base_commit,
         issue_text=issue_text,
-        attempt1_dir=base_run / "attempt_1",
         attempt1_patch_path=attempt1_patch,
         attempt1_runtime_signals_path=attempt1_rs,
         context_packet_path=ctx_pkt,
@@ -637,7 +675,7 @@ def run_host_agent_retry(
         "instance_id": instance_id,
         "packet_source": request.metadata.get("packet_source") if hasattr(request, "metadata") else None,
         "failure_witness_used": baseline not in ("plain_rerun",),
-        "context_packet_used": baseline in ("condiag_retry", "condiag_packet_only", "condiag_retry_v2_alpha"),
+        "context_packet_used": baseline in ("condiag_retry", "condiag_packet_only", "condiag_retry_v2_alpha", "condiag_contract_retry"),
         "api_navigation_used": baseline in ("condiag_retry", "condiag_retry_v2_alpha"),
         "e1_contract_injected": baseline == "packet_consumption_e1",
         "mode": mode,
@@ -822,7 +860,7 @@ def run_host_agent_retry(
         "baseline": baseline,
         "packet_source": request.metadata.get("packet_source") if hasattr(request, "metadata") else None,
         "failure_witness_used": baseline not in ("plain_rerun",),
-        "context_packet_used": baseline in ("condiag_retry", "condiag_packet_only", "condiag_retry_v2_alpha"),
+        "context_packet_used": baseline in ("condiag_retry", "condiag_packet_only", "condiag_retry_v2_alpha", "condiag_contract_retry"),
         "api_navigation_used": baseline in ("condiag_retry", "condiag_retry_v2_alpha"),
         "e1_contract_injected": baseline == "packet_consumption_e1",
         "source": "host_agent_retry",
@@ -943,7 +981,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument(
         "--baseline", required=True,
-        choices=["plain_rerun", "feedback_retry", "broad_expansion", "condiag_retry", "condiag_retry_v2_alpha", "packet_consumption_e1"],
+        choices=["plain_rerun", "feedback_retry", "broad_expansion", "condiag_retry", "condiag_retry_v2_alpha", "packet_consumption_e1", "condiag_contract_retry"],
         help="baseline to run (plain_rerun = original issue only; condiag_retry reads packet from condiag_packet_only)",
     )
     parser.add_argument(
