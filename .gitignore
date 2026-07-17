@@ -8,3 +8,7 @@ ContextBench/
 *.json
 tmp_*.py
 D:*
+abc_diagnostic_briefs/
+artifacts/
+miniswe_agent/
+repos/
