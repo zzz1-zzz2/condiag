@@ -236,7 +236,72 @@ Known issues:
 3. **5 dev pilot** → Run on astropy-13398, django-11400, etc. with real LLM
 4. **MER/MRP** → Compare gold context vs Round 2 visited files
 
+## 12. New-Machine Migration
+
+### Do NOT copy these (machine-local, not project)
+
+```
+~/.claude/                          # Claude Code state
+~/.claude.json                       # OAuth, credentials
+~/.claude/.credentials.json
+~/.claude/projects/<project>/*.jsonl # conversation history
+~/.claude/file-history/              # raw file read history
+~/.claude/debug/
+~/.claude/paste-cache/
+~/.claude/image-cache/
+~/.claude/plugins/                   # re-install
+```
+
+The hardcoded DeepSeek API key in this repo's history MUST be rotated in the
+provider dashboard. New key: read from env var only.
+
+### Must-migrate (project content)
+
+```
+/home/swelite/condiag/                # ENTIRE workspace (git + untracked artifacts)
+ContextBench/data/full.parquet        # 25MB, gold contexts
+/min/d/condiag-artifacts/condiag/manifests/instances_v2.jsonl
+```
+
+### Migration package layout
+
+```text
+condiag-migration/
+├── condiag.bundle                 # git bundle create condiag.bundle --all
+├── data/
+│   ├── contextbench.parquet
+│   └── instances_99.json
+├── artifacts/                      # last successful run (optional, for verification)
+├── environment/
+│   ├── versions.txt
+│   ├── pip-freeze.txt
+│   ├── git-commits.txt
+│   ├── docker-images.txt
+│   └── env.example                 # variable NAMES only, no values
+└── docker/
+    └── pilot-images.tar             # docker save (optional, see 4.3)
+```
+
+### New-machine recovery order
+
+```text
+1. Install Ubuntu, Git, Docker, Python 3.10+, VS Code
+2. Install mini-SWE-agent from source matching commit
+3. Restore git bundle: git clone condiag.bundle
+4. Restore ContextBench parquet + instance manifest
+5. pip install -r requirements.txt
+6. bash scripts/setup_new_machine.sh
+7. bash scripts/pull_pilot_images.sh  # or restore from docker/pilot-images.tar
+8. Configure API key (env var, NOT hardcoded)
+9. cd condiag && python3 scripts/test_branch_builder.py  # unit tests
+10. python3 scripts/injection_gate.py  # injection gate (8 assertions)
+11. Run a single canary instance, verify R1 + SF + CD all termination_reason=submitted
+12. THEN run 5 dev pilot
+```
+
 ## 11. Versions
+
+
 
 ```
 ConDiag v4
