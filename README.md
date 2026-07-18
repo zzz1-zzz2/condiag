@@ -74,28 +74,26 @@ SWE-bench Verified (HuggingFace cache, offline):
 - Canonical rows with version, FAIL_TO_PASS, PASS_TO_PASS, base_commit
 - InstanceRegistry merges both sources via `original_inst_id`
 
-### Pilot (16 first-failed Verified/python)
+### Full Breakdown (99 instances)
 
-| Instance | f2p | Image status |
-|----------|-----|-------------|
-| astropy__astropy-13398 | 4 | ✅ |
-| astropy__astropy-14995 | 1 | ✅ |
-| django__django-11400 | 6 | ✅ |
-| django__django-11815 | 2 | ✅ |
-| django__django-11820 | 2 | ✅ |
-| django__django-12663 | 1 | ✅ |
-| django__django-13195 | 5 | ✅ |
-| django__django-13513 | 1 | ✅ |
-| django__django-14140 | 4 | ✅ |
-| django__django-14349 | 1 | ✅ |
-| django__django-14792 | 2 | ✅ |
-| scikit-learn__scikit-learn-25232 | 1 | ✅ |
-| sympy__sympy-13852 | 1 | ✅ |
-| sympy__sympy-16597 | 3 | ✅ |
-| sympy__sympy-17318 | 1 | ✅ |
-| sympy__sympy-20428 | 1 | ✅ |
+| Source | Pool | Count | Language | Docker image |
+|--------|------|-------|----------|-------------|
+| Verified | first_failed | **16** | python | ✅ 52/52 |
+| Verified | solved | 36 | python | ✅ |
+| Pro | first_failed | 13 | python/go/javascript | ❌ needs adapter |
+| Pro | solved | 3 | python/go | ❌ |
+| Multi | first_failed | 8 | c/cpp/go/java/js/rust | ❌ |
+| Multi | timeout/pending | 6 | c/go/java/typescript | ❌ |
+| Multi | solved | 2 | cpp/rust | ❌ |
+| Poly | first_failed | 2 | python/javascript | ❌ |
+| Poly | solved | 10 | python/typescript/javascript/python | ❌ |
+| Poly | pending | 2 | typescript | ❌ |
+| **Total** | | **99** | | **52 ready** |
 
-52 total available (36 more solved/Verified/python), 47 unavailable (Multi/Poly/Pro, need namespace adaptation).
+**Pilot set** (16 first-failed Verified/python): astropy-13398, astropy-14995,
+django-11400, django-11815, django-11820, django-12663, django-13195,
+django-13513, django-14140, django-14349, django-14792,
+scikit-learn-25232, sympy-13852, sympy-16597, sympy-17318, sympy-20428
 
 ## Validation Status (2026-07-18)
 
