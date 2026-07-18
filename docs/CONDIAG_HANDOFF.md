@@ -74,7 +74,7 @@
 | Env images | Tagged from eval images | `docker tag swebench/sweb.eval...:latest sweb.env.py.x86_64.{hash}:latest` |
 | Harness eval caching | Unique `run_id` per patch | `run_id = f"{branch}_{patch_sha}_{timestamp}"` |
 
-## 4. Setup & Configuration
+## 5. Setup & Configuration
 
 ### 4.1 Docker Images
 
@@ -147,9 +147,9 @@ echo 'DEEPSEEK_API_KEY=sk-...' >> ~/.config/mini-swe-agent/.env
 export HF_DATASETS_OFFLINE=1    # prevent HuggingFace retry loops during eval
 ```
 
-## 5. Dataset
+## 6. Dataset
 
-## 6. Code Structure
+## 7. Code Structure
 
 ```
 condiag/
@@ -180,7 +180,7 @@ scripts/
 └── pull_pilot_images.sh       ← Docker image puller
 ```
 
-## 7. Critical Constraints (VIOLATION = ROLLBACK)
+## 8. Critical Constraints (VIOLATION = ROLLBACK)
 
 1. **Do NOT modify mini-SWE-agent source.** All ConDiag code is in `condiag/`.
 2. **MUST use official `swebench.harness.run_instance()`** for evaluation. No custom `docker exec` eval logic.
@@ -193,7 +193,7 @@ scripts/
 9. **Format-error termination is NOT a valid submission.** Only `submitted` counts.
 10. **Old artifact dirs must be archived, not deleted.** Tag with `_invalid_` suffix and `.invalid_reason.json`.
 
-## 8. Bugs Found & Fixed
+## 9. Bugs Found & Fixed
 
 | # | Issue | Fix |
 |---|-------|-----|
@@ -208,7 +208,7 @@ scripts/
 | 9 | `env_image` missing | `docker tag` from eval image |
 | 10 | `paired_runner.py` too large (single class does everything) | Split into 6 modules |
 
-## 9. Current State (2026-07-17)
+## 10. Current State (2026-07-17)
 
 ```
 V2c   Engineering validation  ✅
@@ -229,7 +229,7 @@ Known issues:
 - contextbench evaluate needs git clone (network unreliable)
 ```
 
-## 10. Next Steps
+## 11. Next Steps
 
 1. **Check CD format error** → `condiag/trajectory.json`: Is diagnosis instruction causing output format errors?
 2. **V2d ContextBench offline eval** → Connect trajectory metrics (needs stable git clone for repo checkout)
@@ -299,7 +299,7 @@ condiag-migration/
 12. THEN run 5 dev pilot
 ```
 
-## 11. Versions
+## 13. Versions
 
 
 
