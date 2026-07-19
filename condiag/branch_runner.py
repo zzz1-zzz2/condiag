@@ -14,7 +14,7 @@ from condiag.branch_builder import build_branch_messages
 
 logger = logging.getLogger("condiag.branch")
 
-LIMITS = {"cost_limit": 3.0, "wall_time_limit_seconds": 1800, "max_consecutive_format_errors": 15}
+LIMITS = {"cost_limit": 3.0, "wall_time_limit_seconds": 3600, "max_consecutive_format_errors": 3}
 
 
 @dataclass

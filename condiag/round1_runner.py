@@ -11,7 +11,7 @@ from minisweagent.exceptions import Submitted, LimitsExceeded, TimeExceeded, For
 
 logger = logging.getLogger("condiag.round1")
 
-LIMITS = {"cost_limit": 3.0, "wall_time_limit_seconds": 1800, "max_consecutive_format_errors": 15}
+LIMITS = {"cost_limit": 3.0, "wall_time_limit_seconds": 3600, "max_consecutive_format_errors": 15}
 
 
 @dataclass

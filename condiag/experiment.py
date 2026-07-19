@@ -13,6 +13,7 @@ from condiag.round1_runner import run_round1, Round1Result
 from condiag.branch_runner import run_branch, BranchResult
 from condiag.branch_builder import build_branch_messages
 from condiag.checkpoint import CheckpointManager
+from condiag.compression.strategy import compress_messages, estimate_tokens, get_message_stats
 
 logger = logging.getLogger("condiag.experiment")
 
@@ -119,11 +120,24 @@ def run_experiment(
             from condiag.diagnosis_prompt_builder import DiagnosisPromptBuilder, TrajectorySnapshot
             diag = DiagnosisPromptBuilder().build(fw, TrajectorySnapshot())
 
+        # ═══════ Compression ═══════
+        compressed_messages = compress_messages(
+            r1.messages,
+            max_tool_output=500,
+            max_turns=20,
+            max_total_chars=80000,
+        )
+        pre_tok = estimate_tokens(r1.messages)
+        post_tok = estimate_tokens(compressed_messages)
+        logger.info("[%s] Compression: %s tok → %s tok (%.0f%% reduction)",
+                     instance_id, pre_tok, post_tok,
+                     (1 - post_tok / max(pre_tok, 1)) * 100)
+
         # ═══════ Fork: SF ═══════
         logger.info("[%s] SF branch begin", instance_id)
         sf = run_branch(
             agent_factory=agent_factory,
-            checkpoint_messages=r1.messages,
+            checkpoint_messages=compressed_messages,
             base_commit=base_commit, task=task,
             patch_to_apply=r1.patch_text,
             r1_n_calls=r1.n_calls, r1_cost=r1.cost,
@@ -144,7 +158,7 @@ def run_experiment(
         logger.info("[%s] CD branch begin", instance_id)
         cd = run_branch(
             agent_factory=agent_factory,
-            checkpoint_messages=r1.messages,
+            checkpoint_messages=compressed_messages,
             base_commit=base_commit, task=task,
             patch_to_apply=r1.patch_text,
             r1_n_calls=r1.n_calls, r1_cost=r1.cost,

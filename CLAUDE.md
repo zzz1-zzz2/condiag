@@ -2,101 +2,143 @@
 
 ## 首先阅读
 
-@docs/CONDIAG_HANDOFF.md
-
-## 硬性约束（违反 = 回滚）
-
-- **不要修改 mini-SWE-agent 源码。** 所有 ConDiag 代码在 `condiag/` 下。
-- **必须使用官方 `swebench.harness.run_instance()`**（`namespace="swebench"`），不允许自定义 `docker exec` 评测逻辑。
-- **SF 和 ConDiag 必须从同一个 Round 1 snapshot 启动**（共用 `build_branch_messages`）。
-- **两个分支收到相同的 FailureWitness。** 只有 ConDiag 收到 Diagnosis Instruction。
-- **`step_limit=0`** — 无人工截断。只有 `submitted` 是有效的终止。
-- **FormatError 终止不能算作有效提交。** 只有 `termination_reason == "submitted"` 才算。
-- **`comparison.json` 必须始终在 `try/finally` 中写出**，即使部分失败。
-- **每次修改代码后执行 `git diff` 确认变更范围。**
+@docs/research_baseline.md
 
 ## 项目定位
 
-ConDiag v4: **Failure-Guided Context Diagnosis via Persistent Repair Episodes**。
-研究代码位于 `/home/swelite/condiag/`。产物位于 `/mnt/d/condiag-artifacts/condiag/`。
+**AAAI 投稿方向：** ConDiag: Self-Diagnostic Context Management for LLM Agents
 
-**核心假设：** ConDiag 不是通过检索更多上下文来改进修复，而是在同一轮 repair episode 中让 agent 保持存活，利用中间验证的失败信号（通过软诊断 prompt）有针对性地重新探索。
+核心研究问题：LLM Agent 在仓库级程序修复中，能否利用测试失败信号**自我诊断**当前缺失的上下文类型，并据此指导后续的信息获取。
 
-**v4 核心变化（2026-07-15）：**
-- 两次独立 Attempt → 1 个 persistent episode
-- Markdown ContextPacket 注入 → 保留原生 message history + working tree
-- 外部 CDType 规则 → 宿主同一模型在 DIAGNOSE phase 显式推理
-- 外部 retry runner → `ConDiagIntegratedAgent(DefaultAgent)` 嵌入原生 loop
-
-## 实验设定（不可协商）
-
-Post-Validation / Interactive Feedback Repair。不是标准 hidden-test SWE-bench pass@1。
-
-**已验证（V2c）：**
-```
-R1 自然提交（step_limit=0, 等待 Submitted）
-→ 拦截 → 补 tool response → 提取 canonical patch（含 untracked）
-→ 官方 run_instance() 评测
-→ 深复制 checkpoint（messages, workspace, n_calls, cost, elapsed）
-→ 如果是 UNRESOLVED:
-    同一 checkpoint fork SF（FW only）/ CD（FW + Diagnosis）
-    恢复工作区 + 计数器 → 继续 step loop → 提交 → 最终评测
-→ comparison.json（try/finally 保证写出）
-```
-
-## 架构图
+## 核心架构（三层）
 
 ```
-experiment.py（薄编排）
-  ├── round1_runner.py    R1 自然提交（step_limit=0）
-  ├── branch_runner.py    R2 分支（SF/CD 共用, mode 参数区分）
-  ├── branch_builder.py   ⚠️ 唯一注入入口（gate + runner 共用）
-  ├── checkpoint.py       快照保存/恢复
-  └── official_harness.py  官方 run_instance() 薄层
+Patch → Test → Failure Signal
+                ↓
+         [Diagnosis] ←── 核心贡献
+         多特征融合推理缺失上下文类型
+                ↓
+         [Compression] ←── 使能技术
+         诊断感知的上下文预算分配
+                ↓
+         [Acquisition] ←── 使能技术
+         诊断驱动的定向检索
+                ↓
+         Next Patch
 ```
 
-所有注入逻辑只存在于 `build_branch_messages()`。门禁测试和正式实验调用同一份代码。
+## 硬性约束
 
-## 数据集
+- **不改 mini-SWE-agent 源码。** 所有 ConDiag 代码在 `condiag/` 下。
+- **必须用官方 `swebench.harness.run_instance()`** 评测（`namespace="swebench"`）。
+- **`comparison.json` 必须在 `try/finally` 中写出。**
 
-| 来源 | 实例数 | Docker 镜像 |
-|------|--------|-------------|
-| Verified/python（99 中） | 52 | ✅ 已拉取 |
-| Multi/Poly/Pro（99 中） | 47 | ❌ 需要适配 |
-| SWE-bench Lite | 12 | 已在 52 中 |
-| SWE-bench Verified | 54/500 有镜像 | 其余需拉取 |
+## 投稿目标
 
-**99 实例 manifest：** `/mnt/d/condiag-artifacts/condiag/manifests/instances_v2.jsonl`
-
-## 已知问题
-
-1. **DeepSeek 长上下文 JSON 不稳定** — 150K+ 字符下约 7% 坏 JSON。FormatError 计数器已验证正确（每一步 clean step 后归零）。末尾 8+ 连 FE 是模型进入错误状态，非计数 bug。
-2. **Django gold calibration** — 已通过 `django-12125`（empty→UNRESOLVED, gold→RESOLVED）。官方 `run_instance()` 配 `namespace="swebench"` 正常工作。
-3. **ContextBench 离线评测未接通** — 需要 git clone（网络不稳定）或本地 repo cache。
-
-## 关键文件
-
-| 文件 | 用途 | 状态 |
-|------|------|------|
-| `condiag/round1_runner.py` | R1 自然提交循环 | ✅ |
-| `condiag/branch_runner.py` | R2 分支循环 | ✅ |
-| `condiag/experiment.py` | 实验编排 | ✅ |
-| `condiag/branch_builder.py` | ⚠️ 唯一注入函数 | ✅ |
-| `condiag/checkpoint.py` | 快照保存/恢复 | ✅ |
-| `condiag/instance_registry.py` | 数据加载 | ✅ |
-| `condiag/evaluators/official_harness.py` | 官方评测薄层 | ✅ |
-| `experiments/v2c_entry.py` | CLI 入口 | ✅ |
-| `docs/CONDIAG_HANDOFF.md` | 完整项目知识 | ✅ |
-
-## 冻结模块（v1-v3，不修改）
-
-| 模块 | 处置 |
+| 项目 | 内容 |
 |------|------|
-| `condiag/trajectory_signals.py` | 冻结 |
-| `condiag/context_deficiency_diagnoser.py` | 冻结 |
-| `condiag/search_contract_builder.py` | 冻结 |
-| `condiag/contract_renderer.py` | 冻结 |
-| `condiag/paired_runner_legacy.py` | 冻结 |
-| `condiag/paired_runner_prototype_v1.py` | 冻结 |
-| `condiag/integrated_agent.py` | 冻结（参考用） |
-| `condiag/evaluators/docker_swebench.py` | 冻结 |
+| 会议 | AAAI |
+| 主标题 | ConDiag: Self-Diagnostic Context Management for LLM Agents |
+| 核心贡献 | Diagnosis（多特征融合的缺失推理） |
+| 使能技术 | Compression + Acquisition（System Design） |
+| 核心创新 | 测试失败 → Context Deficiency Signal 的形式化 |
+| 实验重点 | 诊断 ablation、Oracle 上界、多模型泛化 |
+
+## 关键指标
+
+| 维度 | 指标 | 对应模块 |
+|------|------|---------|
+| 修复效果 | Resolved Rate, Rescue Rate | 整体 |
+| 上下文质量 | Context Precision/Recall, MER, Steps-to-Hit | Diagnosis |
+| 窗口健康 | Structured Output Success Rate | Compression |
+| 诊断消费 | Diagnosis Consumed Rate | 整体 |
+| 成本 | Token Consumption, Tool Calls | 整体 |
+
+## 代码结构
+
+```
+condiag/
+├── round1_runner.py           # R1 自然提交（复用 v4）
+├── branch_runner.py           # R2 分支逻辑（复用 v4）
+├── experiment.py              # 实验编排（需扩展）
+├── checkpoint.py              # 状态保存/恢复（复用 v4）
+├── branch_builder.py          # 消息注入（需扩展）
+│
+├── diagnosis/                 # 🆕 核心贡献
+│   ├── taxonomy.py            # ContextDeficiencyType
+│   ├── schema.py              # 数据结构
+│   ├── signals/               # 信号提取（规则）
+│   └── reasoner/              # 缺失推理（LLM/规则）
+│
+├── compression/               # 🆕 使能技术
+│   ├── strategy.py            # 压缩策略
+│   └── budget.py              # 预算管理
+│
+├── acquisition/               # 🆕 使能技术
+│   ├── router.py              # 缺失类型→检索动作
+│   └── instructions.py        # 检索指令生成
+│
+├── evaluation/                # 🆕 评测
+│   ├── contextbench.py        # ContextBench 评测
+│   └── metrics.py             # 指标计算
+│
+├── evaluators/
+│   └── official_harness.py    # SWE-bench 评测（复用）
+│
+├── instance_registry.py       # 数据加载（复用）
+├── schemas.py                 # 现有 schema（冻结）
+├── trajectory_signals.py      # 待迁移到 diagnosis/signals/
+├── context_deficiency_diagnoser.py  # 冻结（v1-v3）
+├── search_contract_builder.py       # 冻结（v2）
+├── contract_renderer.py             # 冻结（v2）
+├── integrated_agent.py              # 冻结（v4）
+└── diagnosis_prompt_builder.py      # 冻结（v4 soft diagnosis）
+```
+
+## 实验对比矩阵
+
+| 实验 | Diag | Compress | Acquire | 回答的问题 |
+|------|------|----------|---------|-----------|
+| Full Context (baseline) | ❌ | ❌ | ❌ | 当前 v4 现状 |
+| w/o Diagnosis | ❌ | ✅ | ✅ 无脑 | 诊断是否有用 |
+| Single-Signal Diag | ✅ 规则 | ✅ | ✅ 定向 | 一对一映射够不够 |
+| Multi-Signal Diag | ✅ LLM | ✅ | ✅ 定向 | 多特征是否更好 |
+| **Oracle Diag** | ✅ Gold | ✅ | ✅ 定向 | 上界 |
+| w/o Compression | ✅ | ❌ | ✅ | 压缩是否必要 |
+| w/o Routing | ✅ | ✅ | ❌ 全量 | 定向是否优于全量 |
+
+## 环境
+
+| 项目 | 状态 |
+|------|------|
+| Python 3.11 + venv | ✅ |
+| Docker | ✅ |
+| minisweagent v2.4.1 | ✅ |
+| swebench v4.1.0 | ✅ |
+| SWE-bench data（HF 镜像） | ✅ |
+| DeepSeek API Key | ✅ |
+| astropy-13398 镜像 | ✅ |
+| SWE-bench 评测 | ✅ 已验证 |
+| Compression → R2 跑通 | ❌ Phase 1 |
+| Diagnosis 模块 | ❌ Phase 2 |
+| ContextBench data | ❌ 需迁移 |
+
+## 执行 Plan
+
+| Phase | 内容 | 状态 |
+|-------|------|------|
+| Phase 1 | Compression 模块 + 跑通 R1→R2 | 🔜 当前 |
+| Phase 2 | Diagnosis 模块（信号 + 推理 + ablation） | ⏳ 待开始 |
+| Phase 3 | 跨模型验证 + Oracle baseline + 写论文 | ⏳ 待开始 |
+
+## 冻结模块（不修改）
+
+| 模块 | 原因 |
+|------|------|
+| `condiag/context_deficiency_diagnoser.py` | v1-v3 规则 CDType，被新架构取代 |
+| `condiag/search_contract_builder.py` | v2 Diagnostic Search Contract，思路已过时 |
+| `condiag/contract_renderer.py` | v2 Contract→Markdown，已弃用 |
+| `condiag/integrated_agent.py` | v4 ConDiagIntegratedAgent，参考冻结 |
+| `condiag/diagnosis_prompt_builder.py` | v4 soft diagnosis，被新 diagnosis 模块取代 |
+| `condiag/trajectory_signals.py` | 有用逻辑待迁移到 diagnosis/signals/，迁后冻结 |
+| `condiag/evaluators/docker_swebench.py` | 自定义 evaluator，禁止使用 |

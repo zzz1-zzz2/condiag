@@ -44,6 +44,7 @@ class FailureWitness:
     stack_frames: list[dict] = field(default_factory=list)
     raw_log_preview: str = ""
     sanitized: bool = False
+    _extra: dict = field(default_factory=dict)  # structured signals from new extractor
 
     def to_dict(self) -> dict:
         return {
@@ -52,6 +53,7 @@ class FailureWitness:
             "stack_frames": self.stack_frames,
             "raw_log_preview": self.raw_log_preview[:2000],
             "sanitized": self.sanitized,
+            # _extra intentionally excluded — it's internal to the extraction pipeline
         }
 
 
@@ -173,6 +175,15 @@ class OfficialHarnessGateway:
         }
 
     def extract_witness(self, eval_result: EvalResult) -> FailureWitness:
+        """Extract FailureWitness from evaluation result.
+
+        Delegates to condiag.diagnosis.signals for structured extraction,
+        then maps back to the legacy FailureWitness format for backward compatibility.
+
+        FIXED (v4→v5): Legacy code only matched 'File \"...\"' format, which
+        captured pip build frames but MISSED all pytest short-format frames.
+        New extractor handles both formats and separates build vs test frames.
+        """
         fw = FailureWitness()
         if eval_result.status != "UNRESOLVED":
             return fw
@@ -180,24 +191,42 @@ class OfficialHarnessGateway:
         if not lp or not Path(lp).exists():
             fw.error_message = "No test log"
             return fw
-        raw = Path(lp).read_text(encoding="utf-8", errors="replace")
-        fw.raw_log_preview = raw[:2000]
-        failed = []
-        for line in raw.split("\n"):
-            s = line.strip()
-            if s.startswith("FAILED "):
-                parts = s.split("::")
-                if len(parts) >= 2: failed.append(parts[-1].split()[0])
-            m = re.search(r"FAIL:\s+(\w+)", s)
-            if m: failed.append(m.group(1))
-        fw.failed_tests = list(set(failed))
-        em = re.search(r"(AssertionError|TypeError|ValueError|AttributeError)[^:\n]*:\s*([^\n]+)", raw)
-        if em: fw.error_message = em.group(0).strip()
-        frames = []
-        for m in re.finditer(r'File\s+"([^"]+)",\s*line\s+(\d+)(?:,\s*in\s+(\w+))?', raw):
-            fp = m.group(1)
-            if fp.startswith("/testbed/"): fp = fp[len("/testbed/"):]
-            frames.append({"file": fp, "line": int(m.group(2)), "function": m.group(3) or ""})
-        fw.stack_frames = frames[:15]
+
+        # Delegate to new structured extractor
+        from condiag.diagnosis.signals.pytest_extractor import extract_test_log
+        signals = extract_test_log(lp)
+
+        fw.failed_tests = list(signals.failed_tests)
+        fw.error_message = signals.first_error_message
+        fw.raw_log_preview = Path(lp).read_text(encoding="utf-8", errors="replace")[:2000]
+
+        # Map structured StackFrame to legacy dict format
+        repo_frames = [f for f in signals.stack_frames if f.is_repo_frame]
+        if repo_frames:
+            fw.stack_frames = [
+                {"file": f.file, "line": f.line, "function": f.function}
+                for f in repo_frames[:15]
+            ]
+        else:
+            # Fallback: all frames (shouldn't happen with pytest, but guard)
+            fw.stack_frames = [
+                {"file": f.file, "line": f.line, "function": f.function}
+                for f in signals.stack_frames[:15]
+            ]
+
         fw.sanitized = True
+
+        # Attach structured signals for enhanced consumers (diagnosis module)
+        fw._extra = {
+            "passed_tests": signals.passed_tests,
+            "error_types": signals.error_types,
+            "error_messages": signals.error_messages,
+            "failure_assertions": signals.failure_assertions,
+            "build_frames": [
+                {"file": f.file, "line": f.line, "function": f.function}
+                for f in signals.build_frames
+            ],
+            "num_tests_run": signals.num_tests_run,
+        }
+
         return fw

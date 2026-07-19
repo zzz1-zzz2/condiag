@@ -1,0 +1,1 @@
+- [Empty patch debug trap](empty-patch-debug-trap.md) — prompt 没写"改代码"导致 agent 提交空 patch
