@@ -177,6 +177,14 @@ def run_experiment(
         out.failure_witness_sha = _sha(fw)
         _save_checkpoint(checkpointer, r1, base_commit)
 
+        # ═══════ Workspace Snapshot ═══════
+        # Capture R1's final workspace state for Round 2 restore
+        r1_snapshot = _capture_workspace_snapshot(r1, base_commit, inst_dir / "round1")
+        _write_json(inst_dir / "round1" / "workspace_snapshot.json", r1_snapshot.to_dict())
+        logger.info("[%s] Workspace snapshot: state_sha=%s tracked=%s",
+                     instance_id, r1_snapshot.workspace_state_sha,
+                     r1_snapshot.tracked_diff_sha)
+
         # ═══════ Diagnosis ═══════
         diag = None
         if diagnosis_builder_cls and fw.get("failed_tests"):
@@ -203,10 +211,10 @@ def run_experiment(
             agent_factory=agent_factory,
             checkpoint_messages=compressed_messages,
             base_commit=base_commit, task=task,
-            patch_to_apply=r1.patch_text,
             r1_n_calls=r1.n_calls, r1_cost=r1.cost,
             failure_witness=fw, diagnosis=None, mode="sf",
             protocol_config=revision_config,
+            workspace_snapshot=r1_snapshot,
         )
         _write_patch(inst_dir / "sf" / "patch.diff", sf.patch_text)
         _write_trajectory(inst_dir / "sf" / "trajectory.json", sf.trajectory)
@@ -228,10 +236,10 @@ def run_experiment(
                 agent_factory=agent_factory,
                 checkpoint_messages=compressed_messages,
                 base_commit=base_commit, task=task,
-                patch_to_apply=r1.patch_text,
                 r1_n_calls=r1.n_calls, r1_cost=r1.cost,
                 failure_witness=fw, diagnosis=diag, mode="condiag",
                 protocol_config=revision_config,
+                workspace_snapshot=r1_snapshot,
             )
             _write_patch(inst_dir / "cd" / "patch.diff", cd.patch_text)
             _write_trajectory(inst_dir / "cd" / "trajectory.json", cd.trajectory)
@@ -248,6 +256,19 @@ def run_experiment(
             logger.info("[%s] CD branch skipped (--no-condiag)", instance_id)
             out.cd["termination_reason"] = "not_run_disabled"
             out.cd_run = False
+
+        # ═══════ Fairness Check ═══════
+        sf_ws = sf.workspace_sha_before_first_step if hasattr(sf, "workspace_sha_before_first_step") else ""
+        cd_ws = cd.workspace_sha_before_first_step if hasattr(cd, "workspace_sha_before_first_step") else ""
+        r1_ws = r1_snapshot.workspace_state_sha
+        fairness_ok = (
+            sf.restore_result.ok
+            and (not cd_ws or cd.restore_result.ok)
+            and sf_ws == r1_ws
+            and (not cd_ws or cd_ws == r1_ws)
+        )
+        logger.info("[%s] fairness: r1_ws=%s sf_ws=%s cd_ws=%s ok=%s",
+                     instance_id, r1_ws, sf_ws, cd_ws, fairness_ok)
 
         # ═══════ Verdict ═══════
         if not out.cd_run:
@@ -345,3 +366,12 @@ def _get_git_commit() -> str:
         return r.stdout.strip() if r.returncode == 0 else "unknown"
     except Exception:
         return "unknown"
+
+
+def _capture_workspace_snapshot(r1: Any, base_commit: str, snapshot_dir: Path) -> Any:
+    """Capture workspace snapshot from R1's stored data."""
+    from condiag.workspace import WorkspaceSnapshot
+    return WorkspaceSnapshot(
+        tracked_diff=r1.patch_text,
+        base_commit_sha=base_commit,
+    )

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,9 +21,19 @@ LIMITS = {"cost_limit": 3.0, "wall_time_limit_seconds": 3600, "max_consecutive_f
 
 
 @dataclass
+class RestoreResult:
+    """Result of workspace restore operation."""
+    ok: bool = False
+    workspace_sha: str = ""
+    reason: str = ""
+
+
+@dataclass
 class BranchResult:
     mode: str = ""                  # sf | condiag
     termination_reason: str = ""    # submitted | cost_limit | wall_timeout | repeated_format_error | error
+    restore_result: RestoreResult = field(default_factory=RestoreResult)
+    workspace_sha_before_first_step: str = ""
     patch_text: str = ""
     messages: list[dict] = field(default_factory=list)
     n_calls_total: int = 0
@@ -32,25 +44,133 @@ class BranchResult:
     trajectory: dict = field(default_factory=dict)
 
 
+def restore_workspace(agent, snapshot, base_commit: str) -> RestoreResult:
+    """Restore a WorkspaceSnapshot into the agent's container.
+
+    5 protections:
+      1. Verify container HEAD == base_commit
+      2. Clean workspace (git reset --hard + git clean -fd)
+      3. Apply tracked diff with --check before actual apply
+      4. Validate restored workspace_state_sha
+      5. Cleanup temp files in finally
+    """
+    temp_path = None
+    try:
+        cid = agent.env.container_id
+        if not cid:
+            return RestoreResult(ok=False, reason="no_container_id")
+
+        # Protection 1: Verify container HEAD
+        head_r = agent.env.execute({"command": "cd /testbed && git rev-parse HEAD 2>/dev/null"})
+        if head_r.get("returncode") != 0 or head_r.get("output", "").strip() != base_commit:
+            return RestoreResult(ok=False, reason=f"HEAD mismatch: expected {base_commit}")
+
+        # Protection 2: Clean workspace
+        agent.env.execute({"command": f"cd /testbed && git reset --hard {base_commit} 2>/dev/null"})
+        agent.env.execute({"command": "cd /testbed && git clean -fd 2>/dev/null"})
+
+        if not snapshot or not snapshot.tracked_diff:
+            return RestoreResult(ok=True, workspace_sha="clean_base", reason="no_diff")
+
+        # Protection 3: Apply tracked diff
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as f:
+            f.write(snapshot.tracked_diff)
+            f.flush()
+            temp_path = f.name
+
+        r1 = subprocess.run(
+            ["docker", "cp", temp_path, f"{cid}:/tmp/restore.patch"],
+            capture_output=True, timeout=10,
+        )
+        if r1.returncode != 0:
+            return RestoreResult(ok=False, reason=f"docker cp failed: {r1.stderr.decode(errors='replace')[:200]}")
+
+        # --check first (validate without applying)
+        r2 = agent.env.execute({"command": "cd /testbed && git apply --check /tmp/restore.patch 2>&1"})
+        if r2.get("returncode") != 0:
+            return RestoreResult(ok=False, reason=f"git apply --check failed")
+
+        r3 = agent.env.execute({"command": "cd /testbed && git apply --whitespace=nowarn /tmp/restore.patch 2>&1"})
+        if r3.get("returncode") != 0:
+            return RestoreResult(ok=False, reason=f"git apply failed")
+
+        # Restore untracked files if archive exists
+        if snapshot.untracked_archive_path and os.path.exists(snapshot.untracked_archive_path):
+            subprocess.run(
+                ["docker", "cp", snapshot.untracked_archive_path, f"{cid}:/tmp/untracked.tar"],
+                capture_output=True, timeout=10,
+            )
+            agent.env.execute({"command": "cd /testbed && tar xf /tmp/untracked.tar 2>/dev/null || true"})
+
+        # Protection 4: Validate workspace_state_sha
+        diff_r = agent.env.execute({
+            "command": f"cd /testbed && git diff --binary --no-ext-diff {base_commit} 2>/dev/null"
+        })
+        if diff_r.get("returncode") != 0:
+            return RestoreResult(ok=False, reason="git diff failed after restore")
+
+        restored_diff = diff_r.get("output", "")
+        from condiag.workspace import WorkspaceSnapshot
+        restored = WorkspaceSnapshot(
+            tracked_diff=restored_diff,
+            base_commit_sha=base_commit,
+        )
+        if restored.workspace_state_sha != snapshot.workspace_state_sha:
+            return RestoreResult(
+                ok=False,
+                reason=f"state SHA mismatch: {restored.workspace_state_sha} != {snapshot.workspace_state_sha}",
+            )
+
+        return RestoreResult(ok=True, workspace_sha=restored.workspace_state_sha)
+
+    except Exception as e:
+        return RestoreResult(ok=False, reason=f"exception: {type(e).__name__}: {e}")
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+
+
+def capture_workspace_sha(agent, base_commit: str) -> str:
+    """Extract workspace_state_sha from a live agent container."""
+    try:
+        diff_r = agent.env.execute({
+            "command": f"cd /testbed && git diff --binary --no-ext-diff {base_commit} 2>/dev/null"
+        })
+        if diff_r.get("returncode") != 0:
+            return ""
+        head_r = agent.env.execute({"command": "cd /testbed && git rev-parse HEAD 2>/dev/null"})
+        head_sha = head_r.get("output", "").strip() if head_r.get("returncode") == 0 else ""
+        from condiag.workspace import WorkspaceSnapshot
+        ws = WorkspaceSnapshot(tracked_diff=diff_r.get("output", ""), base_commit_sha=head_sha)
+        return ws.workspace_state_sha
+    except Exception:
+        return ""
+
+
 def run_branch(
     *,
     agent_factory: Callable[[], Any],
     checkpoint_messages: list[dict],
     base_commit: str,
     task: str,
-    patch_to_apply: str,
     r1_n_calls: int,
     r1_cost: float,
     failure_witness: dict | None,
     diagnosis: str | None = None,
     mode: str = "sf",
     protocol_config: Any = None,
+    workspace_snapshot: Any = None,  # WorkspaceSnapshot from R1
 ) -> BranchResult:
     """Restore R1 state, inject messages, run until 2nd submission.
 
     Args:
         mode: "sf" (FW only) or "condiag" (FW + diagnosis).
         protocol_config: RevisionProtocolConfig — overrides LIMITS defaults.
+        workspace_snapshot: WorkspaceSnapshot to restore before first step.
+                           If None, workspace restore is skipped.
     """
     # Resolve limits from protocol_config or fallback to defaults
     limits = dict(LIMITS)
@@ -69,8 +189,28 @@ def run_branch(
         style="stateful_feedback" if mode == "sf" else "condiag",
     )
 
-    # Restore workspace
-    _apply_patch(agent, patch_to_apply)
+    # Restore workspace from snapshot
+    restore = RestoreResult(ok=True, reason="no_snapshot")
+    ws_before = ""
+    if workspace_snapshot:
+        restore = restore_workspace(agent, workspace_snapshot, base_commit)
+        if not restore.ok:
+            result = BranchResult(
+                mode=mode,
+                termination_reason=f"workspace_restore_failed:{restore.reason}",
+                restore_result=restore,
+                messages=list(agent.messages),
+                n_calls_total=r1_n_calls,
+                n_calls_incremental=0,
+                cost_total=r1_cost,
+                cost_incremental=0.0,
+                duration_seconds=time.time() - t0,
+            )
+            logger.warning("[%s] Workspace restore failed: %s", mode.upper(), restore.reason)
+            return result
+        # Capture workspace SHA before first agent.step()
+        ws_before = capture_workspace_sha(agent, base_commit)
+        logger.info("[%s] Workspace restored, pre-step SHA=%s", mode.upper(), ws_before)
 
     t0 = time.time()
     reason = ""
@@ -101,6 +241,8 @@ def run_branch(
         result = BranchResult(
             mode=mode,
             termination_reason=reason,
+            restore_result=restore,
+            workspace_sha_before_first_step=ws_before,
             patch_text=_canonical_patch(agent, base_commit),
             messages=list(agent.messages),
             n_calls_total=agent.n_calls,

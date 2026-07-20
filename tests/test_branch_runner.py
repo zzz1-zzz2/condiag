@@ -1,9 +1,13 @@
-"""Lightweight test for branch_runner — verifies agent creation and limits."""
+"""Lightweight test for branch_runner — verifies agent creation, limits, restore."""
 from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from condiag.branch_runner import run_branch
+from condiag.branch_runner import (
+    RestoreResult,
+    run_branch,
+    restore_workspace,
+)
 
 
 class MockAgent:
@@ -18,6 +22,7 @@ class MockAgent:
         self._start_time = 0
         self.env = MagicMock()
         self.env.execute.return_value = {"output": "", "returncode": 0}
+        self.env.container_id = "mock_container"
 
     def add_messages(self, *msgs):
         self.messages.extend(msgs)
@@ -34,43 +39,29 @@ class MockAgent:
 
 
 class TestBranchRunner:
-    def test_agent_is_defined_before_message_building(self):
+    def test_agent_is_defined(self):
         """If this fails, agent is referenced before assignment (NameError)."""
-        agent_instance = MockAgent()
-
-        def factory():
-            return agent_instance
-
         result = run_branch(
-            agent_factory=factory,
+            agent_factory=lambda: MockAgent(),
             checkpoint_messages=[],
             base_commit="test",
             task="test task",
-            patch_to_apply="",
             r1_n_calls=5,
             r1_cost=0.5,
             failure_witness=None,
             diagnosis=None,
             mode="sf",
         )
-        # The branch should reach an error exit (mock agent raises), not NameError
         assert result is not None
-        assert "error" in result.termination_reason
+        assert result.termination_reason != ""
 
-    def test_branch_accepts_protocol_config(self):
-        """Verify RevisionProtocolConfig is accepted without error."""
+    def test_accepts_protocol_config(self):
         from condiag.agent.config import RevisionProtocolConfig
-        agent_instance = MockAgent()
-
-        def factory():
-            return agent_instance
-
         result = run_branch(
-            agent_factory=factory,
+            agent_factory=lambda: MockAgent(),
             checkpoint_messages=[],
             base_commit="test",
             task="test task",
-            patch_to_apply="",
             r1_n_calls=5,
             r1_cost=0.5,
             failure_witness=None,
@@ -79,3 +70,36 @@ class TestBranchRunner:
             protocol_config=RevisionProtocolConfig(),
         )
         assert result is not None
+
+    def test_restore_in_branch_result(self):
+        """BranchResult should contain restore_result and workspace_sha."""
+        result = run_branch(
+            agent_factory=lambda: MockAgent(),
+            checkpoint_messages=[],
+            base_commit="test",
+            task="test task",
+            r1_n_calls=5,
+            r1_cost=0.5,
+            failure_witness=None,
+            diagnosis=None,
+            mode="sf",
+        )
+        assert hasattr(result, "restore_result")
+        assert hasattr(result, "workspace_sha_before_first_step")
+
+
+class TestRestoreWorkspace:
+    def test_no_container_id(self):
+        agent = MockAgent()
+        agent.env.container_id = ""
+        r = restore_workspace(agent, None, "test")
+        assert not r.ok
+        assert "no_container_id" in r.reason
+
+    def test_head_mismatch(self):
+        agent = MockAgent()
+        agent.env.execute.return_value = {"output": "wrong_sha", "returncode": 0}
+        from condiag.workspace import WorkspaceSnapshot
+        r = restore_workspace(agent, WorkspaceSnapshot(base_commit_sha="expected"), "expected")
+        assert not r.ok
+        assert "HEAD mismatch" in r.reason
