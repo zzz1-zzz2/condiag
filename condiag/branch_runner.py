@@ -58,6 +58,11 @@ def run_branch(
         limits["wall_time_limit_seconds"] = getattr(protocol_config, "r2_wall_time_limit_seconds", limits["wall_time_limit_seconds"])
         limits["max_consecutive_format_errors"] = getattr(protocol_config, "r2_max_consecutive_format_errors", limits["max_consecutive_format_errors"])
 
+    agent = agent_factory()
+    agent.config.step_limit = 0
+    agent.n_calls = r1_n_calls
+    agent.cost = r1_cost
+
     # Build message sequence via shared function
     agent.messages = build_branch_messages(
         checkpoint_messages, failure_witness, diagnosis=diagnosis,

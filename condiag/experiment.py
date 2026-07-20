@@ -98,9 +98,18 @@ def run_experiment(
     out.episode_run_id = episode_run_id
     if agent_config:
         out.config_sha = getattr(agent_config, "config_sha", "")
-        out.config_sha_full = hashlib.sha256(
-            getattr(agent_config, "config_sha", "").encode()
-        ).hexdigest() if getattr(agent_config, "config_sha", "") else ""
+        # config_sha_full is the 64-char SHA of the full config content, not a hash of the short SHA
+        raw = (
+            f"protocol={getattr(agent_config, 'protocol_name', '')}:{getattr(agent_config, 'protocol_version', '')}"
+            f"|model={getattr(agent_config, 'model_name', '')}"
+            f"|temp={getattr(agent_config, 'temperature', '')}"
+            f"|maxtok={getattr(agent_config, 'max_tokens', '')}"
+            f"|step={getattr(agent_config, 'step_limit', '')}"
+            f"|cost={getattr(agent_config, 'cost_limit', '')}"
+            f"|yaml={getattr(agent_config, 'source_yaml_sha', '')}"
+            f"|rev={getattr(revision_config, 'sha', '') if revision_config else ''}"
+        )
+        out.config_sha_full = hashlib.sha256(raw.encode()).hexdigest()
         out.source_yaml_sha = getattr(agent_config, "source_yaml_sha", "")
     if revision_config:
         out.revision_protocol_sha = getattr(revision_config, "sha", "")

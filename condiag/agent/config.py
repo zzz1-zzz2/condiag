@@ -94,10 +94,11 @@ class AgentConfig:
                 f"|maxtok={self.max_tokens}"
                 f"|step={self.step_limit}"
                 f"|cost={self.cost_limit}"
-                f"|yaml={self.source_yaml_sha[:16]}"
+                f"|yaml={self.source_yaml_sha}"
                 f"|rev={self.revision_protocol.sha}"
             )
-            object.__setattr__(self, "config_sha", sha256_short(raw))
+            full_sha = sha256_full(raw)
+            object.__setattr__(self, "config_sha", full_sha[:16])
 
 
 def load_locked_yaml() -> dict:
