@@ -167,3 +167,15 @@ class TestFingerprintCapture:
         assert cr.ok, f"Fingerprint failed: {cr.reason}"
         paths = {u.path for u in cr.snapshot.untracked_manifest}
         assert weird_name in paths, f"Special char file not captured: {paths}"
+
+    def test_pipeline_failure_returns_empty(self, local_git_repo):
+        """archive_untracked_files must return "" when git ls-files fails (pipefail)."""
+        from condiag.workspace import archive_untracked_files
+
+        agent_a, workdir, base = local_git_repo
+        # Delete .git so git ls-files will fail
+        subprocess.run(["bash", "-c", "rm -rf .git"], cwd=workdir, check=True)
+
+        snapshot_dir = workdir / "snapshot_pf"
+        result = archive_untracked_files(agent_a, snapshot_dir)
+        assert result == "", f"Expected empty string on pipeline failure, got {result!r}"

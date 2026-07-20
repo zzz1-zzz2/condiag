@@ -19,13 +19,16 @@ DEFAULT_LIMITS = {"cost_limit": 3.0, "wall_time_limit_seconds": 3600, "max_conse
 @dataclass
 class Round1Result:
     termination_reason: str = ""    # submitted | cost_limit | wall_timeout | repeated_format_error | error
-    patch_text: str = ""
+    patch_text: str = ""  # Legacy: raw workspace diff
     messages: list[dict] = field(default_factory=list)
     n_calls: int = 0
     cost: float = 0.0
     duration_seconds: float = 0.0
     trajectory: dict = field(default_factory=dict)
     workspace_snapshot: Any = None  # WorkspaceSnapshot captured at R1 completion
+    # P0-3: Patch provenance fields
+    agent_submission: Any = None  # AgentSubmission object
+    evaluation_patch: str = ""  # What Harness actually receives
 
 
 def run_round1(*, agent_factory: Callable[[], Any], task: str,
@@ -81,19 +84,41 @@ def run_round1(*, agent_factory: Callable[[], Any], task: str,
     finally:
         # Capture workspace snapshot (before container dies)
         snapshot = _capture_snapshot(agent, base_commit, Path(snapshot_dir) if snapshot_dir else None)
+
+        # P0-3: Collect AgentSubmission from exit message
+        from condiag.patch_artifacts import (
+            collect_agent_submission, canonicalize_patch, AgentSubmission,
+        )
+        workspace_diff = _canonical_patch(agent, base_commit)
+        agent_sub = collect_agent_submission(agent_messages=list(agent.messages))
+
+        # evaluation_patch: prefer explicit submission, fall back to workspace diff
+        if agent_sub.selected_patch.strip():
+            evaluation_patch = canonicalize_patch(agent_sub.selected_patch)
+        else:
+            # Compatibility fallback: use workspace diff but mark it
+            evaluation_patch = canonicalize_patch(workspace_diff)
+            agent_sub.selected_source = "workspace_diff_fallback"
+            agent_sub.selected_patch = evaluation_patch
+            agent_sub.consistency_status = "fallback_used"
+
         result = Round1Result(
             termination_reason=reason,
-            patch_text=_canonical_patch(agent, base_commit),
+            patch_text=workspace_diff,
             messages=[m for m in agent.messages if m.get("role") != "exit"],
             n_calls=agent.n_calls,
             cost=agent.cost,
             duration_seconds=time.time() - t0,
             trajectory=redact_trajectory(agent.serialize()) if hasattr(agent, "serialize") else {},
             workspace_snapshot=snapshot,
+            agent_submission=agent_sub,
+            evaluation_patch=evaluation_patch,
         )
 
-    logger.info("R1: reason=%s calls=%d cost=%.4f patch=%dch",
-                 reason, result.n_calls, result.cost, len(result.patch_text))
+    logger.info("R1: reason=%s calls=%d cost=%.4f patch=%dch eval=%dch src=%s",
+                 reason, result.n_calls, result.cost, len(result.patch_text),
+                 len(result.evaluation_patch),
+                 agent_sub.selected_source if agent_sub else "none")
     return result
 
 

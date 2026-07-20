@@ -14,7 +14,7 @@ from condiag.workspace import (
 
 class TestPatchArtifacts:
     def test_collect_agent_submission_exception(self):
-        sub = collect_agent_submission(submitted_exception="--- a/foo.py\n+++ b/foo.py\n")
+        sub = collect_agent_submission(exception_payload="--- a/foo.py\n+++ b/foo.py\n")
         assert sub.selected_source == "exception_payload"
         assert sub.sha != ""
 
@@ -29,10 +29,25 @@ class TestPatchArtifacts:
 
     def test_collect_agent_submission_mismatch(self):
         sub = collect_agent_submission(
-            submitted_exception="diff --git a/a.py b/a.py",
+            exception_payload="diff --git a/a.py b/a.py",
             patch_file_text="diff --git a/b.py b/b.py",
         )
         assert sub.consistency_status == "mismatch"
+
+    def test_collect_agent_submission_from_messages(self):
+        """Extract submission from agent's exit message via extra.submission."""
+        from condiag.patch_artifacts import extract_submission_from_messages
+        messages = [
+            {"role": "assistant", "content": "done"},
+            {"role": "exit", "content": "",
+             "extra": {"exit_status": "Submitted", "submission": "--- a/x.py\n+++ b/x.py\n"}},
+        ]
+        patch, source = extract_submission_from_messages(messages)
+        assert source == "exit_extra_submission"
+        assert "x.py" in patch
+        # Should be selected as primary source
+        sub = collect_agent_submission(agent_messages=messages)
+        assert sub.selected_source == "exit_extra_submission"
 
     def test_canonicalize_patch_removes_trailing_spaces(self):
         raw = "diff --git a/x.py b/x.py\n+print('hello')\n\n  \n"
@@ -42,6 +57,24 @@ class TestPatchArtifacts:
     def test_canonicalize_patch_empty(self):
         assert canonicalize_patch("") == ""
         assert canonicalize_patch("   ") == ""
+
+    def test_consistency_check_consistent(self):
+        from condiag.patch_artifacts import patch_consistency_check
+        a = "diff --git a/x.py\n+x\n"
+        b = "diff --git a/x.py\n+x\n\n\n"
+        assert patch_consistency_check(a, b) == "consistent"
+
+    def test_consistency_check_mismatch(self):
+        from condiag.patch_artifacts import patch_consistency_check
+        a = "diff --git a/x.py\n+x\n"
+        b = "diff --git a/x.py\n+y\n"
+        assert patch_consistency_check(a, b) == "mismatch"
+
+    def test_consistency_check_empty(self):
+        from condiag.patch_artifacts import patch_consistency_check
+        assert patch_consistency_check("", "") == "empty"
+        # One side non-empty = mismatch (not empty)
+        assert patch_consistency_check("x", "") == "mismatch"
 
     def test_patch_artifacts_defaults(self):
         pa = PatchArtifacts()

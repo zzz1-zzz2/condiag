@@ -159,11 +159,20 @@ def run_experiment(
 
         # ═══════ Official eval R1 ═══════
         logger.info("[%s] Eval R1 patch", instance_id)
-        r1_eval = harness.evaluate(instance_spec, model_patch=r1.patch_text,
-                                   run_id=f"r1_{_sha(r1.patch_text)}_{int(time.time())}")
+        r1_eval = harness.evaluate(instance_spec, model_patch=r1.evaluation_patch,
+                                   run_id=f"r1_{_sha(r1.evaluation_patch)}_{int(time.time())}")
         _write_json(inst_dir / "round1" / "harness_eval.json",
                     {"status": r1_eval.status, "duration": r1_eval.duration_seconds,
                      "report": r1_eval.report, "test_log_path": r1_eval.test_log_path})
+
+        # Save P0-3 artifacts
+        if r1.agent_submission:
+            _write_json(inst_dir / "round1" / "agent_submission.json",
+                        r1.agent_submission.to_dict())
+        _write_patch(inst_dir / "round1" / "agent_submitted.patch",
+                     getattr(r1.agent_submission, "selected_patch", "") or r1.patch_text)
+        _write_patch(inst_dir / "round1" / "workspace.patch", r1.patch_text)
+        _write_patch(inst_dir / "round1" / "evaluation.patch", r1.evaluation_patch)
         out.round1["harness_status"] = r1_eval.status
         out.round1_resolved = (r1_eval.status == "RESOLVED")
         if out.round1_resolved:
@@ -229,9 +238,10 @@ def run_experiment(
             workspace_snapshot=r1_snapshot,
         )
         _write_patch(inst_dir / "sf" / "patch.diff", sf.patch_text)
+        _write_patch(inst_dir / "sf" / "final_evaluation.patch", sf.final_evaluation_patch)
         _write_trajectory(inst_dir / "sf" / "trajectory.json", sf.trajectory)
         if sf.termination_reason == "submitted":
-            _eval_and_save(harness, instance_spec, sf.patch_text, inst_dir / "sf" / "harness_eval.json",
+            _eval_and_save(harness, instance_spec, sf.final_evaluation_patch, inst_dir / "sf" / "harness_eval.json",
                            "sf", sf)
         else:
             logger.info("[%s] SF not submitted (%s) — skip eval", instance_id, sf.termination_reason)
@@ -254,9 +264,10 @@ def run_experiment(
                 workspace_snapshot=r1_snapshot,
             )
             _write_patch(inst_dir / "cd" / "patch.diff", cd.patch_text)
+            _write_patch(inst_dir / "cd" / "final_evaluation.patch", cd.final_evaluation_patch)
             _write_trajectory(inst_dir / "cd" / "trajectory.json", cd.trajectory)
             if cd.termination_reason == "submitted":
-                _eval_and_save(harness, instance_spec, cd.patch_text, inst_dir / "cd" / "harness_eval.json",
+                _eval_and_save(harness, instance_spec, cd.final_evaluation_patch, inst_dir / "cd" / "harness_eval.json",
                                "cd", cd)
             else:
                 logger.info("[%s] CD not submitted (%s) — skip eval", instance_id, cd.termination_reason)

@@ -34,7 +34,7 @@ class BranchResult:
     termination_reason: str = ""    # submitted | cost_limit | wall_timeout | repeated_format_error | error
     restore_result: RestoreResult = field(default_factory=RestoreResult)
     workspace_sha_before_first_step: str = ""
-    patch_text: str = ""
+    patch_text: str = ""  # Cumulative workspace diff (vs base_commit)
     messages: list[dict] = field(default_factory=list)
     n_calls_total: int = 0
     n_calls_incremental: int = 0
@@ -42,6 +42,9 @@ class BranchResult:
     cost_incremental: float = 0.0
     duration_seconds: float = 0.0
     trajectory: dict = field(default_factory=dict)
+    # P0-3: Patch provenance fields
+    agent_submission: Any = None  # AgentSubmission object
+    final_evaluation_patch: str = ""  # What Harness actually receives
 
 
 def restore_workspace(agent, snapshot, base_commit: str) -> RestoreResult:
@@ -247,12 +250,26 @@ def run_branch(
                     agent.handle_uncaught_exception(e)
                     reason = f"error:{type(e).__name__}"; break
     finally:
+        # P0-3: Collect AgentSubmission and final_evaluation_patch
+        from condiag.patch_artifacts import (
+            collect_agent_submission, canonicalize_patch,
+        )
+        workspace_diff = _canonical_patch(agent, base_commit)
+        br_sub = collect_agent_submission(agent_messages=list(agent.messages))
+        if br_sub.selected_patch.strip():
+            final_eval = canonicalize_patch(br_sub.selected_patch)
+        else:
+            final_eval = canonicalize_patch(workspace_diff)
+            br_sub.selected_source = "workspace_diff_fallback"
+            br_sub.selected_patch = final_eval
+            br_sub.consistency_status = "fallback_used"
+
         result = BranchResult(
             mode=mode,
             termination_reason=reason,
             restore_result=restore,
             workspace_sha_before_first_step=ws_before,
-            patch_text=_canonical_patch(agent, base_commit),
+            patch_text=workspace_diff,
             messages=list(agent.messages),
             n_calls_total=agent.n_calls,
             n_calls_incremental=agent.n_calls - r1_n_calls,
@@ -260,6 +277,8 @@ def run_branch(
             cost_incremental=agent.cost - r1_cost,
             duration_seconds=time.time() - t0,
             trajectory=redact_trajectory(agent.serialize()) if hasattr(agent, "serialize") else {},
+            agent_submission=br_sub,
+            final_evaluation_patch=final_eval,
         )
 
     logger.info("[%s] reason=%s incr_calls=%d total_calls=%d patch=%dch",

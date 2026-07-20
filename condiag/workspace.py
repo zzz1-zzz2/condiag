@@ -162,11 +162,15 @@ def archive_untracked_files(agent: Any, snapshot_dir: Path) -> str:
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     archive_path = str(snapshot_dir / "untracked.tar")
 
-    # Create archive with null-delimited file list (pipefail for safety)
-    rc, _ = _exec(agent,
-        "cd /testbed && (git ls-files -z --others --exclude-standard 2>/dev/null | "
-        "tar --null --verbatim-files-from -T - -cf /tmp/untracked.tar 2>&1)"
+    # Create archive with null-delimited file list + pipefail
+    # Use bash -o pipefail to detect failures in either git ls-files or tar
+    archive_script = (
+        "git ls-files -z --others --exclude-standard 2>/dev/null | "
+        "tar --null --verbatim-files-from -T - -cf /tmp/untracked.tar"
     )
+    rc, _ = _exec(agent, f"cd /testbed && bash -o pipefail -c {shlex.quote(archive_script)} 2>&1")
+    if rc != 0:
+        return ""
     if rc != 0:
         return ""
 
