@@ -50,7 +50,10 @@ def run_single(instance_id: str, args: argparse.Namespace) -> dict:
     )
     agent_factory = build_agent_factory(config, instance_id)
 
-    diagnosis_builder_cls = None  # placeholder for future DiagnoserCore
+    # TODO(P1-5): Replace with condiag.diagnosis.diagnoser_core.DiagnoserCore
+    from condiag.diagnosis_prompt_builder import DiagnosisPromptBuilder
+    diagnosis_builder_cls = None if args.no_condiag else DiagnosisPromptBuilder
+
     result = run_experiment(
         instance_id=instance_id,
         agent_factory=agent_factory,
@@ -58,7 +61,7 @@ def run_single(instance_id: str, args: argparse.Namespace) -> dict:
         checkpointer=checkpointer,
         output_dir=V2C_ARTIFACTS,
         instance_spec=spec,
-        diagnosis_builder_cls=diagnosis_builder_cls if not args.no_condiag else None,
+        diagnosis_builder_cls=diagnosis_builder_cls,
     )
     return {"instance_id": instance_id, "result": result.to_dict()}
 
