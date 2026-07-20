@@ -1,10 +1,10 @@
 """ConDiag V2c — Single canary instance runner.
 
 Loads instance data from cached pickle.
-Usage: source venv/bin/activate && python3 run_canary.py
+Usage: DEEPSEEK_API_KEY=sk-xxx python3 run_canary.py
 """
 from __future__ import annotations
-import json, logging, pickle, time
+import json, logging, os, pickle
 from pathlib import Path
 from typing import Any
 
@@ -49,85 +49,21 @@ def load_instance(instance_id: str = "astropy__astropy-13398"):
 
 
 def make_agent_factory(instance_id: str):
-    from minisweagent.environments.docker import DockerEnvironment
-    from minisweagent.models.litellm_model import LitellmModel
-    from minisweagent.run.benchmarks.swebench import get_swebench_docker_image_name
+    from condiag.agent.config import AgentConfig, build_agent_factory, require_api_key
+    require_api_key()
 
-    image_name = get_swebench_docker_image_name({"instance_id": instance_id})
-    log.info("  Docker image: %s", image_name)
-
-    def factory():
-        from condiag.integrated_agent import ConDiagIntegratedAgent
-        env = DockerEnvironment(image=image_name, cwd="/testbed", timeout=120)
-        model = LitellmModel(
-            model_name="openai/deepseek-v4-pro",
-            model_kwargs={
-                "temperature": 0.0, "max_tokens": 4096,
-                "api_base": "https://api.deepseek.com/v1",
-                "api_key": "sk-9236ebc647c24f44bbb6fa47b24bd67b",
-            },
-            cost_tracking="ignore_errors",
-        )
-        agent = ConDiagIntegratedAgent(
-            model=model, env=env,
-            system_template="You are a helpful assistant that can interact with a computer shell to solve programming tasks.",
-            instance_template="""<pr_description>
-Consider the following PR description:
-{{task}}
-</pr_description>
-
-<instructions>
-# Task Instructions
-
-## Overview
-
-You're a software engineer interacting continuously with a computer by submitting commands.
-You'll be helping implement necessary changes to meet requirements in the PR description.
-Your task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.
-<IMPORTANT>This is an interactive process where you will think and issue AT LEAST ONE command, see the result, then think and issue your next command(s).</important>
-
-## Recommended Workflow
-
-1. Analyze the codebase by finding and reading relevant files
-2. Create a script to reproduce the issue
-3. Edit the source code to resolve the issue
-4. Verify your fix works by running your script again
-5. Submit your changes by creating a patch and using the submit command
-
-## Important Boundaries
-
-- MODIFY: Regular source code files in /testbed (this is the working directory)
-- DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)
-
-## Submission
-
-When you've completed your work, you MUST submit your changes as a git patch.
-Follow these steps IN ORDER, with SEPARATE commands:
-
-Step 1: Create the patch file
-Run `git diff -- path/to/file1 path/to/file2 > patch.txt` listing only the source files you modified.
-
-Step 2: Verify your patch
-Inspect patch.txt to confirm it only contains your intended changes.
-
-Step 3: Submit
-You MUST use this EXACT command to submit:
-
-```bash
-echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt
-```
-
-If the command fails (nonzero exit status), it will not submit.
-
-<CRITICAL>
-- Creating/viewing the patch and submitting it MUST be separate commands.
-- You CANNOT continue working after submitting.
-</CRITICAL>
-</instructions>""",
-            step_limit=0, cost_limit=5.0, output_path=None,
-        )
-        return agent
-    return factory
+    config = AgentConfig(
+        protocol_name="persistent_revision",
+        protocol_version="1.0",
+        model_name="openai/deepseek-v4-pro",
+        temperature=0.0,
+        max_tokens=4096,
+        step_limit=0,
+        cost_limit=5.0,
+    )
+    log.info("  AgentConfig: protocol=%s/%s model=%s",
+             config.protocol_name, config.protocol_version, config.model_name)
+    return build_agent_factory(config, instance_id)
 
 
 def run_canary(instance_id: str = "astropy__astropy-13398"):

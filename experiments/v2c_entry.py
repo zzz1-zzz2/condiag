@@ -1,49 +1,23 @@
-"""ConDiag v4 V2c Entry — Run a complete paired comparison episode.
+"""ConDiag V2c Entry — Run a complete paired comparison episode.
 
 Usage:
-  python3 -m experiments.v2c_entry --instance django__django-11820
-  python3 -m experiments.v2c_entry --instance sympy__sympy-20428 --force
-  python3 -m experiments.v2c_entry --pilot
+  DEEPSEEK_API_KEY=sk-xxx python3 -m experiments.v2c_entry --instance astropy__astropy-13398
+  DEEPSEEK_API_KEY=sk-xxx python3 -m experiments.v2c_entry --pilot
 """
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, "/home/swelite/condiag")
+import sys; sys.path.insert(0, "/home/swelite/condiag")  # noqa: E702
 logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
 log = logging.getLogger("v2c_entry")
 
 V2C_ARTIFACTS = Path("/home/swelite/condiag/artifacts/v2c")
-
-
-def build_agent_factory(instance_id: str, model_name: str = "deepseek/deepseek-v4-pro",
-                        temperature: float = 0.0):
-    from minisweagent.environments.docker import DockerEnvironment
-    from minisweagent.models.litellm_model import LitellmModel
-    from minisweagent.run.benchmarks.swebench import get_swebench_docker_image_name
-
-    pred = {"instance_id": instance_id}
-    image_name = get_swebench_docker_image_name(pred)
-    log.info("  Docker image: %s", image_name)
-
-    def factory():
-        from condiag.integrated_agent import ConDiagIntegratedAgent
-        env = DockerEnvironment(image=image_name, cwd="/testbed", timeout=120)
-        model = LitellmModel(model_name=model_name, model_kwargs={"temperature": temperature, "max_tokens": 1024})
-        agent = ConDiagIntegratedAgent(
-            model=model, env=env,
-            system_template="You are a software engineer. You can run bash commands. "
-                            "Read files with cat, edit with sed or python. When done, "
-                            "run `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.",
-            instance_template="{{task}}",
-            step_limit=0, cost_limit=5.0, output_path=None,
-        )
-        return agent
-    return factory
 
 
 def run_single(instance_id: str, args: argparse.Namespace) -> dict:
@@ -51,6 +25,9 @@ def run_single(instance_id: str, args: argparse.Namespace) -> dict:
     from condiag.evaluators.official_harness import OfficialHarnessGateway
     from condiag.checkpoint import CheckpointManager
     from condiag.experiment import run_experiment
+    from condiag.agent.config import AgentConfig, build_agent_factory, require_api_key
+
+    require_api_key()
 
     reg = InstanceRegistry()
     spec = reg.get_instance(instance_id)
@@ -63,9 +40,17 @@ def run_single(instance_id: str, args: argparse.Namespace) -> dict:
 
     harness = OfficialHarnessGateway(run_id=f"v2c_{instance_id}", rm_image=False, force_rebuild=False, timeout=600)
     checkpointer = CheckpointManager(V2C_ARTIFACTS / instance_id / "round1")
-    agent_factory = build_agent_factory(instance_id=instance_id, model_name=args.model, temperature=args.temperature)
 
-    from condiag.diagnosis_prompt_builder import DiagnosisPromptBuilder
+    config = AgentConfig(
+        model_name=args.model,
+        temperature=args.temperature,
+        max_tokens=4096,
+        step_limit=0,
+        cost_limit=5.0,
+    )
+    agent_factory = build_agent_factory(config, instance_id)
+
+    diagnosis_builder_cls = None  # placeholder for future DiagnoserCore
     result = run_experiment(
         instance_id=instance_id,
         agent_factory=agent_factory,
@@ -73,25 +58,28 @@ def run_single(instance_id: str, args: argparse.Namespace) -> dict:
         checkpointer=checkpointer,
         output_dir=V2C_ARTIFACTS,
         instance_spec=spec,
-        diagnosis_builder_cls=DiagnosisPromptBuilder if not args.no_condiag else None,
+        diagnosis_builder_cls=diagnosis_builder_cls if not args.no_condiag else None,
     )
     return {"instance_id": instance_id, "result": result.to_dict()}
 
 
 def dry_run_harness(instance_id: str):
+    """Run a dry evaluation (empty patch + gold patch) to verify harness setup."""
     from condiag.instance_registry import InstanceRegistry
     from condiag.evaluators.official_harness import OfficialHarnessGateway
+    from condiag.agent.config import require_api_key
+    require_api_key()
     reg = InstanceRegistry()
     spec = reg.get_instance(instance_id)
-    if not spec: return
+    if not spec:
+        log.error("Instance %s not found", instance_id)
+        return
     gw = OfficialHarnessGateway(run_id=f"dry_{instance_id}")
     r = gw.evaluate(spec, model_patch="")
-    log.info("Empty -> %s (%.1fs) mode=%s", r.status, r.duration_seconds, r.mode)
+    log.info("Empty -> %s (%.1fs)", r.status, r.duration_seconds)
     if spec.gold_patch:
         r2 = gw.evaluate(spec, model_patch=spec.gold_patch)
-        log.info("Gold  -> %s (%.1fs) mode=%s", r2.status, r2.duration_seconds, r2.mode)
-
-
+        log.info("Gold  -> %s (%.1fs)", r2.status, r2.duration_seconds)
 def run_pilot(args):
     from condiag.instance_registry import InstanceRegistry
     reg = InstanceRegistry()
@@ -106,9 +94,9 @@ def run_pilot(args):
             results[spec.instance_id] = {"error": str(e)}
     print("\n\n" + "=" * 70 + "\nPILOT SUMMARY\n" + "=" * 70)
     for iid, r in results.items():
-        r1 = r.get("round1", {}).get("status", "?")
-        sf = r.get("stateful_feedback", {}).get("status", "?")
-        cd = r.get("condiag", {}).get("status", "?")
+        r1 = r.get("round1", {}).get("termination_reason", "?")
+        sf = r.get("sf", {}).get("termination_reason", "?")
+        cd = r.get("cd", {}).get("termination_reason", "?")
         print(f"  {iid:45s} R1={r1:12s} SF={sf:12s} CD={cd:12s}")
     (V2C_ARTIFACTS / "pilot_summary.json").write_text(json.dumps(results, indent=2))
 
@@ -119,9 +107,10 @@ def main():
     p.add_argument("--pilot", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--force", action="store_true")
-    p.add_argument("--model", default="deepseek/deepseek-v4-pro")
+    p.add_argument("--model", default="openai/deepseek-v4-pro")
     p.add_argument("--temperature", type=float, default=0.0)
-    p.add_argument("--no-condiag", action="store_true")
+    p.add_argument("--no-condiag", action="store_true",
+                   help="Skip CD branch entirely (only run R1 + SF)")
 
     args = p.parse_args()
     V2C_ARTIFACTS.mkdir(parents=True, exist_ok=True)
@@ -132,8 +121,10 @@ def main():
     elif args.instance:
         r = run_single(args.instance, args)
         res = r.get("result", {})
-        r1, sf, cd = res.get("round1", {}).get("status", "?"), res.get("stateful_feedback", {}).get("status", "?"), res.get("condiag", {}).get("status", "?")
-        print(f"\n=== {args.instance} ===\n  R1={r1} SF={sf} CD={cd}")
+        r1_reason = res.get("round1", {}).get("termination_reason", "?")
+        sf_reason = res.get("sf", {}).get("termination_reason", "?")
+        cd_reason = res.get("cd", {}).get("termination_reason", "?")
+        print(f"\n=== {args.instance} ===\n  R1={r1_reason} SF={sf_reason} CD={cd_reason}")
     else: p.print_help()
 
 
