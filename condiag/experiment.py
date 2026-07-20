@@ -4,7 +4,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -29,9 +31,11 @@ def _sha256_full(d) -> str:
 @dataclass
 class ComparisonOutput:
     instance_id: str = ""
+    episode_run_id: str = ""
     evaluation_mode: str = "official"
     # Config identity
     config_sha: str = ""
+    config_sha_full: str = ""
     revision_protocol_sha: str = ""
     source_yaml_sha: str = ""
     # R1
@@ -90,15 +94,36 @@ def run_experiment(
     out = ComparisonOutput(instance_id=instance_id)
 
     # Save config identity
+    episode_run_id = f"run_{time.strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    out.episode_run_id = episode_run_id
     if agent_config:
         out.config_sha = getattr(agent_config, "config_sha", "")
-        out.source_yaml_sha = getattr(agent_config, "source_yaml_sha", "")[:16]
+        out.config_sha_full = hashlib.sha256(
+            getattr(agent_config, "config_sha", "").encode()
+        ).hexdigest() if getattr(agent_config, "config_sha", "") else ""
+        out.source_yaml_sha = getattr(agent_config, "source_yaml_sha", "")
     if revision_config:
         out.revision_protocol_sha = getattr(revision_config, "sha", "")
 
-    inst_dir = output_dir / instance_id
-    for d in ("round1", "sf", "cd"):
-        (inst_dir / d).mkdir(parents=True, exist_ok=True)
+    # Use episode_run_id in output directory
+    out_dir = output_dir / instance_id
+    inst_dir = out_dir / episode_run_id
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write run_manifest.json
+    _write_json(inst_dir / "run_manifest.json", {
+        "instance_id": instance_id,
+        "episode_run_id": episode_run_id,
+        "git_commit": _get_git_commit(),
+        "config_sha": out.config_sha,
+        "config_sha_full": out.config_sha_full,
+        "revision_protocol_sha": out.revision_protocol_sha,
+        "source_yaml_sha": out.source_yaml_sha,
+        "api_base_host": os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1"),
+        "model_name": getattr(agent_config, "model_name", "") if agent_config else "",
+        "start_time_epoch": time.time(),
+        "evaluation_mode": out.evaluation_mode,
+    })
 
     task = instance_spec.problem_statement if hasattr(instance_spec, "problem_statement") else ""
     base_commit = instance_spec.base_commit if hasattr(instance_spec, "base_commit") else ""
@@ -106,7 +131,8 @@ def run_experiment(
     try:
         # ═══════ Round 1 ═══════
         logger.info("[%s] Round 1 begin", instance_id)
-        r1 = run_round1(agent_factory=agent_factory, task=task, base_commit=base_commit)
+        r1 = run_round1(agent_factory=agent_factory, task=task, base_commit=base_commit,
+                        protocol_config=revision_config)
         _write_patch(inst_dir / "round1" / "patch.diff", r1.patch_text)
         _write_trajectory(inst_dir / "round1" / "trajectory.json", r1.trajectory)
 
@@ -114,7 +140,7 @@ def run_experiment(
 
         if r1.termination_reason != "submitted":
             logger.info("[%s] R1 not submitted (%s) — abort", instance_id, r1.termination_reason)
-            out.verdict = "both_fail"
+            out.verdict = "r1_not_submitted"
             return out
 
         # ═══════ Official eval R1 ═══════
@@ -127,7 +153,8 @@ def run_experiment(
         out.round1["harness_status"] = r1_eval.status
         out.round1_resolved = (r1_eval.status == "RESOLVED")
         if out.round1_resolved:
-            out.verdict = "both_succeed"
+            logger.info("[%s] R1 resolved — episode valid, skipping SF/CD", instance_id)
+            out.verdict = "r1_resolved"
             return out
 
         # ═══════ FW + Checkpoint ═══════
@@ -170,11 +197,15 @@ def run_experiment(
             patch_to_apply=r1.patch_text,
             r1_n_calls=r1.n_calls, r1_cost=r1.cost,
             failure_witness=fw, diagnosis=None, mode="sf",
+            protocol_config=revision_config,
         )
         _write_patch(inst_dir / "sf" / "patch.diff", sf.patch_text)
         _write_trajectory(inst_dir / "sf" / "trajectory.json", sf.trajectory)
-        _eval_and_save(harness, instance_spec, sf.patch_text, inst_dir / "sf" / "harness_eval.json",
-                       "sf", sf)
+        if sf.termination_reason == "submitted":
+            _eval_and_save(harness, instance_spec, sf.patch_text, inst_dir / "sf" / "harness_eval.json",
+                           "sf", sf)
+        else:
+            logger.info("[%s] SF not submitted (%s) — skip eval", instance_id, sf.termination_reason)
         out.sf = asdict_skip(sf, ["messages", "trajectory"])
         out.sf_messages_sha = _sha([m for m in sf.messages if m.get("role") != "exit"])
         out.sf_resolved = (sf.termination_reason == "submitted" and
@@ -191,11 +222,15 @@ def run_experiment(
                 patch_to_apply=r1.patch_text,
                 r1_n_calls=r1.n_calls, r1_cost=r1.cost,
                 failure_witness=fw, diagnosis=diag, mode="condiag",
+                protocol_config=revision_config,
             )
             _write_patch(inst_dir / "cd" / "patch.diff", cd.patch_text)
             _write_trajectory(inst_dir / "cd" / "trajectory.json", cd.trajectory)
-            _eval_and_save(harness, instance_spec, cd.patch_text, inst_dir / "cd" / "harness_eval.json",
-                           "cd", cd)
+            if cd.termination_reason == "submitted":
+                _eval_and_save(harness, instance_spec, cd.patch_text, inst_dir / "cd" / "harness_eval.json",
+                               "cd", cd)
+            else:
+                logger.info("[%s] CD not submitted (%s) — skip eval", instance_id, cd.termination_reason)
             out.cd = asdict_skip(cd, ["messages", "trajectory"])
             out.cd_messages_sha = _sha([m for m in cd.messages if m.get("role") != "exit"])
             out.cd_resolved = (cd.termination_reason == "submitted" and
@@ -290,3 +325,14 @@ def _write_comparison(inst_dir: Path, out: ComparisonOutput):
     p = inst_dir / "comparison.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(out.to_dict(), indent=2))
+
+
+def _get_git_commit() -> str:
+    """Return short git commit hash, or 'unknown' if not in a repo."""
+    try:
+        import subprocess
+        r = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"

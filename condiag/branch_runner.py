@@ -11,6 +11,7 @@ from typing import Any, Callable
 from minisweagent.exceptions import Submitted, LimitsExceeded, TimeExceeded, FormatError
 
 from condiag.branch_builder import build_branch_messages
+from condiag.agent.config import redact_trajectory
 
 logger = logging.getLogger("condiag.branch")
 
@@ -43,16 +44,19 @@ def run_branch(
     failure_witness: dict | None,
     diagnosis: str | None = None,
     mode: str = "sf",
+    protocol_config: Any = None,
 ) -> BranchResult:
     """Restore R1 state, inject messages, run until 2nd submission.
 
     Args:
         mode: "sf" (FW only) or "condiag" (FW + diagnosis).
+        protocol_config: RevisionProtocolConfig — overrides LIMITS defaults.
     """
-    agent = agent_factory()
-    agent.config.step_limit = 0
-    agent.n_calls = r1_n_calls
-    agent.cost = r1_cost
+    # Resolve limits from protocol_config or fallback to defaults
+    limits = dict(LIMITS)
+    if protocol_config:
+        limits["wall_time_limit_seconds"] = getattr(protocol_config, "r2_wall_time_limit_seconds", limits["wall_time_limit_seconds"])
+        limits["max_consecutive_format_errors"] = getattr(protocol_config, "r2_max_consecutive_format_errors", limits["max_consecutive_format_errors"])
 
     # Build message sequence via shared function
     agent.messages = build_branch_messages(
@@ -67,7 +71,7 @@ def run_branch(
     reason = ""
     try:
         while True:
-            if time.time() - t0 > LIMITS["wall_time_limit_seconds"]:
+            if time.time() - t0 > limits["wall_time_limit_seconds"]:
                 reason = "wall_timeout"; break
             try:
                 agent.step()
@@ -82,7 +86,7 @@ def run_branch(
                 elif isinstance(e, FormatError):
                     agent.n_consecutive_format_errors += 1
                     agent.add_messages(*e.messages)
-                    if agent.n_consecutive_format_errors >= LIMITS["max_consecutive_format_errors"]:
+                    if agent.n_consecutive_format_errors >= limits["max_consecutive_format_errors"]:
                         reason = "repeated_format_error"; break
                     continue
                 else:
@@ -99,7 +103,7 @@ def run_branch(
             cost_total=agent.cost,
             cost_incremental=agent.cost - r1_cost,
             duration_seconds=time.time() - t0,
-            trajectory=agent.serialize() if hasattr(agent, "serialize") else {},
+            trajectory=redact_trajectory(agent.serialize()) if hasattr(agent, "serialize") else {},
         )
 
     logger.info("[%s] reason=%s incr_calls=%d total_calls=%d patch=%dch",

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -75,9 +75,9 @@ class AgentConfig:
     cost_limit: float = 5.0
     revision_protocol: RevisionProtocolConfig = RevisionProtocolConfig()
 
-    # Computed fields (set in __post_init__, not settable by caller)
-    config_sha: str = ""
-    source_yaml_sha: str = ""
+    # Computed fields — not settable by caller to prevent forgery
+    config_sha: str = field(default="", init=False)
+    source_yaml_sha: str = field(default="", init=False)
 
     def __post_init__(self):
         # Auto-fill source_yaml_sha from locked YAML — always reads from disk
@@ -119,6 +119,26 @@ def load_locked_yaml() -> dict:
         )
 
     return yaml.safe_load(raw)
+
+
+_REDACTED_KEYS = frozenset({"api_key", "authorization", "token", "password"})
+
+
+def redact_trajectory(trajectory: dict) -> dict:
+    """Remove sensitive fields (API keys, tokens) from a serialized trajectory.
+
+    Call this before saving trajectory.json to prevent secret leakage.
+    Modifies the dict in-place and returns it.
+    """
+    import copy
+    result = copy.deepcopy(trajectory)
+    model_info = result.get("info", {}).get("config", {}).get("model", {})
+    kwargs = model_info.get("model_kwargs", {})
+    if isinstance(kwargs, dict):
+        for key in _REDACTED_KEYS:
+            if key in kwargs:
+                kwargs[key] = "***REDACTED***"
+    return result
 
 
 def build_agent_factory(

@@ -9,9 +9,11 @@ from typing import Any, Callable
 
 from minisweagent.exceptions import Submitted, LimitsExceeded, TimeExceeded, FormatError
 
+from condiag.agent.config import redact_trajectory
+
 logger = logging.getLogger("condiag.round1")
 
-LIMITS = {"cost_limit": 3.0, "wall_time_limit_seconds": 3600, "max_consecutive_format_errors": 15}
+DEFAULT_LIMITS = {"cost_limit": 3.0, "wall_time_limit_seconds": 3600, "max_consecutive_format_errors": 15}
 
 
 @dataclass
@@ -26,8 +28,19 @@ class Round1Result:
 
 
 def run_round1(*, agent_factory: Callable[[], Any], task: str,
-               base_commit: str = "") -> Round1Result:
-    """Run agent until natural Submitted or terminal error."""
+               base_commit: str = "",
+               protocol_config: Any = None) -> Round1Result:
+    """Run agent until natural Submitted or terminal error.
+
+    Args:
+        protocol_config: RevisionProtocolConfig — overrides DEFAULT_LIMITS.
+    """
+    # Resolve limits from protocol_config or fallback to defaults
+    limits = dict(DEFAULT_LIMITS)
+    if protocol_config:
+        limits["wall_time_limit_seconds"] = getattr(protocol_config, "r1_wall_time_limit_seconds", limits["wall_time_limit_seconds"])
+        limits["max_consecutive_format_errors"] = getattr(protocol_config, "r1_max_consecutive_format_errors", limits["max_consecutive_format_errors"])
+
     agent = agent_factory()
     agent.config.step_limit = 0  # unlimited — we control wall/time limits externally
 
@@ -42,7 +55,7 @@ def run_round1(*, agent_factory: Callable[[], Any], task: str,
     reason = ""
     try:
         while True:
-            if time.time() - t0 > LIMITS["wall_time_limit_seconds"]:
+            if time.time() - t0 > limits["wall_time_limit_seconds"]:
                 reason = "wall_timeout"; break
             try:
                 agent.step()
@@ -57,7 +70,7 @@ def run_round1(*, agent_factory: Callable[[], Any], task: str,
                 elif isinstance(e, FormatError):
                     agent.n_consecutive_format_errors += 1
                     agent.add_messages(*e.messages)
-                    if agent.n_consecutive_format_errors >= LIMITS["max_consecutive_format_errors"]:
+                    if agent.n_consecutive_format_errors >= limits["max_consecutive_format_errors"]:
                         reason = "repeated_format_error"; break
                     continue
                 else:
@@ -71,7 +84,7 @@ def run_round1(*, agent_factory: Callable[[], Any], task: str,
             n_calls=agent.n_calls,
             cost=agent.cost,
             duration_seconds=time.time() - t0,
-            trajectory=agent.serialize() if hasattr(agent, "serialize") else {},
+            trajectory=redact_trajectory(agent.serialize()) if hasattr(agent, "serialize") else {},
         )
 
     logger.info("R1: reason=%s calls=%d cost=%.4f patch=%dch",

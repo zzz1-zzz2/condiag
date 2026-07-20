@@ -98,3 +98,34 @@ class TestAgentConfig:
         c1 = AgentConfig(protocol_name="baseline_reproduction")
         c2 = AgentConfig(protocol_name="persistent_revision")
         assert c1.config_sha != c2.config_sha
+
+
+class TestRedaction:
+    def test_redact_trajectory_removes_api_key(self):
+        from condiag.agent.config import redact_trajectory
+        traj = {
+            "info": {
+                "config": {
+                    "model": {
+                        "model_kwargs": {
+                            "api_key": "sk-should-be-redacted",
+                            "temperature": 0.0,
+                        }
+                    }
+                }
+            },
+            "messages": [],
+        }
+        result = redact_trajectory(traj)
+        kwargs = result["info"]["config"]["model"]["model_kwargs"]
+        assert kwargs["api_key"] == "***REDACTED***"
+        assert kwargs["temperature"] == 0.0
+        assert "sk-" not in str(result)
+        # Original unchanged
+        assert traj["info"]["config"]["model"]["model_kwargs"]["api_key"] == "sk-should-be-redacted"
+
+    def test_redact_trajectory_no_key(self):
+        from condiag.agent.config import redact_trajectory
+        traj = {"info": {"config": {"model": {"model_kwargs": {"temperature": 0.0}}}}}
+        result = redact_trajectory(traj)
+        assert result["info"]["config"]["model"]["model_kwargs"]["temperature"] == 0.0
