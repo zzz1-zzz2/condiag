@@ -178,7 +178,6 @@ def run_experiment(
         logger.info("[%s] FW: %s", instance_id, fw_preview)
 
         out.r1_messages_sha = _sha(r1.messages)
-        out.r1_workspace_sha = _sha(r1.patch_text)
         out.r1_patch_sha = _sha(r1.patch_text)
         out.failure_witness_sha = _sha(fw)
         _save_checkpoint(checkpointer, r1, base_commit)
@@ -320,9 +319,17 @@ def run_experiment(
 # ─── Helpers ───────────────────────────────────────────────────────
 
 def asdict_skip(obj, skip_keys):
+    """Convert dataclass to dict, recursively handling nested dataclasses."""
+    import dataclasses
     d = {}
     for k, v in vars(obj).items():
-        if k not in skip_keys and not k.startswith("_"):
+        if k in skip_keys or k.startswith("_"):
+            continue
+        if dataclasses.is_dataclass(v):
+            d[k] = dataclasses.asdict(v)
+        elif isinstance(v, (list, tuple)) and v and dataclasses.is_dataclass(v[0]):
+            d[k] = [dataclasses.asdict(item) for item in v]
+        else:
             d[k] = v
     return d
 

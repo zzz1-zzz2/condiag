@@ -126,8 +126,9 @@ def _capture_snapshot(agent, base_commit: str, snapshot_dir: Path | None = None)
     # Archive untracked files (optional — failure doesn't block fingerprint)
     if snapshot_dir and ws.untracked_manifest:
         archive_path = archive_untracked_files(agent, Path(snapshot_dir))
-        ws.untracked_archive_path = archive_path
-        if not archive_path:
-            logger.warning("Untracked archive creation failed (fingerprint OK)")
-
-    return ws
+        if archive_path:
+            ws.untracked_archive_path = archive_path
+        else:
+            # Archive failure with untracked files present → block episode
+            logger.error("Untracked archive creation failed — blocking episode")
+            return None

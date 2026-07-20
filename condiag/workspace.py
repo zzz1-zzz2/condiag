@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -107,30 +108,42 @@ def capture_workspace_fingerprint(agent: Any, base_commit: str) -> CaptureResult
     if rc != 0:
         return CaptureResult(ok=False, reason=f"git diff failed (rc={rc})")
 
-    # Untracked file list (null-delimited for safety)
-    rc, ut_raw = _exec(agent, "cd /testbed && git ls-files -z --others --exclude-standard 2>/dev/null | head -c 1M")
+    # Untracked file fingerprint via inline Python (shell-safe for all filenames)
+    untracked_paths: list[str] = []
+    py_script = """
+import hashlib, json, os, subprocess
+raw = subprocess.check_output(["git", "ls-files", "-z", "--others", "--exclude-standard"])
+items = []
+for raw_path in raw.split(b"\\0"):
+    if not raw_path:
+        continue
+    path = os.fsdecode(raw_path)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        items.append({"path": path, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+    except (OSError, PermissionError) as e:
+        items.append({"path": path, "size": -1, "sha256": f"error:{e}"})
+print(json.dumps(items, ensure_ascii=False))
+"""
+    rc, ut_json = _exec(agent, f"cd /testbed && python3 -c {shlex.quote(py_script)} 2>/dev/null")
     if rc != 0:
-        return CaptureResult(ok=False, reason=f"git ls-files failed (rc={rc})")
-    untracked_paths = [p for p in ut_raw.split("\0") if p.strip()] if ut_raw.strip() else []
+        return CaptureResult(ok=False, reason=f"untracked fingerprint failed (rc={rc})")
 
-    # Build manifest with content SHA and size
+    try:
+        untracked_items = json.loads(ut_json)
+    except json.JSONDecodeError as e:
+        return CaptureResult(ok=False, reason=f"untracked JSON parse failed: {e}")
+
     manifest: list[UntrackedFile] = []
-    for upath in untracked_paths:
-        # Use null-delimited sha256sum for safety
-        rc, sha_out = _exec(agent, f"cd /testbed && sha256sum -- '{upath}' 2>/dev/null || echo FAIL")
-        f_sha = ""
-        if rc == 0 and sha_out.strip() and "FAIL" not in sha_out:
-            f_sha = sha_out.split()[0] if sha_out.strip() else ""
-
-        rc, wc_out = _exec(agent, f"cd /testbed && wc -c -- '{upath}' 2>/dev/null || echo FAIL")
-        f_size = 0
-        if rc == 0 and wc_out.strip() and "FAIL" not in wc_out:
-            try:
-                f_size = int(wc_out.split()[0])
-            except (ValueError, IndexError):
-                pass
-
-        manifest.append(UntrackedFile(path=upath, size=f_size, sha256=f_sha))
+    for item in untracked_items:
+        if item.get("size", 0) < 0:
+            return CaptureResult(ok=False, reason=f"untracked read error: {item['path']}: {item.get('sha256', '')}")
+        manifest.append(UntrackedFile(
+            path=item["path"],
+            size=item["size"],
+            sha256=item["sha256"],
+        ))
 
     snapshot = WorkspaceSnapshot(
         tracked_diff=tracked,

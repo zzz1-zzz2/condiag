@@ -1,84 +1,101 @@
-"""Integration tests for experiment flow: serialization, fairness, snapshot."""
+"""Tests for P0-5/6 closure: serialization, capture, fairness pre-step gate."""
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock
+from dataclasses import dataclass
 
-from condiag.experiment import ComparisonOutput, _sha
-from condiag.workspace import WorkspaceSnapshot, UntrackedFile, check_workspace_fairness
+from condiag.experiment import ComparisonOutput, asdict_skip
+from condiag.workspace import (
+    CaptureResult,
+    WorkspaceSnapshot,
+    UntrackedFile,
+    check_workspace_fairness,
+)
 
 
-class TestComparisonOutput:
-    def test_to_dict_serializable(self):
-        """comparison.json must be JSON-serializable without custom encoders."""
-        out = ComparisonOutput(
-            instance_id="test",
-            verdict="tie",
-        )
-        d = out.to_dict()
-        dumped = json.dumps(d, indent=2)
-        assert '"instance_id": "test"' in dumped
-
-    def test_to_dict_with_round1_result(self):
-        """asdict_skip must exclude non-serializable fields like workspace_snapshot."""
+class TestComparisonSerialization:
+    def test_branch_result_with_restore_result_serializable(self):
+        """branch_result containing RestoreResult must survive json.dumps()."""
         out = ComparisonOutput(instance_id="test")
-        # Simulate what experiment.py does with round1 result
-        out.round1 = {
+
+        # Simulate what experiment.py does after assigning asdict_skip(sf, ...)
+        sf_dict = {
             "termination_reason": "submitted",
-            "n_calls": 35,
-            "patch_text": "diff --git a/x.py b/x.py",
+            "restore_result": {"ok": True, "workspace_sha": "abc123", "reason": ""},
+            "workspace_sha_before_first_step": "abc123",
+            "n_calls_total": 37,
         }
-        d = out.to_dict()
-        json.dumps(d, indent=2)  # must not raise
+        out.sf = sf_dict
+
+        cd_dict = {
+            "termination_reason": "submitted",
+            "restore_result": {"ok": True, "workspace_sha": "abc123", "reason": ""},
+            "workspace_sha_before_first_step": "abc123",
+            "n_calls_total": 42,
+        }
+        out.cd = cd_dict
+        out.fairness_ok = True
+
+        # Must not raise TypeError
+        dumped = json.dumps(out.to_dict(), indent=2)
+        assert '"fairness_ok": true' in dumped
+        assert '"restore_result"' in dumped
+
+    def test_asdict_skip_handles_nested_dataclass(self):
+        """asdict_skip must recursively convert dataclass fields to dicts."""
+
+        @dataclass
+        class Inner:
+            ok: bool = True
+            sha: str = "abc"
+
+        @dataclass
+        class Outer:
+            name: str = "test"
+            inner: Inner | None = None
+
+        result = asdict_skip(Outer(inner=Inner()), skip_keys=[])
+        assert isinstance(result["inner"], dict)
+        assert result["inner"]["ok"] is True
+        # Verify JSON serializable
+        json.dumps(result)
 
 
-class TestFairness:
-    def test_identical_workspaces_pass(self):
-        ws = WorkspaceSnapshot(tracked_diff="same diff", base_commit_sha="abc")
-        r = check_workspace_fairness(ws, ws, ws)
-        assert r["all_ok"]
+class TestCaptureResult:
+    def test_capture_ok(self):
+        cr = CaptureResult(ok=True, snapshot=WorkspaceSnapshot(), reason="")
+        assert cr.ok
+        assert cr.snapshot is not None
 
-    def test_diff_tracked_fails(self):
-        ws1 = WorkspaceSnapshot(tracked_diff="change a", base_commit_sha="abc")
-        ws2 = WorkspaceSnapshot(tracked_diff="change b", base_commit_sha="abc")
-        r = check_workspace_fairness(ws1, ws2, ws1)
-        assert not r["all_ok"]
+    def test_capture_failed(self):
+        cr = CaptureResult(ok=False, reason="git rev-parse failed")
+        assert not cr.ok
+        assert cr.snapshot is None
 
-    def test_diff_untracked_fails(self):
-        ws1 = WorkspaceSnapshot(
+
+class TestFairnessGate:
+    def test_equal_workspaces_pass(self):
+        ws = WorkspaceSnapshot(tracked_diff="same", base_commit_sha="abc")
+        assert check_workspace_fairness(ws, ws, ws)["all_ok"]
+
+    def test_mismatched_tracked_fails(self):
+        r1 = WorkspaceSnapshot(tracked_diff="diff a", base_commit_sha="abc")
+        sf = WorkspaceSnapshot(tracked_diff="diff b", base_commit_sha="abc")
+        fairness = check_workspace_fairness(r1, sf, sf)
+        assert not fairness["all_ok"]
+        assert not fairness["r1_vs_sf_tracked_ok"]
+
+    def test_mismatched_untracked_fails(self):
+        r1 = WorkspaceSnapshot(
             tracked_diff="same",
-            untracked_manifest=[UntrackedFile(path="x.py", size=10, sha256="aaa")],
+            untracked_manifest=[UntrackedFile("x.py", 10, "aaa")],
             base_commit_sha="abc",
         )
-        ws2 = WorkspaceSnapshot(
+        sf = WorkspaceSnapshot(
             tracked_diff="same",
-            untracked_manifest=[UntrackedFile(path="y.py", size=20, sha256="bbb")],
+            untracked_manifest=[UntrackedFile("x.py", 20, "bbb")],
             base_commit_sha="abc",
         )
-        r = check_workspace_fairness(ws1, ws2, ws1)
-        assert not r["all_ok"]
-
-
-class TestWorkspaceSnapshot:
-    def test_only_untracked_no_tracked(self):
-        """Snapshot with only untracked files should still produce a meaningful SHA."""
-        ws = WorkspaceSnapshot(
-            tracked_diff="",
-            untracked_manifest=[UntrackedFile(path="reproduce.py", size=50, sha256="abc123")],
-            base_commit_sha="abc",
-        )
-        assert ws.workspace_state_sha != ""
-
-    def test_untracked_content_sha_changes_state(self):
-        """Same path but different content SHA must produce different state SHA."""
-        ws1 = WorkspaceSnapshot(
-            tracked_diff="diff",
-            untracked_manifest=[UntrackedFile(path="x.py", size=10, sha256="aaa")],
-            base_commit_sha="abc",
-        )
-        ws2 = WorkspaceSnapshot(
-            tracked_diff="diff",
-            untracked_manifest=[UntrackedFile(path="x.py", size=10, sha256="bbb")],
-            base_commit_sha="abc",
-        )
-        assert ws1.workspace_state_sha != ws2.workspace_state_sha
+        fairness = check_workspace_fairness(r1, sf, sf)
+        assert not fairness["all_ok"]
+        assert not fairness["r1_vs_sf_state_ok"]
