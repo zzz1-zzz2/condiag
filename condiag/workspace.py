@@ -117,45 +117,46 @@ def capture_workspace_snapshot(
     manifest = []
     archive_path = ""
     if snapshot_dir and untracked_paths:
-        import tarfile
-        import tempfile
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         archive_path = str(snapshot_dir / "untracked.tar")
 
-        with tempfile.NamedTemporaryFile(suffix=".txt", mode="w", delete=False) as list_file:
-            list_file.write("\n".join(untracked_paths))
-            list_file_path = list_file.name
-
-        # Get file stats via container command
-        for upath in untracked_paths[:50]:  # Limit to 50 files
-            stat_r = agent.env.execute({
-                "command": f"cd /testbed && sha256sum '{upath}' 2>/dev/null && wc -c '{upath}' 2>/dev/null"
+        for upath in untracked_paths:
+            # Parse sha256sum output: "sha256  path"
+            sha_r = agent.env.execute({
+                "command": f"cd /testbed && sha256sum '{upath}' 2>/dev/null"
             })
-            if stat_r.get("returncode") == 0:
-                manifest.append(UntrackedFile(
-                    path=upath,
-                    size=0,  # Would need more parsing
-                    sha256="",
-                ))
+            f_sha = ""
+            if sha_r.get("returncode") == 0:
+                f_sha = sha_r["output"].split()[0] if sha_r["output"].strip() else ""
 
-        # Create tar archive
-        agent.env.execute({
-            "command": f"cd /testbed && tar cf /tmp/untracked.tar {' '.join(untracked_paths[:50])} 2>/dev/null || true"
+            # Parse wc -c output: "SIZE path"
+            wc_r = agent.env.execute({
+                "command": f"cd /testbed && wc -c '{upath}' 2>/dev/null"
+            })
+            f_size = 0
+            if wc_r.get("returncode") == 0:
+                try:
+                    f_size = int(wc_r["output"].split()[0])
+                except (ValueError, IndexError):
+                    pass
+
+            manifest.append(UntrackedFile(path=upath, size=f_size, sha256=f_sha))
+
+        # Create tar archive — check return code
+        tar_r = agent.env.execute({
+            "command": f"cd /testbed && tar cf /tmp/untracked.tar {' '.join(untracked_paths)} 2>&1"
         })
-        # Copy archive out
-        import subprocess
-        try:
-            subprocess.run(
-                ["docker", "cp", f"{agent.env.container_id}:/tmp/untracked.tar", archive_path],
-                capture_output=True, timeout=10,
-            )
-        except Exception:
+        if tar_r.get("returncode") != 0:
             archive_path = ""
 
-        try:
-            Path(list_file_path).unlink(missing_ok=True)
-        except Exception:
-            pass
+        # Copy archive out — check return code
+        import subprocess
+        cp_r = subprocess.run(
+            ["docker", "cp", f"{agent.env.container_id}:/tmp/untracked.tar", archive_path],
+            capture_output=True, timeout=10,
+        )
+        if cp_r.returncode != 0:
+            archive_path = ""
 
     return WorkspaceSnapshot(
         tracked_diff=tracked,

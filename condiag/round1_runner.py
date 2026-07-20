@@ -30,7 +30,8 @@ class Round1Result:
 
 def run_round1(*, agent_factory: Callable[[], Any], task: str,
                base_commit: str = "",
-               protocol_config: Any = None) -> Round1Result:
+               protocol_config: Any = None,
+               snapshot_dir: str | Path | None = None) -> Round1Result:
     """Run agent until natural Submitted or terminal error.
 
     Args:
@@ -79,7 +80,7 @@ def run_round1(*, agent_factory: Callable[[], Any], task: str,
                     reason = f"error:{type(e).__name__}"; break
     finally:
         # Capture workspace snapshot (before container dies)
-        snapshot = _capture_snapshot(agent, base_commit)
+        snapshot = _capture_snapshot(agent, base_commit, Path(snapshot_dir) if snapshot_dir else None)
         result = Round1Result(
             termination_reason=reason,
             patch_text=_canonical_patch(agent, base_commit),
@@ -107,22 +108,11 @@ def _canonical_patch(agent, base_commit: str = "") -> str:
         return ""
 
 
-def _capture_snapshot(agent, base_commit: str) -> Any:
-    """Capture workspace snapshot from the live agent container."""
-    from condiag.workspace import WorkspaceSnapshot
+def _capture_snapshot(agent, base_commit: str, snapshot_dir: Path | None = None) -> Any:
+    """Capture full workspace snapshot (tracked + untracked) from live container."""
+    from condiag.workspace import capture_workspace_snapshot
     try:
-        diff_r = agent.env.execute({
-            "command": f"cd /testbed && git diff --binary --no-ext-diff {base_commit} 2>/dev/null"
-        })
-        tracked = diff_r.get("output", "") if diff_r.get("returncode") == 0 else ""
-
-        head_r = agent.env.execute({"command": "cd /testbed && git rev-parse HEAD 2>/dev/null"})
-        head_sha = head_r.get("output", "").strip() if head_r.get("returncode") == 0 else ""
-
-        ws = WorkspaceSnapshot(
-            tracked_diff=tracked,
-            base_commit_sha=head_sha or base_commit,
-        )
-        return ws
-    except Exception:
-        return WorkspaceSnapshot(base_commit_sha=base_commit)
+        return capture_workspace_snapshot(agent, base_commit, snapshot_dir)
+    except Exception as e:
+        logger.error("Failed to capture workspace snapshot: %s", e)
+        return None

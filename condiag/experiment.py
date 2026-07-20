@@ -146,11 +146,12 @@ def run_experiment(
         # ═══════ Round 1 ═══════
         logger.info("[%s] Round 1 begin", instance_id)
         r1 = run_round1(agent_factory=agent_factory, task=task, base_commit=base_commit,
-                        protocol_config=revision_config)
+                        protocol_config=revision_config,
+                        snapshot_dir=inst_dir / "round1")
         _write_patch(inst_dir / "round1" / "patch.diff", r1.patch_text)
         _write_trajectory(inst_dir / "round1" / "trajectory.json", r1.trajectory)
 
-        out.round1 = asdict_skip(r1, ["messages", "trajectory"])
+        out.round1 = asdict_skip(r1, ["messages", "trajectory", "workspace_snapshot"])
 
         if r1.termination_reason != "submitted":
             logger.info("[%s] R1 not submitted (%s) — abort", instance_id, r1.termination_reason)
@@ -268,13 +269,15 @@ def run_experiment(
         # ═══════ Fairness Check ═══════
         sf_ws = sf.workspace_sha_before_first_step if hasattr(sf, "workspace_sha_before_first_step") else ""
         cd_ws = cd.workspace_sha_before_first_step if (out.cd_run and hasattr(cd, "workspace_sha_before_first_step")) else ""
-        r1_ws = r1_snapshot.workspace_state_sha
+        r1_ws = r1_snapshot.workspace_state_sha if r1_snapshot else "no_snapshot"
         cd_restore_ok = cd.restore_result.ok if out.cd_run else True
+        cd_ws_ok = bool(cd_ws) and cd_ws == r1_ws if out.cd_run else True
         fairness_ok = (
-            sf.restore_result.ok
+            r1_snapshot is not None
+            and sf.restore_result.ok
             and cd_restore_ok
             and sf_ws == r1_ws
-            and (not cd_ws or cd_ws == r1_ws)
+            and cd_ws_ok
         )
         out.fairness_ok = fairness_ok
         out.r1_workspace_sha = r1_ws
@@ -284,9 +287,9 @@ def run_experiment(
                      instance_id, r1_ws, sf_ws, cd_ws, fairness_ok)
 
         # ═══════ Verdict ═══════
-        if not out.cd_run:
-            out.verdict = "cd_disabled"
-        elif not fairness_ok:
+        if not fairness_ok:
+            out.verdict = "invalid_fairness"
+        elif not out.cd_run:
             out.verdict = "invalid_fairness"
         elif out.sf_resolved and out.cd_resolved:
             out.verdict = "both_succeed"

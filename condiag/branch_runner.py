@@ -72,35 +72,39 @@ def restore_workspace(agent, snapshot, base_commit: str) -> RestoreResult:
         if not snapshot or (not snapshot.tracked_diff and not snapshot.untracked_manifest):
             return RestoreResult(ok=True, workspace_sha="clean_base", reason="no_diff_or_untracked")
 
-        # Protection 3: Apply tracked diff
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as f:
-            f.write(snapshot.tracked_diff)
-            f.flush()
-            temp_path = f.name
+        # Protection 3: Apply tracked diff (if any)
+        temp_path = None
+        if snapshot.tracked_diff:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as f:
+                f.write(snapshot.tracked_diff)
+                f.flush()
+                temp_path = f.name
 
-        r1 = subprocess.run(
-            ["docker", "cp", temp_path, f"{cid}:/tmp/restore.patch"],
-            capture_output=True, timeout=10,
-        )
-        if r1.returncode != 0:
-            return RestoreResult(ok=False, reason=f"docker cp failed: {r1.stderr.decode(errors='replace')[:200]}")
+            r1 = subprocess.run(
+                ["docker", "cp", temp_path, f"{cid}:/tmp/restore.patch"],
+                capture_output=True, timeout=10,
+            )
+            if r1.returncode != 0:
+                return RestoreResult(ok=False, reason=f"docker cp failed: {r1.stderr.decode(errors='replace')[:200]}")
 
-        # --check first (validate without applying)
-        r2 = agent.env.execute({"command": "cd /testbed && git apply --check /tmp/restore.patch 2>&1"})
-        if r2.get("returncode") != 0:
-            return RestoreResult(ok=False, reason=f"git apply --check failed")
+            r2 = agent.env.execute({"command": "cd /testbed && git apply --check /tmp/restore.patch 2>&1"})
+            if r2.get("returncode") != 0:
+                return RestoreResult(ok=False, reason=f"git apply --check failed")
 
-        r3 = agent.env.execute({"command": "cd /testbed && git apply --whitespace=nowarn /tmp/restore.patch 2>&1"})
-        if r3.get("returncode") != 0:
-            return RestoreResult(ok=False, reason=f"git apply failed")
+            r3 = agent.env.execute({"command": "cd /testbed && git apply --whitespace=nowarn /tmp/restore.patch 2>&1"})
+            if r3.get("returncode") != 0:
+                return RestoreResult(ok=False, reason=f"git apply failed")
 
         # Restore untracked files if archive exists
         if snapshot.untracked_archive_path and os.path.exists(snapshot.untracked_archive_path):
-            subprocess.run(
+            cp_r = subprocess.run(
                 ["docker", "cp", snapshot.untracked_archive_path, f"{cid}:/tmp/untracked.tar"],
                 capture_output=True, timeout=10,
             )
-            agent.env.execute({"command": "cd /testbed && tar xf /tmp/untracked.tar 2>/dev/null || true"})
+            if cp_r.returncode == 0:
+                tar_r = agent.env.execute({"command": "cd /testbed && tar xf /tmp/untracked.tar 2>&1"})
+                if tar_r.get("returncode") != 0:
+                    return RestoreResult(ok=False, reason=f"untracked tar extract failed")
 
         # Protection 4: Validate workspace_state_sha (tracked + untracked)
         diff_r = agent.env.execute({
@@ -116,13 +120,13 @@ def restore_workspace(agent, snapshot, base_commit: str) -> RestoreResult:
         })
         ut_paths = [p for p in ut_r.get("output", "").split("\n") if p.strip()] if ut_r.get("returncode") == 0 else []
 
-        from condiag.workspace import WorkspaceSnapshot
+        from condiag.workspace import WorkspaceSnapshot, UntrackedFile
         restored = WorkspaceSnapshot(
             tracked_diff=restored_diff,
             base_commit_sha=base_commit,
         )
         if ut_paths:
-            restored.untracked_manifest = [{"path": p, "size": 0, "sha256": ""} for p in ut_paths]
+            restored.untracked_manifest = [UntrackedFile(path=p, size=0, sha256="") for p in ut_paths]
 
         if restored.workspace_state_sha != snapshot.workspace_state_sha:
             return RestoreResult(
