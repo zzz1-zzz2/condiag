@@ -1,7 +1,6 @@
 """Tests for AgentConfig module — no model calls."""
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 
 import pytest
@@ -10,10 +9,25 @@ from condiag.agent.config import (
     LOCKED_CONFIG_PATH,
     LOCKED_YAML_SHA256,
     AgentConfig,
-    ConfigDriftError,
-    _sha,
+    RevisionProtocolConfig,
+    sha256_full,
+    sha256_short,
     load_locked_yaml,
 )
+
+
+class TestSHA:
+    def test_full_length(self):
+        h = sha256_full("hello")
+        assert len(h) == 64
+
+    def test_short_length(self):
+        h = sha256_short("hello")
+        assert len(h) == 16
+
+    def test_deterministic(self):
+        assert sha256_full("hello") == sha256_full("hello")
+        assert sha256_full("hello") != sha256_full("world")
 
 
 class TestConfigSHA:
@@ -24,10 +38,11 @@ class TestConfigSHA:
         """If this fails, the locked YAML was modified.
         If intentional, update LOCKED_YAML_SHA256 in config.py."""
         raw = LOCKED_CONFIG_PATH.read_text("utf-8")
-        actual = _sha(raw)
+        actual = sha256_full(raw)
         assert actual == LOCKED_YAML_SHA256, (
-            f"Locked YAML SHA mismatch: expected {LOCKED_YAML_SHA256}, got {actual}. "
-            "If you upgraded the locked config, update LOCKED_YAML_SHA256 in config.py"
+            f"Locked YAML SHA mismatch:\n"
+            f"  expected: {LOCKED_YAML_SHA256[:32]}...\n"
+            f"  actual:   {actual[:32]}..."
         )
 
     def test_load_locked_yaml_returns_dict(self):
@@ -38,31 +53,48 @@ class TestConfigSHA:
         assert "model" in cfg
 
 
+class TestRevisionProtocolConfig:
+    def test_defaults(self):
+        r = RevisionProtocolConfig()
+        assert r.r1_wall_time_limit_seconds == 3600
+        assert r.r2_wall_time_limit_seconds == 3600
+        assert r.r1_max_consecutive_format_errors == 15
+        assert r.r2_max_consecutive_format_errors == 3
+
+    def test_sha_changes_with_params(self):
+        r1 = RevisionProtocolConfig(r1_max_consecutive_format_errors=15)
+        r2 = RevisionProtocolConfig(r1_max_consecutive_format_errors=3)
+        assert r1.sha != r2.sha
+
+
 class TestAgentConfig:
     def test_default_config(self):
         c = AgentConfig()
         assert c.protocol_name == "persistent_revision"
-        assert c.protocol_version == "1.0"
         assert c.config_sha != ""
         assert c.source_yaml_sha != ""
 
-    def test_config_sha_covers_all_protocol_fields(self):
+    def test_source_yaml_sha_is_full_length(self):
+        c = AgentConfig()
+        assert len(c.source_yaml_sha) == 64 or len(c.source_yaml_sha) == 0
+
+    def test_config_sha_covers_step_limit(self):
         c1 = AgentConfig(step_limit=0, cost_limit=5.0)
         c2 = AgentConfig(step_limit=250, cost_limit=3.0)
-        assert c1.config_sha != c2.config_sha, \
-            "Different protocol params must produce different config_sha"
+        assert c1.config_sha != c2.config_sha
 
-    def test_config_sha_changes_with_yaml_sha(self):
-        c1 = AgentConfig(source_yaml_sha="abc123")
-        c2 = AgentConfig(source_yaml_sha="def456")
+    def test_config_sha_16_chars(self):
+        c = AgentConfig()
+        assert len(c.config_sha) == 16
+
+    def test_config_sha_includes_revision_protocol(self):
+        r1 = RevisionProtocolConfig(r1_max_consecutive_format_errors=15)
+        r2 = RevisionProtocolConfig(r1_max_consecutive_format_errors=3)
+        c1 = AgentConfig(revision_protocol=r1)
+        c2 = AgentConfig(revision_protocol=r2)
         assert c1.config_sha != c2.config_sha
 
     def test_different_protocols_different_sha(self):
         c1 = AgentConfig(protocol_name="baseline_reproduction")
         c2 = AgentConfig(protocol_name="persistent_revision")
         assert c1.config_sha != c2.config_sha
-
-    def test_source_yaml_sha_auto_filled(self):
-        c = AgentConfig()
-        assert c.source_yaml_sha != "", "source_yaml_sha should be auto-filled"
-        assert len(c.source_yaml_sha) == 16

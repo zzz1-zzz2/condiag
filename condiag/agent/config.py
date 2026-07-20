@@ -4,7 +4,7 @@ Design:
   - One factory function, one set of locked prompt templates
   - Protocol-versioned: "baseline_reproduction" vs "persistent_revision"
   - Config SHA is checked at runtime to detect drift
-  - All environment variables come from env, not hardcoded strings
+  - All secrets come from env, not hardcoded strings
 """
 from __future__ import annotations
 
@@ -18,26 +18,52 @@ import yaml
 
 LOCKED_CONFIG_PATH = Path(__file__).parent.parent.parent / "configs" / "locked" / "minisweagent_swebench_v2.4.1.yaml"
 
-# Hardcoded SHA256 of the locked YAML.
-# If the locked YAML is updated (new mini-swe-agent version), this must be
-# recalculated and updated EXPLICITLY — auto-follow is forbidden.
-LOCKED_YAML_SHA256 = "229f178a07faa109"
+# Full SHA256 hex digest of the locked YAML at the time of writing.
+# If upgrading the locked YAML, recalculate and update this value — no auto-follow.
+LOCKED_YAML_SHA256 = "229f178a07faa109e3a020c75dfe603b6a24200e1f3aebe257b97098fd3a6fee"
 
 
 class ConfigDriftError(RuntimeError):
     """Raised when the locked YAML config has drifted from expected SHA."""
 
 
-def _sha(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+def sha256_full(text: str) -> str:
+    """Full 64-character SHA256 hex digest. Use for permanent records."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def sha256_short(text: str) -> str:
+    """First 16 characters of SHA256. Use for display/logging."""
+    return sha256_full(text)[:16]
+
+
+@dataclass(frozen=True)
+class RevisionProtocolConfig:
+    """Constraints that differ between R1 and R2 but form a single experiment protocol.
+
+    These are NOT in AgentConfig because R1 and R2 apply them differently,
+    but they MUST be recorded as part of the episode config SHA.
+    """
+
+    r1_wall_time_limit_seconds: int = 3600
+    r2_wall_time_limit_seconds: int = 3600
+    r1_max_consecutive_format_errors: int = 15
+    r2_max_consecutive_format_errors: int = 3
+
+    @property
+    def sha(self) -> str:
+        raw = f"R1wall={self.r1_wall_time_limit_seconds}|R1fmt={self.r1_max_consecutive_format_errors}"
+        raw += f"|R2wall={self.r2_wall_time_limit_seconds}|R2fmt={self.r2_max_consecutive_format_errors}"
+        return sha256_short(raw)
 
 
 @dataclass(frozen=True)
 class AgentConfig:
     """Immutable agent configuration with protocol tracking.
 
-    config_sha covers ALL fields below — not just a subset.
-    source_yaml_sha is auto-filled from the locked YAML on construction.
+    config_sha covers ALL fields below — used as the episode config identity.
+    source_yaml_sha is auto-filled from the locked YAML on construction
+    and CANNOT be overridden by callers.
     """
 
     protocol_name: str = "persistent_revision"
@@ -47,14 +73,17 @@ class AgentConfig:
     max_tokens: int = 4096
     step_limit: int = 0
     cost_limit: float = 5.0
+    revision_protocol: RevisionProtocolConfig = RevisionProtocolConfig()
+
+    # Computed fields (set in __post_init__, not settable by caller)
     config_sha: str = ""
     source_yaml_sha: str = ""
 
     def __post_init__(self):
-        # Auto-fill source_yaml_sha from locked YAML
-        if not self.source_yaml_sha and LOCKED_CONFIG_PATH.exists():
+        # Auto-fill source_yaml_sha from locked YAML — always reads from disk
+        if LOCKED_CONFIG_PATH.exists():
             raw = LOCKED_CONFIG_PATH.read_text("utf-8")
-            object.__setattr__(self, "source_yaml_sha", _sha(raw))
+            object.__setattr__(self, "source_yaml_sha", sha256_full(raw))
 
         # Compute config SHA covering ALL protocol-relevant fields
         if not self.config_sha:
@@ -65,9 +94,10 @@ class AgentConfig:
                 f"|maxtok={self.max_tokens}"
                 f"|step={self.step_limit}"
                 f"|cost={self.cost_limit}"
-                f"|yaml={self.source_yaml_sha}"
+                f"|yaml={self.source_yaml_sha[:16]}"
+                f"|rev={self.revision_protocol.sha}"
             )
-            object.__setattr__(self, "config_sha", _sha(raw))
+            object.__setattr__(self, "config_sha", sha256_short(raw))
 
 
 def load_locked_yaml() -> dict:
@@ -76,13 +106,16 @@ def load_locked_yaml() -> dict:
         raise FileNotFoundError(f"Locked config not found: {LOCKED_CONFIG_PATH}")
 
     raw = LOCKED_CONFIG_PATH.read_text(encoding="utf-8")
-    actual_sha = _sha(raw)
+    actual_sha = sha256_full(raw)
 
     if actual_sha != LOCKED_YAML_SHA256:
         raise ConfigDriftError(
-            f"Locked YAML SHA mismatch: expected {LOCKED_YAML_SHA256}, got {actual_sha}. "
-            f"If you intentionally upgraded the locked YAML, update LOCKED_YAML_SHA256 in config.py. "
-            f"Locked file: {LOCKED_CONFIG_PATH}"
+            f"Locked YAML SHA mismatch:\n"
+            f"  expected: {LOCKED_YAML_SHA256}\n"
+            f"  actual:   {actual_sha}\n"
+            f"File: {LOCKED_CONFIG_PATH}\n"
+            f"If you intentionally upgraded the locked YAML, update "
+            f"LOCKED_YAML_SHA256 in condiag/agent/config.py"
         )
 
     return yaml.safe_load(raw)
@@ -94,11 +127,9 @@ def build_agent_factory(
 ) -> Callable[[], Any]:
     """Build and return a callable that creates a new agent instance.
 
+    Validates source_yaml_sha against the locked YAML on disk.
     Each call to the returned factory creates a fresh agent with its own
     Docker container — suitable for forked branches in Round 2.
-
-    The agent is a plain minisweagent.agents.default.DefaultAgent,
-    NOT ConDiagIntegratedAgent (frozen v4 architecture).
 
     Usage:
         factory = build_agent_factory(config, instance_id)
@@ -108,6 +139,15 @@ def build_agent_factory(
     from minisweagent.environments.docker import DockerEnvironment
     from minisweagent.models.litellm_model import LitellmModel
     from minisweagent.run.benchmarks.swebench import get_swebench_docker_image_name
+
+    # Validate source_yaml_sha against disk
+    raw_yaml = LOCKED_CONFIG_PATH.read_text("utf-8")
+    actual_yaml_sha = sha256_full(raw_yaml)
+    if config.source_yaml_sha and config.source_yaml_sha != actual_yaml_sha:
+        raise ConfigDriftError(
+            f"AgentConfig.source_yaml_sha ({config.source_yaml_sha[:16]}...) "
+            f"does not match disk ({actual_yaml_sha[:16]}...)"
+        )
 
     pred = {"instance_id": instance_id}
     image_name = get_swebench_docker_image_name(pred)
@@ -119,18 +159,19 @@ def build_agent_factory(
 
     system_template = agent_cfg.get("system_template", "")
     instance_template = agent_cfg.get("instance_template", "")
-
-    # Read YAML environment settings
     env_timeout = env_cfg.get("timeout", 120)
     env_interpreter = env_cfg.get("interpreter", ["bash", "-c"])
     env_vars = env_cfg.get("env", {})
     env_cwd = env_cfg.get("cwd", "/testbed")
 
-    # Read YAML model settings
     model_kwargs = dict(model_cfg.get("model_kwargs", {}))
     model_kwargs.update({
         "temperature": config.temperature,
         "max_tokens": config.max_tokens,
+        "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
+        "api_base": os.environ.get(
+            "DEEPSEEK_API_BASE", "https://api.deepseek.com/v1"
+        ),
     })
     observation_template = model_cfg.get("observation_template", "")
     format_error_template = model_cfg.get("format_error_template", "")
@@ -142,19 +183,16 @@ def build_agent_factory(
             timeout=env_timeout,
             interpreter=env_interpreter,
         )
-        # Apply environment variables
         for k, v in env_vars.items():
             env.config.env[k] = v
 
         model = LitellmModel(
             model_name=config.model_name,
             model_kwargs=model_kwargs,
+            cost_tracking="ignore_errors",
+            observation_template=observation_template,
+            format_error_template=format_error_template,
         )
-        # Apply model observation/error templates from YAML
-        if observation_template:
-            model.config.observation_template = observation_template
-        if format_error_template:
-            model.config.format_error_template = format_error_template
 
         agent = DefaultAgent(
             model=model,

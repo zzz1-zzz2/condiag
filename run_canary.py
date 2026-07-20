@@ -49,7 +49,7 @@ def load_instance(instance_id: str = "astropy__astropy-13398"):
 
 
 def make_agent_factory(instance_id: str):
-    from condiag.agent.config import AgentConfig, build_agent_factory, require_api_key
+    from condiag.agent.config import AgentConfig, RevisionProtocolConfig, build_agent_factory, require_api_key
     require_api_key()
 
     config = AgentConfig(
@@ -61,9 +61,9 @@ def make_agent_factory(instance_id: str):
         step_limit=0,
         cost_limit=5.0,
     )
-    log.info("  AgentConfig: protocol=%s/%s model=%s",
-             config.protocol_name, config.protocol_version, config.model_name)
-    return build_agent_factory(config, instance_id)
+    log.info("  AgentConfig: protocol=%s/%s model=%s sha=%s",
+             config.protocol_name, config.protocol_version, config.model_name, config.config_sha)
+    return build_agent_factory(config, instance_id), config, RevisionProtocolConfig()
 
 
 def run_canary(instance_id: str = "astropy__astropy-13398"):
@@ -86,7 +86,7 @@ def run_canary(instance_id: str = "astropy__astropy-13398"):
         run_id=f"canary_{instance_id}", rm_image=False, force_rebuild=False, timeout=600,
     )
     checkpointer = CheckpointManager(ARTIFACTS / instance_id / "round1")
-    agent_factory = make_agent_factory(instance_id)
+    agent_factory, agent_config, rev_config = make_agent_factory(instance_id)
 
     result = run_experiment(
         instance_id=instance_id,
@@ -96,6 +96,9 @@ def run_canary(instance_id: str = "astropy__astropy-13398"):
         output_dir=ARTIFACTS,
         instance_spec=spec,
         diagnosis_builder_cls=DiagnosisPromptBuilder,
+        run_cd=True,
+        agent_config=agent_config,
+        revision_config=rev_config,
     )
 
     print("\n" + "=" * 60)

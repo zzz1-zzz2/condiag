@@ -22,25 +22,38 @@ def _sha(d):
     return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
+def _sha256_full(d) -> str:
+    return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()
+
+
 @dataclass
 class ComparisonOutput:
     instance_id: str = ""
     evaluation_mode: str = "official"
-    checkpoint_id: str = ""
+    # Config identity
+    config_sha: str = ""
+    revision_protocol_sha: str = ""
+    source_yaml_sha: str = ""
+    # R1
     r1_messages_sha: str = ""
     r1_workspace_sha: str = ""
     r1_patch_sha: str = ""
     failure_witness_sha: str = ""
-    sf_workspace_sha: str = ""
-    cd_workspace_sha: str = ""
-    sf_messages_sha: str = ""
-    cd_messages_sha: str = ""
     round1: dict = field(default_factory=dict)
-    sf: dict = field(default_factory=dict)
-    cd: dict = field(default_factory=dict)
     round1_resolved: bool = False
+    # SF
+    sf_workspace_sha: str = ""
+    sf_messages_sha: str = ""
+    sf: dict = field(default_factory=dict)
     sf_resolved: bool = False
+    sf_run: bool = False
+    # CD
+    cd_workspace_sha: str = ""
+    cd_messages_sha: str = ""
+    cd: dict = field(default_factory=dict)
     cd_resolved: bool = False
+    cd_run: bool = False
+    # Overall
     verdict: str = "tie"
     error: str = ""
 
@@ -63,9 +76,26 @@ def run_experiment(
     output_dir: Path,
     instance_spec: Any,
     diagnosis_builder_cls: type | None = None,
+    run_cd: bool = True,
+    agent_config: Any = None,      # AgentConfig instance — for config_sha tracking
+    revision_config: Any = None,   # RevisionProtocolConfig instance
 ) -> ComparisonOutput:
-    """Full experiment: R1 → eval → fork SF/CD → eval → comparison."""
+    """Full experiment: R1 → eval → fork SF/CD → eval → comparison.
+
+    Args:
+        run_cd: If False, skip CD branch entirely. Used for --no-condiag mode.
+        agent_config: AgentConfig instance (for logging config_sha to manifest).
+        revision_config: RevisionProtocolConfig instance.
+    """
     out = ComparisonOutput(instance_id=instance_id)
+
+    # Save config identity
+    if agent_config:
+        out.config_sha = getattr(agent_config, "config_sha", "")
+        out.source_yaml_sha = getattr(agent_config, "source_yaml_sha", "")[:16]
+    if revision_config:
+        out.revision_protocol_sha = getattr(revision_config, "sha", "")
+
     inst_dir = output_dir / instance_id
     for d in ("round1", "sf", "cd"):
         (inst_dir / d).mkdir(parents=True, exist_ok=True)
@@ -100,21 +130,18 @@ def run_experiment(
             out.verdict = "both_succeed"
             return out
 
-        # ═══════ Checkpoint + FW ═══════
+        # ═══════ FW + Checkpoint ═══════
         fw = harness.extract_witness(r1_eval).to_dict()
         fw_preview = fw.get("failed_tests", [])[:3] or [fw.get("error_message", "")[:50]]
         logger.info("[%s] FW: %s", instance_id, fw_preview)
 
-        out.checkpoint_id = _sha({"t": time.time(), "i": instance_id, "n": r1.n_calls})
         out.r1_messages_sha = _sha(r1.messages)
         out.r1_workspace_sha = _sha(r1.patch_text)
         out.r1_patch_sha = _sha(r1.patch_text)
         out.failure_witness_sha = _sha(fw)
-
-        # Save checkpoint via CheckpointManager
-        # (We need a mini-agent-like object with the right attrs — reconstruct from r1 data)
         _save_checkpoint(checkpointer, r1, base_commit)
 
+        # ═══════ Diagnosis ═══════
         diag = None
         if diagnosis_builder_cls and fw.get("failed_tests"):
             from condiag.diagnosis_prompt_builder import DiagnosisPromptBuilder, TrajectorySnapshot
@@ -135,6 +162,7 @@ def run_experiment(
 
         # ═══════ Fork: SF ═══════
         logger.info("[%s] SF branch begin", instance_id)
+        out.sf_run = True
         sf = run_branch(
             agent_factory=agent_factory,
             checkpoint_messages=compressed_messages,
@@ -147,36 +175,40 @@ def run_experiment(
         _write_trajectory(inst_dir / "sf" / "trajectory.json", sf.trajectory)
         _eval_and_save(harness, instance_spec, sf.patch_text, inst_dir / "sf" / "harness_eval.json",
                        "sf", sf)
-
         out.sf = asdict_skip(sf, ["messages", "trajectory"])
-        out.sf_workspace_sha = _sha(r1.patch_text)
         out.sf_messages_sha = _sha([m for m in sf.messages if m.get("role") != "exit"])
         out.sf_resolved = (sf.termination_reason == "submitted" and
                            out.sf.get("harness_status") == "RESOLVED")
 
-        # ═══════ Fork: CD ═══════
-        logger.info("[%s] CD branch begin", instance_id)
-        cd = run_branch(
-            agent_factory=agent_factory,
-            checkpoint_messages=compressed_messages,
-            base_commit=base_commit, task=task,
-            patch_to_apply=r1.patch_text,
-            r1_n_calls=r1.n_calls, r1_cost=r1.cost,
-            failure_witness=fw, diagnosis=diag, mode="condiag",
-        )
-        _write_patch(inst_dir / "cd" / "patch.diff", cd.patch_text)
-        _write_trajectory(inst_dir / "cd" / "trajectory.json", cd.trajectory)
-        _eval_and_save(harness, instance_spec, cd.patch_text, inst_dir / "cd" / "harness_eval.json",
-                       "cd", cd)
-
-        out.cd = asdict_skip(cd, ["messages", "trajectory"])
-        out.cd_workspace_sha = _sha(r1.patch_text)
-        out.cd_messages_sha = _sha([m for m in cd.messages if m.get("role") != "exit"])
-        out.cd_resolved = (cd.termination_reason == "submitted" and
-                           out.cd.get("harness_status") == "RESOLVED")
+        # ═══════ Fork: CD (optional) ═══════
+        if run_cd:
+            logger.info("[%s] CD branch begin", instance_id)
+            out.cd_run = True
+            cd = run_branch(
+                agent_factory=agent_factory,
+                checkpoint_messages=compressed_messages,
+                base_commit=base_commit, task=task,
+                patch_to_apply=r1.patch_text,
+                r1_n_calls=r1.n_calls, r1_cost=r1.cost,
+                failure_witness=fw, diagnosis=diag, mode="condiag",
+            )
+            _write_patch(inst_dir / "cd" / "patch.diff", cd.patch_text)
+            _write_trajectory(inst_dir / "cd" / "trajectory.json", cd.trajectory)
+            _eval_and_save(harness, instance_spec, cd.patch_text, inst_dir / "cd" / "harness_eval.json",
+                           "cd", cd)
+            out.cd = asdict_skip(cd, ["messages", "trajectory"])
+            out.cd_messages_sha = _sha([m for m in cd.messages if m.get("role") != "exit"])
+            out.cd_resolved = (cd.termination_reason == "submitted" and
+                               out.cd.get("harness_status") == "RESOLVED")
+        else:
+            logger.info("[%s] CD branch skipped (--no-condiag)", instance_id)
+            out.cd["termination_reason"] = "not_run_disabled"
+            out.cd_run = False
 
         # ═══════ Verdict ═══════
-        if out.sf_resolved and out.cd_resolved:
+        if not out.cd_run:
+            out.verdict = "cd_disabled"
+        elif out.sf_resolved and out.cd_resolved:
             out.verdict = "both_succeed"
         elif out.sf_resolved and not out.cd_resolved:
             out.verdict = "sf_wins"
@@ -185,8 +217,7 @@ def run_experiment(
         else:
             out.verdict = "both_fail"
 
-        ws_ok = out.sf_workspace_sha == out.cd_workspace_sha
-        logger.info("[%s] verdict=%s fairness_ws=%s", instance_id, out.verdict, "OK" if ws_ok else "⚠️")
+        logger.info("[%s] verdict=%s", instance_id, out.verdict)
 
     except Exception as e:
         logger.exception("[%s] Experiment failed", instance_id)
@@ -198,7 +229,7 @@ def run_experiment(
     return out
 
 
-# ─── Helpers ───────────────────────────────────────────────────────────
+# ─── Helpers ───────────────────────────────────────────────────────
 
 def asdict_skip(obj, skip_keys):
     d = {}
@@ -242,6 +273,7 @@ def _save_checkpoint(checkpointer, r1: Round1Result, base_commit: str):
         model = _Mod()
         env = _Env()
     checkpointer.capture(_Stub(), base_commit=base_commit, round1_patch=r1.patch_text)
+
 
 def _eval_and_save(harness, spec, patch, json_path, label, result):
     try:

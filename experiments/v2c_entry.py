@@ -25,7 +25,12 @@ def run_single(instance_id: str, args: argparse.Namespace) -> dict:
     from condiag.evaluators.official_harness import OfficialHarnessGateway
     from condiag.checkpoint import CheckpointManager
     from condiag.experiment import run_experiment
-    from condiag.agent.config import AgentConfig, build_agent_factory, require_api_key
+    from condiag.agent.config import (
+    AgentConfig,
+    RevisionProtocolConfig,
+    build_agent_factory,
+    require_api_key,
+)
 
     require_api_key()
 
@@ -48,6 +53,7 @@ def run_single(instance_id: str, args: argparse.Namespace) -> dict:
         step_limit=0,
         cost_limit=5.0,
     )
+    rev_config = RevisionProtocolConfig()
     agent_factory = build_agent_factory(config, instance_id)
 
     # TODO(P1-5): Replace with condiag.diagnosis.diagnoser_core.DiagnoserCore
@@ -62,6 +68,9 @@ def run_single(instance_id: str, args: argparse.Namespace) -> dict:
         output_dir=V2C_ARTIFACTS,
         instance_spec=spec,
         diagnosis_builder_cls=diagnosis_builder_cls,
+        run_cd=(not args.no_condiag),
+        agent_config=config,
+        revision_config=rev_config,
     )
     return {"instance_id": instance_id, "result": result.to_dict()}
 
@@ -83,6 +92,8 @@ def dry_run_harness(instance_id: str):
     if spec.gold_patch:
         r2 = gw.evaluate(spec, model_patch=spec.gold_patch)
         log.info("Gold  -> %s (%.1fs)", r2.status, r2.duration_seconds)
+
+
 def run_pilot(args):
     from condiag.instance_registry import InstanceRegistry
     reg = InstanceRegistry()
