@@ -162,10 +162,10 @@ def archive_untracked_files(agent: Any, snapshot_dir: Path) -> str:
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     archive_path = str(snapshot_dir / "untracked.tar")
 
-    # Create archive with null-delimited file list
+    # Create archive with null-delimited file list (pipefail for safety)
     rc, _ = _exec(agent,
-        "cd /testbed && git ls-files -z --others --exclude-standard 2>/dev/null "
-        "| tar --null --verbatim-files-from -T - -cf /tmp/untracked.tar 2>&1"
+        "cd /testbed && (git ls-files -z --others --exclude-standard 2>/dev/null | "
+        "tar --null --verbatim-files-from -T - -cf /tmp/untracked.tar 2>&1)"
     )
     if rc != 0:
         return ""

@@ -40,12 +40,11 @@ class ComparisonOutput:
     source_yaml_sha: str = ""
     # Fairness
     fairness_ok: bool = False
-    r1_workspace_sha: str = ""
     sf_preflight_sha: str = ""
     cd_preflight_sha: str = ""
     # R1
     r1_messages_sha: str = ""
-    r1_workspace_sha: str = ""
+    r1_preflight_workspace_sha: str = ""
     r1_patch_sha: str = ""
     failure_witness_sha: str = ""
     round1: dict = field(default_factory=dict)
@@ -284,7 +283,7 @@ def run_experiment(
             and cd_ws_ok
         )
         out.fairness_ok = fairness_ok
-        out.r1_workspace_sha = r1_ws
+        out.r1_preflight_workspace_sha = r1_ws
         out.sf_preflight_sha = sf_ws
         out.cd_preflight_sha = cd_ws
         logger.info("[%s] fairness: r1_ws=%s sf_ws=%s cd_ws=%s ok=%s",

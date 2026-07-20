@@ -132,3 +132,4 @@ def _capture_snapshot(agent, base_commit: str, snapshot_dir: Path | None = None)
             # Archive failure with untracked files present → block episode
             logger.error("Untracked archive creation failed — blocking episode")
             return None
+    return ws
