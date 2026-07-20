@@ -69,8 +69,8 @@ def restore_workspace(agent, snapshot, base_commit: str) -> RestoreResult:
         agent.env.execute({"command": f"cd /testbed && git reset --hard {base_commit} 2>/dev/null"})
         agent.env.execute({"command": "cd /testbed && git clean -fd 2>/dev/null"})
 
-        if not snapshot or not snapshot.tracked_diff:
-            return RestoreResult(ok=True, workspace_sha="clean_base", reason="no_diff")
+        if not snapshot or (not snapshot.tracked_diff and not snapshot.untracked_manifest):
+            return RestoreResult(ok=True, workspace_sha="clean_base", reason="no_diff_or_untracked")
 
         # Protection 3: Apply tracked diff
         with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as f:
@@ -102,19 +102,28 @@ def restore_workspace(agent, snapshot, base_commit: str) -> RestoreResult:
             )
             agent.env.execute({"command": "cd /testbed && tar xf /tmp/untracked.tar 2>/dev/null || true"})
 
-        # Protection 4: Validate workspace_state_sha
+        # Protection 4: Validate workspace_state_sha (tracked + untracked)
         diff_r = agent.env.execute({
             "command": f"cd /testbed && git diff --binary --no-ext-diff {base_commit} 2>/dev/null"
         })
         if diff_r.get("returncode") != 0:
             return RestoreResult(ok=False, reason="git diff failed after restore")
-
         restored_diff = diff_r.get("output", "")
+
+        # Re-extract untracked manifest
+        ut_r = agent.env.execute({
+            "command": "cd /testbed && git ls-files --others --exclude-standard 2>/dev/null"
+        })
+        ut_paths = [p for p in ut_r.get("output", "").split("\n") if p.strip()] if ut_r.get("returncode") == 0 else []
+
         from condiag.workspace import WorkspaceSnapshot
         restored = WorkspaceSnapshot(
             tracked_diff=restored_diff,
             base_commit_sha=base_commit,
         )
+        if ut_paths:
+            restored.untracked_manifest = [{"path": p, "size": 0, "sha256": ""} for p in ut_paths]
+
         if restored.workspace_state_sha != snapshot.workspace_state_sha:
             return RestoreResult(
                 ok=False,
@@ -134,7 +143,7 @@ def restore_workspace(agent, snapshot, base_commit: str) -> RestoreResult:
 
 
 def capture_workspace_sha(agent, base_commit: str) -> str:
-    """Extract workspace_state_sha from a live agent container."""
+    """Extract workspace_state_sha (tracked + untracked) from a live agent container."""
     try:
         diff_r = agent.env.execute({
             "command": f"cd /testbed && git diff --binary --no-ext-diff {base_commit} 2>/dev/null"
@@ -143,8 +152,15 @@ def capture_workspace_sha(agent, base_commit: str) -> str:
             return ""
         head_r = agent.env.execute({"command": "cd /testbed && git rev-parse HEAD 2>/dev/null"})
         head_sha = head_r.get("output", "").strip() if head_r.get("returncode") == 0 else ""
+        ut_r = agent.env.execute({
+            "command": "cd /testbed && git ls-files --others --exclude-standard 2>/dev/null"
+        })
+        ut_paths = [p for p in ut_r.get("output", "").split("\n") if p.strip()] if ut_r.get("returncode") == 0 else []
+
         from condiag.workspace import WorkspaceSnapshot
         ws = WorkspaceSnapshot(tracked_diff=diff_r.get("output", ""), base_commit_sha=head_sha)
+        for p in ut_paths:
+            ws.untracked_manifest.append(__import__("condiag.workspace", fromlist=["UntrackedFile"]).UntrackedFile(path=p, size=0, sha256=""))
         return ws.workspace_state_sha
     except Exception:
         return ""
@@ -190,6 +206,7 @@ def run_branch(
     )
 
     # Restore workspace from snapshot
+    t0 = time.time()
     restore = RestoreResult(ok=True, reason="no_snapshot")
     ws_before = ""
     if workspace_snapshot:
@@ -212,7 +229,6 @@ def run_branch(
         ws_before = capture_workspace_sha(agent, base_commit)
         logger.info("[%s] Workspace restored, pre-step SHA=%s", mode.upper(), ws_before)
 
-    t0 = time.time()
     reason = ""
     try:
         while True:

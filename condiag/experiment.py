@@ -38,6 +38,11 @@ class ComparisonOutput:
     config_sha_full: str = ""
     revision_protocol_sha: str = ""
     source_yaml_sha: str = ""
+    # Fairness
+    fairness_ok: bool = False
+    r1_workspace_sha: str = ""
+    sf_preflight_sha: str = ""
+    cd_preflight_sha: str = ""
     # R1
     r1_messages_sha: str = ""
     r1_workspace_sha: str = ""
@@ -178,12 +183,15 @@ def run_experiment(
         _save_checkpoint(checkpointer, r1, base_commit)
 
         # ═══════ Workspace Snapshot ═══════
-        # Capture R1's final workspace state for Round 2 restore
-        r1_snapshot = _capture_workspace_snapshot(r1, base_commit, inst_dir / "round1")
-        _write_json(inst_dir / "round1" / "workspace_snapshot.json", r1_snapshot.to_dict())
-        logger.info("[%s] Workspace snapshot: state_sha=%s tracked=%s",
-                     instance_id, r1_snapshot.workspace_state_sha,
-                     r1_snapshot.tracked_diff_sha)
+        # Captured in run_round1() from the live container
+        r1_snapshot = getattr(r1, "workspace_snapshot", None)
+        if r1_snapshot:
+            _write_json(inst_dir / "round1" / "workspace_snapshot.json", r1_snapshot.to_dict())
+            logger.info("[%s] Workspace snapshot: state_sha=%s tracked=%s",
+                         instance_id, r1_snapshot.workspace_state_sha,
+                         r1_snapshot.tracked_diff_sha)
+        else:
+            logger.warning("[%s] No workspace snapshot from R1", instance_id)
 
         # ═══════ Diagnosis ═══════
         diag = None
@@ -259,20 +267,27 @@ def run_experiment(
 
         # ═══════ Fairness Check ═══════
         sf_ws = sf.workspace_sha_before_first_step if hasattr(sf, "workspace_sha_before_first_step") else ""
-        cd_ws = cd.workspace_sha_before_first_step if hasattr(cd, "workspace_sha_before_first_step") else ""
+        cd_ws = cd.workspace_sha_before_first_step if (out.cd_run and hasattr(cd, "workspace_sha_before_first_step")) else ""
         r1_ws = r1_snapshot.workspace_state_sha
+        cd_restore_ok = cd.restore_result.ok if out.cd_run else True
         fairness_ok = (
             sf.restore_result.ok
-            and (not cd_ws or cd.restore_result.ok)
+            and cd_restore_ok
             and sf_ws == r1_ws
             and (not cd_ws or cd_ws == r1_ws)
         )
+        out.fairness_ok = fairness_ok
+        out.r1_workspace_sha = r1_ws
+        out.sf_preflight_sha = sf_ws
+        out.cd_preflight_sha = cd_ws
         logger.info("[%s] fairness: r1_ws=%s sf_ws=%s cd_ws=%s ok=%s",
                      instance_id, r1_ws, sf_ws, cd_ws, fairness_ok)
 
         # ═══════ Verdict ═══════
         if not out.cd_run:
             out.verdict = "cd_disabled"
+        elif not fairness_ok:
+            out.verdict = "invalid_fairness"
         elif out.sf_resolved and out.cd_resolved:
             out.verdict = "both_succeed"
         elif out.sf_resolved and not out.cd_resolved:
@@ -368,10 +383,3 @@ def _get_git_commit() -> str:
         return "unknown"
 
 
-def _capture_workspace_snapshot(r1: Any, base_commit: str, snapshot_dir: Path) -> Any:
-    """Capture workspace snapshot from R1's stored data."""
-    from condiag.workspace import WorkspaceSnapshot
-    return WorkspaceSnapshot(
-        tracked_diff=r1.patch_text,
-        base_commit_sha=base_commit,
-    )

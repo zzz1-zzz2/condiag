@@ -25,6 +25,7 @@ class Round1Result:
     cost: float = 0.0
     duration_seconds: float = 0.0
     trajectory: dict = field(default_factory=dict)
+    workspace_snapshot: Any = None  # WorkspaceSnapshot captured at R1 completion
 
 
 def run_round1(*, agent_factory: Callable[[], Any], task: str,
@@ -77,6 +78,8 @@ def run_round1(*, agent_factory: Callable[[], Any], task: str,
                     agent.handle_uncaught_exception(e)
                     reason = f"error:{type(e).__name__}"; break
     finally:
+        # Capture workspace snapshot (before container dies)
+        snapshot = _capture_snapshot(agent, base_commit)
         result = Round1Result(
             termination_reason=reason,
             patch_text=_canonical_patch(agent, base_commit),
@@ -85,6 +88,7 @@ def run_round1(*, agent_factory: Callable[[], Any], task: str,
             cost=agent.cost,
             duration_seconds=time.time() - t0,
             trajectory=redact_trajectory(agent.serialize()) if hasattr(agent, "serialize") else {},
+            workspace_snapshot=snapshot,
         )
 
     logger.info("R1: reason=%s calls=%d cost=%.4f patch=%dch",
@@ -101,3 +105,24 @@ def _canonical_patch(agent, base_commit: str = "") -> str:
         return r.get("output", "")
     except Exception:
         return ""
+
+
+def _capture_snapshot(agent, base_commit: str) -> Any:
+    """Capture workspace snapshot from the live agent container."""
+    from condiag.workspace import WorkspaceSnapshot
+    try:
+        diff_r = agent.env.execute({
+            "command": f"cd /testbed && git diff --binary --no-ext-diff {base_commit} 2>/dev/null"
+        })
+        tracked = diff_r.get("output", "") if diff_r.get("returncode") == 0 else ""
+
+        head_r = agent.env.execute({"command": "cd /testbed && git rev-parse HEAD 2>/dev/null"})
+        head_sha = head_r.get("output", "").strip() if head_r.get("returncode") == 0 else ""
+
+        ws = WorkspaceSnapshot(
+            tracked_diff=tracked,
+            base_commit_sha=head_sha or base_commit,
+        )
+        return ws
+    except Exception:
+        return WorkspaceSnapshot(base_commit_sha=base_commit)
