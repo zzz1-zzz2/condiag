@@ -109,10 +109,25 @@ def _canonical_patch(agent, base_commit: str = "") -> str:
 
 
 def _capture_snapshot(agent, base_commit: str, snapshot_dir: Path | None = None) -> Any:
-    """Capture full workspace snapshot (tracked + untracked) from live container."""
-    from condiag.workspace import capture_workspace_snapshot
-    try:
-        return capture_workspace_snapshot(agent, base_commit, snapshot_dir)
-    except Exception as e:
-        logger.error("Failed to capture workspace snapshot: %s", e)
+    """Capture full workspace fingerprint + archive from live container.
+
+    Returns WorkspaceSnapshot if successful, None if capture failed.
+    Episode must be blocked on None.
+    """
+    from condiag.workspace import capture_workspace_fingerprint, archive_untracked_files
+
+    result = capture_workspace_fingerprint(agent, base_commit)
+    if not result.ok or result.snapshot is None:
+        logger.error("Workspace capture failed: %s", result.reason)
         return None
+
+    ws = result.snapshot
+
+    # Archive untracked files (optional — failure doesn't block fingerprint)
+    if snapshot_dir and ws.untracked_manifest:
+        archive_path = archive_untracked_files(agent, Path(snapshot_dir))
+        ws.untracked_archive_path = archive_path
+        if not archive_path:
+            logger.warning("Untracked archive creation failed (fingerprint OK)")
+
+    return ws

@@ -1,8 +1,4 @@
-"""Workspace Snapshot — capture and verify persistent workspace state.
-
-Tracks both tracked (git diff) and untracked files (content archive).
-SHA covers both → used for Fairness Gate comparison.
-"""
+"""Workspace Snapshot — capture and verify persistent workspace state."""
 from __future__ import annotations
 
 import hashlib
@@ -33,20 +29,20 @@ class UntrackedFile:
 
 
 @dataclass
-class WorkspaceSnapshot:
-    """Complete workspace state at a given point in the episode.
+class CaptureResult:
+    """Result of a workspace snapshot capture operation.
 
-    tracked_diff:     git diff --binary --no-ext-diff (all tracked file changes)
-    untracked_manifest: list of UntrackedFile entries
-    untracked_archive_path: Path to a tar archive of untracked file contents
-    base_commit_sha:  git rev-parse HEAD at snapshot time
-
-    SHA fingerprints:
-      tracked_diff_sha:      hash of tracked_diff alone
-      untracked_manifest_sha: hash of the manifest (file paths + content SHAs)
-      workspace_state_sha:   combined SHA for fairness comparison
+    ok=False + reason means capture failed — episode should be blocked.
+    ok=True + snapshot contains the captured workspace state.
     """
 
+    ok: bool = False
+    snapshot: Any | None = None  # WorkspaceSnapshot
+    reason: str = ""
+
+
+@dataclass
+class WorkspaceSnapshot:
     tracked_diff: str = ""
     untracked_manifest: list[UntrackedFile] = field(default_factory=list)
     untracked_archive_path: str = ""
@@ -54,22 +50,19 @@ class WorkspaceSnapshot:
 
     @property
     def tracked_diff_sha(self) -> str:
-        return sha256_short(self.tracked_diff)
+        return sha256_short(self.tracked_diff) if self.tracked_diff else ""
 
     @property
     def untracked_manifest_sha(self) -> str:
+        if not self.untracked_manifest:
+            return ""
         raw = json.dumps([u.to_dict() for u in self.untracked_manifest], sort_keys=True)
         return sha256_short(raw)
 
     @property
     def workspace_state_sha(self) -> str:
-        """Combined SHA: base_commit + tracked diff + untracked manifest."""
-        raw = (
-            self.base_commit_sha
-            + self.tracked_diff_sha
-            + self.untracked_manifest_sha
-        )
-        return sha256_short(raw)
+        raw = (self.base_commit_sha or "") + self.tracked_diff_sha + self.untracked_manifest_sha
+        return sha256_short(raw) if raw.strip() else ""
 
     def to_dict(self) -> dict:
         return {
@@ -82,88 +75,98 @@ class WorkspaceSnapshot:
         }
 
 
-def capture_workspace_snapshot(
-    agent: Any,
-    base_commit: str,
-    snapshot_dir: Path | None = None,
-) -> WorkspaceSnapshot:
-    """Capture the current workspace state from a running agent container.
+def _exec(agent, cmd: str) -> tuple[int, str]:
+    """Execute a command in the agent container and return (returncode, output)."""
+    r = agent.env.execute({"command": cmd})
+    rc = r.get("returncode", -1)
+    out = r.get("output", "") or ""
+    return rc, out
 
-    Args:
-        agent: Agent object with env.execute() for container commands.
-        base_commit: The base commit to diff against.
-        snapshot_dir: If provided, save untracked archive here.
 
-    Returns:
-        WorkspaceSnapshot with tracked_diff and untracked_manifest populated.
+def capture_workspace_fingerprint(agent: Any, base_commit: str) -> CaptureResult:
+    """Capture full workspace fingerprint: tracked diff + untracked manifest.
+
+    This is the ONLY function used for:
+      - R1 workspace capture
+      - Restore validation
+      - Branch preflight fairness
+
+    All three phases call this same function — single source of truth.
+
+    Any critical command failure returns CaptureResult(ok=False, reason=...),
+    NOT a silent empty default. Episodes must be blocked on failure.
     """
-    # Tracked diff
-    result = agent.env.execute({
-        "command": f"cd /testbed && git diff --binary --no-ext-diff {base_commit} 2>/dev/null"
-    })
-    tracked = result.get("output", "") if result.get("returncode") == 0 else ""
-
     # Base commit SHA
-    head_r = agent.env.execute({"command": "cd /testbed && git rev-parse HEAD 2>/dev/null"})
-    head_sha = head_r.get("output", "").strip() if head_r.get("returncode") == 0 else ""
+    rc, head_sha = _exec(agent, "cd /testbed && git rev-parse HEAD 2>/dev/null")
+    if rc != 0 or not head_sha.strip():
+        return CaptureResult(ok=False, reason="git rev-parse HEAD failed")
+    head_sha = head_sha.strip()
 
-    # Untracked files (list only)
-    ut_r = agent.env.execute({
-        "command": "cd /testbed && git ls-files --others --exclude-standard 2>/dev/null"
-    })
-    untracked_paths = [p for p in ut_r.get("output", "").split("\n") if p.strip()] if ut_r.get("returncode") == 0 else []
+    # Tracked diff
+    rc, tracked = _exec(agent, f"cd /testbed && git diff --binary --no-ext-diff {base_commit} 2>/dev/null")
+    if rc != 0:
+        return CaptureResult(ok=False, reason=f"git diff failed (rc={rc})")
 
-    # Build untracked manifest (content SHAs, sizes)
-    manifest = []
-    archive_path = ""
-    if snapshot_dir and untracked_paths:
-        snapshot_dir.mkdir(parents=True, exist_ok=True)
-        archive_path = str(snapshot_dir / "untracked.tar")
+    # Untracked file list (null-delimited for safety)
+    rc, ut_raw = _exec(agent, "cd /testbed && git ls-files -z --others --exclude-standard 2>/dev/null | head -c 1M")
+    if rc != 0:
+        return CaptureResult(ok=False, reason=f"git ls-files failed (rc={rc})")
+    untracked_paths = [p for p in ut_raw.split("\0") if p.strip()] if ut_raw.strip() else []
 
-        for upath in untracked_paths:
-            # Parse sha256sum output: "sha256  path"
-            sha_r = agent.env.execute({
-                "command": f"cd /testbed && sha256sum '{upath}' 2>/dev/null"
-            })
-            f_sha = ""
-            if sha_r.get("returncode") == 0:
-                f_sha = sha_r["output"].split()[0] if sha_r["output"].strip() else ""
+    # Build manifest with content SHA and size
+    manifest: list[UntrackedFile] = []
+    for upath in untracked_paths:
+        # Use null-delimited sha256sum for safety
+        rc, sha_out = _exec(agent, f"cd /testbed && sha256sum -- '{upath}' 2>/dev/null || echo FAIL")
+        f_sha = ""
+        if rc == 0 and sha_out.strip() and "FAIL" not in sha_out:
+            f_sha = sha_out.split()[0] if sha_out.strip() else ""
 
-            # Parse wc -c output: "SIZE path"
-            wc_r = agent.env.execute({
-                "command": f"cd /testbed && wc -c '{upath}' 2>/dev/null"
-            })
-            f_size = 0
-            if wc_r.get("returncode") == 0:
-                try:
-                    f_size = int(wc_r["output"].split()[0])
-                except (ValueError, IndexError):
-                    pass
+        rc, wc_out = _exec(agent, f"cd /testbed && wc -c -- '{upath}' 2>/dev/null || echo FAIL")
+        f_size = 0
+        if rc == 0 and wc_out.strip() and "FAIL" not in wc_out:
+            try:
+                f_size = int(wc_out.split()[0])
+            except (ValueError, IndexError):
+                pass
 
-            manifest.append(UntrackedFile(path=upath, size=f_size, sha256=f_sha))
+        manifest.append(UntrackedFile(path=upath, size=f_size, sha256=f_sha))
 
-        # Create tar archive — check return code
-        tar_r = agent.env.execute({
-            "command": f"cd /testbed && tar cf /tmp/untracked.tar {' '.join(untracked_paths)} 2>&1"
-        })
-        if tar_r.get("returncode") != 0:
-            archive_path = ""
-
-        # Copy archive out — check return code
-        import subprocess
-        cp_r = subprocess.run(
-            ["docker", "cp", f"{agent.env.container_id}:/tmp/untracked.tar", archive_path],
-            capture_output=True, timeout=10,
-        )
-        if cp_r.returncode != 0:
-            archive_path = ""
-
-    return WorkspaceSnapshot(
+    snapshot = WorkspaceSnapshot(
         tracked_diff=tracked,
         untracked_manifest=manifest,
-        untracked_archive_path=archive_path,
         base_commit_sha=head_sha,
     )
+    return CaptureResult(ok=True, snapshot=snapshot)
+
+
+def archive_untracked_files(agent: Any, snapshot_dir: Path) -> str:
+    """Create a tar archive of untracked files and copy it out of the container.
+
+    Uses null-delimited file list for safety with special characters.
+    Returns the local archive path, or empty string on failure.
+    """
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = str(snapshot_dir / "untracked.tar")
+
+    # Create archive with null-delimited file list
+    rc, _ = _exec(agent,
+        "cd /testbed && git ls-files -z --others --exclude-standard 2>/dev/null "
+        "| tar --null --verbatim-files-from -T - -cf /tmp/untracked.tar 2>&1"
+    )
+    if rc != 0:
+        return ""
+
+    # Copy out
+    import subprocess
+    cp_r = subprocess.run(
+        ["docker", "cp", f"{agent.env.container_id}:/tmp/untracked.tar", archive_path],
+        capture_output=True, timeout=10,
+    )
+    if cp_r.returncode != 0:
+        return ""
+
+    return archive_path
 
 
 def check_workspace_fairness(
@@ -171,10 +174,7 @@ def check_workspace_fairness(
     sf_snapshot: WorkspaceSnapshot,
     cd_snapshot: WorkspaceSnapshot | None = None,
 ) -> dict[str, bool]:
-    """Verify that all branches start from the same workspace state.
-
-    Returns a dict with individual check results.
-    """
+    """Verify that all branches start from the same workspace state."""
     result = {
         "r1_vs_sf_tracked_ok": r1_snapshot.tracked_diff_sha == sf_snapshot.tracked_diff_sha,
         "r1_vs_sf_state_ok": r1_snapshot.workspace_state_sha == sf_snapshot.workspace_state_sha,

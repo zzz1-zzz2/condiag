@@ -58,6 +58,7 @@ class TestWorkspace:
     def test_workspace_snapshot_sha(self):
         ws = WorkspaceSnapshot(
             tracked_diff="diff --git a/x.py b/x.py",
+            untracked_manifest=[UntrackedFile("y.py", 50, "abc")],
             base_commit_sha="abc123",
         )
         assert ws.tracked_diff_sha != ""

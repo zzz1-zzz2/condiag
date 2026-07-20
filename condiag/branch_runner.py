@@ -106,35 +106,19 @@ def restore_workspace(agent, snapshot, base_commit: str) -> RestoreResult:
                 if tar_r.get("returncode") != 0:
                     return RestoreResult(ok=False, reason=f"untracked tar extract failed")
 
-        # Protection 4: Validate workspace_state_sha (tracked + untracked)
-        diff_r = agent.env.execute({
-            "command": f"cd /testbed && git diff --binary --no-ext-diff {base_commit} 2>/dev/null"
-        })
-        if diff_r.get("returncode") != 0:
-            return RestoreResult(ok=False, reason="git diff failed after restore")
-        restored_diff = diff_r.get("output", "")
+        # Protection 4: Validate workspace via unified fingerprint
+        from condiag.workspace import capture_workspace_fingerprint
+        restored_cr = capture_workspace_fingerprint(agent, base_commit)
+        if not restored_cr.ok or restored_cr.snapshot is None:
+            return RestoreResult(ok=False, reason=f"fingerprint failed after restore: {restored_cr.reason}")
 
-        # Re-extract untracked manifest
-        ut_r = agent.env.execute({
-            "command": "cd /testbed && git ls-files --others --exclude-standard 2>/dev/null"
-        })
-        ut_paths = [p for p in ut_r.get("output", "").split("\n") if p.strip()] if ut_r.get("returncode") == 0 else []
-
-        from condiag.workspace import WorkspaceSnapshot, UntrackedFile
-        restored = WorkspaceSnapshot(
-            tracked_diff=restored_diff,
-            base_commit_sha=base_commit,
-        )
-        if ut_paths:
-            restored.untracked_manifest = [UntrackedFile(path=p, size=0, sha256="") for p in ut_paths]
-
-        if restored.workspace_state_sha != snapshot.workspace_state_sha:
+        if restored_cr.snapshot.workspace_state_sha != snapshot.workspace_state_sha:
             return RestoreResult(
                 ok=False,
-                reason=f"state SHA mismatch: {restored.workspace_state_sha} != {snapshot.workspace_state_sha}",
+                reason=f"state SHA mismatch: {restored_cr.snapshot.workspace_state_sha} != {snapshot.workspace_state_sha}",
             )
 
-        return RestoreResult(ok=True, workspace_sha=restored.workspace_state_sha)
+        return RestoreResult(ok=True, workspace_sha=restored_cr.snapshot.workspace_state_sha)
 
     except Exception as e:
         return RestoreResult(ok=False, reason=f"exception: {type(e).__name__}: {e}")
@@ -147,27 +131,12 @@ def restore_workspace(agent, snapshot, base_commit: str) -> RestoreResult:
 
 
 def capture_workspace_sha(agent, base_commit: str) -> str:
-    """Extract workspace_state_sha (tracked + untracked) from a live agent container."""
-    try:
-        diff_r = agent.env.execute({
-            "command": f"cd /testbed && git diff --binary --no-ext-diff {base_commit} 2>/dev/null"
-        })
-        if diff_r.get("returncode") != 0:
-            return ""
-        head_r = agent.env.execute({"command": "cd /testbed && git rev-parse HEAD 2>/dev/null"})
-        head_sha = head_r.get("output", "").strip() if head_r.get("returncode") == 0 else ""
-        ut_r = agent.env.execute({
-            "command": "cd /testbed && git ls-files --others --exclude-standard 2>/dev/null"
-        })
-        ut_paths = [p for p in ut_r.get("output", "").split("\n") if p.strip()] if ut_r.get("returncode") == 0 else []
-
-        from condiag.workspace import WorkspaceSnapshot
-        ws = WorkspaceSnapshot(tracked_diff=diff_r.get("output", ""), base_commit_sha=head_sha)
-        for p in ut_paths:
-            ws.untracked_manifest.append(__import__("condiag.workspace", fromlist=["UntrackedFile"]).UntrackedFile(path=p, size=0, sha256=""))
-        return ws.workspace_state_sha
-    except Exception:
-        return ""
+    """Pre-step workspace SHA via unified fingerprint function."""
+    from condiag.workspace import capture_workspace_fingerprint
+    cr = capture_workspace_fingerprint(agent, base_commit)
+    if cr.ok and cr.snapshot is not None:
+        return cr.snapshot.workspace_state_sha
+    return ""
 
 
 def run_branch(
@@ -232,6 +201,26 @@ def run_branch(
         # Capture workspace SHA before first agent.step()
         ws_before = capture_workspace_sha(agent, base_commit)
         logger.info("[%s] Workspace restored, pre-step SHA=%s", mode.upper(), ws_before)
+
+        # Pre-step fairness gate: verify SHA matches expected snapshot
+        if not ws_before:
+            return BranchResult(
+                mode=mode, termination_reason="preflight_fairness_failed:empty_sha",
+                restore_result=RestoreResult(ok=False, reason="preflight SHA empty"),
+                messages=list(agent.messages),
+                n_calls_total=r1_n_calls, n_calls_incremental=0,
+                cost_total=r1_cost, cost_incremental=0.0,
+                duration_seconds=time.time() - t0,
+            )
+        if ws_before != workspace_snapshot.workspace_state_sha:
+            return BranchResult(
+                mode=mode, termination_reason=f"preflight_fairness_failed:sha_mismatch",
+                restore_result=RestoreResult(ok=False, reason=f"preflight SHA {ws_before} != expected {workspace_snapshot.workspace_state_sha}"),
+                messages=list(agent.messages),
+                n_calls_total=r1_n_calls, n_calls_incremental=0,
+                cost_total=r1_cost, cost_incremental=0.0,
+                duration_seconds=time.time() - t0,
+            )
 
     reason = ""
     try:

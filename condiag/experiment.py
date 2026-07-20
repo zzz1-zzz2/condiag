@@ -194,6 +194,11 @@ def run_experiment(
         else:
             logger.warning("[%s] No workspace snapshot from R1", instance_id)
 
+        if r1_snapshot is None:
+            logger.error("[%s] R1 snapshot capture failed — episode blocked before SF/CD", instance_id)
+            out.verdict = "invalid_snapshot"
+            return out
+
         # ═══════ Diagnosis ═══════
         diag = None
         if diagnosis_builder_cls and fw.get("failed_tests"):
@@ -290,7 +295,7 @@ def run_experiment(
         if not fairness_ok:
             out.verdict = "invalid_fairness"
         elif not out.cd_run:
-            out.verdict = "invalid_fairness"
+            out.verdict = "cd_disabled"
         elif out.sf_resolved and out.cd_resolved:
             out.verdict = "both_succeed"
         elif out.sf_resolved and not out.cd_resolved:
