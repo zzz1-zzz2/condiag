@@ -4,7 +4,6 @@ from __future__ import annotations
 import logging
 import re
 from collections import Counter
-from pathlib import PurePosixPath
 
 from condiag.diagnosis.signals.schema import TrajectorySignals
 
@@ -16,6 +15,13 @@ _RE_BASH_COMMAND = re.compile(r"```bash\s*\n(.+?)```", re.DOTALL)
 _RE_TOOL_OUTPUT_FILE = re.compile(r"/testbed/([^\s\"']+\.py)")
 _RE_CAT_FILE = re.compile(r"(?:^|\s)(?:cat|head|tail|sed|nl|wc)\s+(-[a-zA-Z0-9]+\s+)?(/testbed/\S+|[^\s;|&`()]+\.py)")
 _RE_VIEW_FILE = re.compile(r"(?:^|\s)(?:grep|rg|find|ack|ag)\s+(-[a-zA-Z0-9]+\s+)?['\"]?[^'\"]+['\"]?\s+(/[^\s;|&`]+\.py|[^\s;|&`]+\.py)")
+
+
+def _repo_path(fp: str) -> str:
+    """Strip /testbed/ prefix if present."""
+    if fp.startswith("/testbed/"):
+        return fp[len("/testbed/"):]
+    return fp
 
 
 def extract_trajectory_signals(trajectory: dict) -> TrajectorySignals:
@@ -42,7 +48,7 @@ def extract_trajectory_signals(trajectory: dict) -> TrajectorySignals:
             actions = (msg.get("extra") or {}).get("actions") or []
             signals.assistant_turn_count += 1
 
-            # Get command text from tool arguments
+            # Collect command texts from arguments
             cmd_texts: list[str] = []
 
             for t in tc:
@@ -55,23 +61,18 @@ def extract_trajectory_signals(trajectory: dict) -> TrajectorySignals:
                     elif isinstance(args_raw, dict):
                         cmd_texts.append(str(args_raw))
                     tool_call_counter[name] += 1
-                    # Dedup by function call id
-                    tid = t.get("id", "")
-                    if tid:
-                        seen_tool_events.add(f"tc:{tid}")
+                tid = t.get("id", "")
+                if tid:
+                    seen_tool_events.add(f"tc:{tid}")
 
             for act in actions:
                 if isinstance(act, dict):
-                    act_type = act.get("type", "bash")
-                    tool_call_counter[act_type] += 1
                     aid = act.get("id", "")
                     if aid:
                         seen_tool_events.add(f"act:{aid}")
+                    else:
+                        seen_tool_events.add(f"act:{hash(str(act)[:100])}")
                     cmd_texts.append(act.get("command", act.get("arguments", "")))
-
-            signals.total_tool_calls = len(seen_tool_events) if seen_tool_events else (
-                len(tc) + len(actions)
-            )
 
             # Extract viewed files from command arguments
             for txt in cmd_texts:
@@ -80,13 +81,11 @@ def extract_trajectory_signals(trajectory: dict) -> TrajectorySignals:
                 for m in _RE_CAT_FILE.finditer(txt):
                     fp = m.group(2) if m.group(2) else m.group(3)
                     if fp:
-                        fp = fp.lstrip("/testbed/")
-                        file_view_counter[fp] += 1
+                        file_view_counter[_repo_path(fp)] += 1
                 for m in _RE_VIEW_FILE.finditer(txt):
                     fp = m.group(2) if m.group(2) else m.group(3)
                     if fp:
-                        fp = fp.lstrip("/testbed/")
-                        file_view_counter[fp] += 1
+                        file_view_counter[_repo_path(fp)] += 1
 
             # Detect bash commands from content
             content = msg.get("content", "") or ""
@@ -99,13 +98,21 @@ def extract_trajectory_signals(trajectory: dict) -> TrajectorySignals:
         elif role == "tool":
             content = str(msg.get("content", "") or "")
             for m in _RE_TOOL_OUTPUT_FILE.finditer(content):
-                fp = m.group(1)
-                file_view_counter[fp] += 1
+                file_view_counter[_repo_path(m.group(1))] += 1
 
         elif role == "user":
             content = msg.get("content", "") or ""
             if "No tool calls found" in content or "Error parsing tool call" in content:
                 format_error_count += 1
+
+    # Compute total tool calls after loop (using deduplicated IDs)
+    if seen_tool_events:
+        signals.total_tool_calls = len(seen_tool_events)
+    else:
+        signals.total_tool_calls = sum(
+            len(m.get("tool_calls") or []) + len((m.get("extra") or {}).get("actions") or [])
+            for m in messages if m.get("role") == "assistant"
+        )
 
     signals.format_error_count = format_error_count
     signals.tool_type_counts = dict(tool_call_counter)

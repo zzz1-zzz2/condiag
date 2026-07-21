@@ -172,18 +172,37 @@ def _truncate_window(messages: list[dict], max_turns: int) -> list[dict]:
 
 
 def _cap_total_size(messages: list[dict], max_chars: int) -> list[dict]:
-    """If total is still over budget, progressively drop older turns."""
-    total = _total_chars(messages)
-    if total <= max_chars:
-        return messages
+    """If still over budget, drop oldest complete turns."""
+    # Group into turns (same logic as _truncate_window)
+    leading, turns, current = [], [], []
+    for m in messages:
+        r = m.get("role", "")
+        if r == "system":
+            leading.append(m)
+        elif r == "user" and not current and not turns:
+            leading.append(m)
+        elif r == "assistant":
+            if current:
+                turns.append(current)
+                current = []
+            current.append(m)
+        elif r == "tool":
+            current.append(m)
+        else:
+            leading.append(m)
+    if current:
+        turns.append(current)
 
-    # Aggressive: drop oldest assistant+tool pairs until under budget
-    while _total_chars(messages) > max_chars and len(messages) > 5:
-        for i in range(len(messages)):
-            if messages[i].get("role") in ("assistant", "tool"):
-                messages.pop(i)
-                break
-    return messages
+    # Drop oldest turns until under budget
+    while True:
+        all_msgs = leading + [m for t in turns for m in t]
+        if _total_chars(all_msgs) <= max_chars or len(all_msgs) <= 5:
+            break
+        if not turns:
+            break
+        turns.pop(0)
+
+    return leading + [m for t in turns for m in t]
 
 
 def _total_chars(messages: list[dict]) -> int:

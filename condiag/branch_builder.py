@@ -46,10 +46,11 @@ def build_branch_messages(
         # Check which IDs already have responses
         existing = {m.get("tool_call_id") for m in msgs if m.get("role") == "tool"}
         missing = [tid for tid in call_ids if tid and tid not in existing]
-        if missing:
-            msgs.append({"role": "tool", "tool_call_id": missing[0],
+        for tid in missing:
+            msgs.append({"role": "tool", "tool_call_id": tid,
                           "content": "(output)"})
-        break  # only the last assistant
+        if missing:
+            break  # only process the last assistant with missing responses
 
     # 2. Inject FailureWitness
     if failure_witness:

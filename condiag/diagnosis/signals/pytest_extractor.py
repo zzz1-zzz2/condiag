@@ -202,12 +202,11 @@ def _extract_errors(signals: TestLogSignals, lines: list[str]) -> None:
             etype = m.group(1)
             msg = m.group(2) or ""
             error_type_counts[etype] = error_type_counts.get(etype, 0) + 1
+            full_msg = f"{etype}: {msg}"
             if not signals.first_error_message:
-                signals.first_error_message = f"{etype}: {msg}"
-                full_msg = f"{etype}: {msg}"
-                if full_msg not in signals.error_messages:
-                    signals.error_messages.append(full_msg)
-            signals.error_messages.append(f"{etype}: {msg}")
+                signals.first_error_message = full_msg
+            if full_msg not in signals.error_messages:
+                signals.error_messages.append(full_msg)
             continue
 
         # Fallback: also match error message in summary lines
@@ -216,11 +215,11 @@ def _extract_errors(signals: TestLogSignals, lines: list[str]) -> None:
             etype = m.group(1)
             msg = m.group(2) or ""
             error_type_counts[etype] = error_type_counts.get(etype, 0) + 1
+            full_msg = f"{etype}: {msg}"
             if not signals.first_error_message:
-                signals.first_error_message = f"{etype}: {msg}"
-                full_msg = f"{etype}: {msg}"
-                if full_msg not in signals.error_messages:
-                    signals.error_messages.append(full_msg)
+                signals.first_error_message = full_msg
+            if full_msg not in signals.error_messages:
+                signals.error_messages.append(full_msg)
 
         # Assertion detail lines: >       cirsnod = inod.transform_to(cframe1)
         if _RE_ASSERTION_LINE.search(stripped):
