@@ -196,8 +196,21 @@ def run_experiment(
             out.verdict = "r1_resolved"
             return out
 
+        # ═══════ P0-4b: Harness Eligibility Gate ═══════
+        from condiag.integrity import check_episode_eligibility
+        # Note: fw is needed for eligibility; extract it first
+        fw_temp = harness.extract_witness(r1_eval).to_dict()
+        eligibility = check_episode_eligibility(r1_eval, fw_temp)
+        _write_json(inst_dir / "round1" / "eligibility_report.json", eligibility.to_dict())
+        logger.info("[%s] R1 eligibility: ok=%s status=%s",
+                     instance_id, eligibility.ok, eligibility.status)
+        if not eligibility.ok:
+            logger.info("[%s] Episode ineligible: %s", instance_id, eligibility.status)
+            out.verdict = f"ineligible:{eligibility.status}"
+            return out
+
         # ═══════ FW + Checkpoint ═══════
-        fw = harness.extract_witness(r1_eval).to_dict()
+        fw = fw_temp
         fw_preview = fw.get("failed_tests", [])[:3] or [fw.get("error_message", "")[:50]]
         logger.info("[%s] FW: %s", instance_id, fw_preview)
 
@@ -280,6 +293,8 @@ def run_experiment(
             logger.info("[%s] SF not submitted or invalid (%s) — skip eval",
                         instance_id, sf_integrity.status)
         out.sf = asdict_skip(sf, ["messages", "trajectory"])
+        out.sf["integrity_ok"] = sf_integrity.ok
+        out.sf["integrity_status"] = sf_integrity.status
         out.sf_messages_sha = _sha([m for m in sf.messages if m.get("role") != "exit"])
         out.sf_resolved = (sf.termination_reason == "submitted" and
                            out.sf.get("harness_status") == "RESOLVED")
@@ -323,6 +338,8 @@ def run_experiment(
                 logger.info("[%s] CD not submitted or invalid (%s) — skip eval",
                             instance_id, cd_integrity.status)
             out.cd = asdict_skip(cd, ["messages", "trajectory"])
+            out.cd["integrity_ok"] = cd_integrity.ok
+            out.cd["integrity_status"] = cd_integrity.status
             out.cd_messages_sha = _sha([m for m in cd.messages if m.get("role") != "exit"])
             out.cd_resolved = (cd.termination_reason == "submitted" and
                                out.cd.get("harness_status") == "RESOLVED")

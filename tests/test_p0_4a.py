@@ -171,8 +171,36 @@ class TestCheckPatchIntegrity:
             workspace_patch=VALID_DIFF,
             evaluation_patch=VALID_DIFF,
             agent_workdir=workdir2,
+            run_apply_check=True,
         )
         assert r.ok
+        assert r.apply_check_status == "passed"
+
+    def test_quoted_filename_with_special_chars(self):
+        """Files with spaces/quotes in names must be captured (Git quotes them)."""
+        diff = (
+            'diff --git "a/students test.py" "b/students test.py"\n'
+            'index 1234567..89abcde 100644\n'
+            '--- "a/students test.py"\n'
+            '+++ "b/students test.py"\n'
+            '@@ -1,1 +1,1 @@\n'
+            '-old\n'
+            '+new\n'
+        )
+        files = extract_changed_files(diff)
+        assert "students test.py" in files
+
+    def test_apply_check_status_not_run_by_default(self):
+        """Without run_apply_check, status is 'not_run' even if workdir provided."""
+        sub = AgentSubmission(selected_patch=VALID_DIFF, selected_source="exit_extra_submission")
+        r = check_patch_integrity(
+            termination_reason="submitted",
+            agent_submission=sub,
+            workspace_patch=VALID_DIFF,
+            evaluation_patch=VALID_DIFF,
+            agent_workdir=None,  # no workdir
+        )
+        assert r.apply_check_status == "not_run"
 
     def test_git_apply_check_failure(self, tmp_path):
         # Set up a Git repo without the file we're trying to modify
@@ -191,9 +219,11 @@ class TestCheckPatchIntegrity:
             workspace_patch=VALID_DIFF,
             evaluation_patch=VALID_DIFF,
             agent_workdir=tmp_path,
+            run_apply_check=True,
         )
         assert r.ok is False
         assert r.status == "invalid_unapplyable"
+        assert r.apply_check_status == "failed"
 
     def test_termination_must_be_submitted(self):
         r = check_patch_integrity(
