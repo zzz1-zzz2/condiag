@@ -206,7 +206,6 @@ class FailureFeatureBundle(BaseModel):
     instance: InstanceSignals = Field(default_factory=InstanceSignals)
     patch: PatchSignals = Field(default_factory=PatchSignals)
     trajectory: TrajectorySignals = Field(default_factory=TrajectorySignals)
-    trajectory: TrajectorySignals = Field(default_factory=TrajectorySignals)
 
     def to_flat_dict(self) -> dict[str, Any]:
         """Flatten to a dict for logging/storage (no Pydantic validation)."""

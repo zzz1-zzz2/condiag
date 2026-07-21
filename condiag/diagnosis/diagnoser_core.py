@@ -121,17 +121,24 @@ class DiagnoserCore:
             edit_files_short = {f.split("/")[-1] for f in edit_files}
             overlap = edit_files_short & error_files_short
             if len(overlap) == 0:
+                key_loc = "; ".join(list(error_files)[:3])
+                findings.append(DeficiencyFinding(
+                    type=ContextDeficiencyType.LOCALIZATION_DIRECTION,
+                    confidence="medium",
+                    evidence=[f"R1 edited {', '.join(patch.edited_files[:3])} but error is in {key_loc}"],
+                    key_location=key_loc,
+                ))
                 rejected.append(
-                    f"R1 edited {', '.join(patch.edited_files)} but error is in "
+                    f"R1 edited {', '.join(patch.edited_files[:3])} but error is in "
                     f"{', '.join(list(error_files)[:3])} — wrong localization"
                 )
 
         # ── Aggregate findings ──
         if not findings:
             findings.append(DeficiencyFinding(
-                type=ContextDeficiencyType.API_DEFINITION,
+                type=ContextDeficiencyType.NO_RELIABLE_DEFICIENCY,
                 confidence="low",
-                evidence=["No strong signal pattern matched"],
+                evidence=["No supported context-deficiency pattern matched"],
             ))
 
         # Sort by confidence, pick primary

@@ -24,6 +24,11 @@ class ContextDeficiencyType(str, Enum):
 
     # ── Core types (observed in SWE-bench_Verified) ──
 
+    NO_RELIABLE_DEFICIENCY = "NO_RELIABLE_DEFICIENCY"
+    """No supported context-deficiency pattern matched. Diagnoser cannot
+    determine what context is missing. Fall back to feedback-only revision.
+    """
+
     API_DEFINITION = "API_DEFINITION"
     """Class/function/attribute doesn't exist on the object, or signature mismatch.
 

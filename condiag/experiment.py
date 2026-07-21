@@ -242,13 +242,12 @@ def run_experiment(
             out.verdict = "invalid_snapshot"
             return out
 
-        # ═══════ P1: Build FailureFeatureBundle + DiagnoserCore ═══════
+        # ═══════ P1: Build FailureFeatureBundle (shared R1 artifact) ═══════
         from condiag.diagnosis.bundle_builder import build_failure_feature_bundle
         from condiag.diagnosis.diagnoser_core import DiagnoserCore
         from condiag.diagnosis.signals import extract_test_log
         from condiag.patch_artifacts import sha256_full
 
-        # Extract test log signals if test_log_path is available
         test_log = None
         if getattr(r1_eval, "test_log_path", ""):
             try:
@@ -264,16 +263,17 @@ def run_experiment(
             instance_spec=instance_spec,
             test_log=test_log,
         )
-        _write_json(inst_dir / "cd" / "failure_feature_bundle.json", bundle.model_dump())
+        _write_json(inst_dir / "round1" / "failure_feature_bundle.json", bundle.model_dump())
 
-        # Run diagnosis (CD only; SF uses same bundle for reference)
-        diagnosis = DiagnoserCore().diagnose(bundle)
-        _write_json(inst_dir / "cd" / "diagnosis.json", diagnosis.model_dump())
-        logger.info("[%s] Diagnosis: primary=%s confidence=%s",
-                     instance_id, diagnosis.primary.type.value, diagnosis.primary.confidence.value)
-
-        # Build diagnosis prompt for CD branch
-        diag_text = _render_diagnosis_prompt(diagnosis)
+        # ═══════ Diagnosis (CD only) ═══════
+        diagnosis = None
+        diag_text = None
+        if run_cd:
+            diagnosis = DiagnoserCore().diagnose(bundle)
+            _write_json(inst_dir / "cd" / "diagnosis.json", diagnosis.model_dump())
+            logger.info("[%s] Diagnosis: primary=%s confidence=%s",
+                         instance_id, diagnosis.primary.type.value, diagnosis.primary.confidence.value)
+            diag_text = _render_diagnosis_prompt(diagnosis)
 
         # ═══════ Compression ═══════
         compressed_messages = compress_messages(
@@ -540,6 +540,8 @@ def _render_diagnosis_prompt(diagnosis) -> str:
         parts.append("Evidence:")
         for e in diagnosis.primary.evidence:
             parts.append(f"  - {e}")
+    if diagnosis.primary.key_location:
+        parts.append(f"Key Location: {diagnosis.primary.key_location}")
     if diagnosis.secondary:
         parts.append(f"\nSecondary considerations ({len(diagnosis.secondary)}):")
         for s in diagnosis.secondary:

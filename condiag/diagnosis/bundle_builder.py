@@ -89,16 +89,18 @@ def _populate_test_log_from_fw(
     if "AttributeError" in error_msg:
         signals.error_types["AttributeError"] = signals.error_types.get("AttributeError", 0) + 1
 
-    frames = fw.get("stack_frames") or []
-    from condiag.diagnosis.signals.schema import StackFrame
-    for frame in frames[:15]:
+    for frame in fw.get("stack_frames") or []:
         if isinstance(frame, dict):
+            path = frame.get("file", "")
+            # /testbed/... path is definitely repo; non-system relative paths are repo
+            from condiag.diagnosis.signals.schema import StackFrame
+            is_repo = "/testbed/" in path or not path.startswith(("/", "<"))
             signals.stack_frames.append(
                 StackFrame(
-                    file=frame.get("file", ""),
+                    file=path,
                     line=frame.get("line", 0),
                     function=frame.get("function", frame.get("func", "")),
-                    is_repo_frame="/testbed" not in frame.get("file", ""),
+                    is_repo_frame=is_repo,
                 )
             )
 
@@ -109,15 +111,14 @@ def _populate_patch_signals(
     workspace_patch: str,
 ) -> None:
     """Extract patch-level features from diff text."""
-    import re
+    patch_text = evaluation_patch or workspace_patch or ""
 
-    signals.patch_size_chars = len(evaluation_patch) if evaluation_patch else len(workspace_patch) if workspace_patch else 0
-    signals.patch_size_lines = evaluation_patch.count("\n") if evaluation_patch else workspace_patch.count("\n") if workspace_patch else 0
+    signals.patch_size_chars = len(patch_text)
+    signals.patch_size_lines = patch_text.count("\n")
 
-    # Extract edited files
-    patch_text = evaluation_patch or workspace_patch
-    for m in re.finditer(r"^diff --git a/(\S+) b/(\S+)", patch_text, re.MULTILINE):
-        signals.edited_files.append(m.group(2))
+    # Reuse the shlex-based parser from integrity.py (handles quoted filenames)
+    from condiag.integrity import extract_changed_files
+    signals.edited_files = extract_changed_files(patch_text)
 
     # Config file changes
     for f in signals.edited_files:
@@ -132,13 +133,18 @@ def _populate_trajectory_signals(
 ) -> None:
     """Parse basic trajectory features."""
     total_tool_calls = 0
+    assistant_turns = 0
     for msg in trajectory.get("messages", []) if isinstance(trajectory, dict) else trajectory:
-        role = msg.get("role", "")
-        if role == "assistant":
-            total_tool_calls += 1
+        if msg.get("role") != "assistant":
+            continue
+        assistant_turns += 1
+        # Count actual tool calls (both top-level and extra.actions)
+        tc = msg.get("tool_calls") or []
+        actions = (msg.get("extra") or {}).get("actions") or []
+        total_tool_calls += len(tc) + len(actions)
 
     signals.total_tool_calls = total_tool_calls
-    signals.format_error_count = 0  # detailed extraction deferred to Phase 2
+    signals.format_error_count = 0
 
 
 def _populate_instance_signals(
