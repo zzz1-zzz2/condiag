@@ -168,11 +168,11 @@ def run_experiment(
         _write_json(inst_dir / "round1" / "integrity_report.json", r1_integrity.to_dict())
         logger.info("[%s] R1 integrity: ok=%s status=%s",
                      instance_id, r1_integrity.ok, r1_integrity.status)
+        out.round1["integrity_ok"] = r1_integrity.ok
+        out.round1["integrity_status"] = r1_integrity.status
         if not r1_integrity.ok:
             logger.info("[%s] R1 patch failed integrity — episode invalid", instance_id)
             out.verdict = f"invalid_r1_patch:{r1_integrity.status}"
-            out.round1["integrity_ok"] = r1_integrity.ok
-            out.round1["integrity_status"] = r1_integrity.status
             return out
 
         # ═══════ Official eval R1 ═══════
@@ -224,7 +224,7 @@ def run_experiment(
         out.r1_patch_sha = _sha(r1.patch_text)
         out.failure_witness_sha = _sha(fw)
         _write_json(inst_dir / "round1" / "failure_witness.json", fw)
-        _save_checkpoint(inst_dir, r1, base_commit)
+        _save_checkpoint(inst_dir, instance_id, episode_run_id, r1, base_commit)
 
         # ═══════ Workspace Snapshot ═══════
         # Captured in run_round1() from the live container
@@ -450,29 +450,34 @@ def _write_trajectory(p: Path, data: dict):
     except Exception: pass
 
 
-def _save_checkpoint(inst_dir: Path, r1: Round1Result, base_commit: str):
-    """Save episode checkpoint directly from R1 artifacts, not from a Stub.
+def _save_checkpoint(inst_dir: Path, instance_id: str, episode_run_id: str,
+                    r1: Round1Result, base_commit: str):
+    """Save episode checkpoint manifest from R1 artifacts.
 
-    The checkpoint contains the data needed to restart an episode:
-    - messages (conversation history)
-    - costs and counters
-    - workspace patch and snapshot SHA
-    - evaluation patch
-    - failure witness SHA
+    This is NOT a full agent state checkpoint — it's an audit manifest
+    that records the R1 outcome and provides links to all R1 artifacts.
+    Full messages, patches, and snapshots are saved as adjacent files.
     """
+    import hashlib
+    fm = hashlib.sha256(json.dumps(r1.messages, sort_keys=True, default=str).encode()).hexdigest()[:16]
     checkpoint = {
-        "episode_run_id": inst_dir.parent.name,
-        "instance_id": r1.termination_reason,
+        "episode_run_id": episode_run_id,
+        "instance_id": instance_id,
         "base_commit": base_commit,
-        "messages_count": len(r1.messages),
         "n_calls": r1.n_calls,
         "cost": r1.cost,
         "duration_seconds": r1.duration_seconds,
         "termination_reason": r1.termination_reason,
-        "workspace_state_sha": r1.workspace_snapshot.workspace_state_sha if r1.workspace_snapshot else "",
         "evaluation_patch_sha": hashlib.sha256(r1.evaluation_patch.encode()).hexdigest()[:16] if r1.evaluation_patch else "",
+        "workspace_state_sha": r1.workspace_snapshot.workspace_state_sha if r1.workspace_snapshot else "",
+        "messages_sha": fm,
+        "snapshot_path": "../workspace_snapshot.json",
+        "failure_witness_path": "../failure_witness.json",
+        "evaluation_patch_path": "../evaluation.patch",
     }
-    _write_json(inst_dir / "round1" / "checkpoint" / "checkpoint.json", checkpoint)
+    cp_dir = inst_dir / "round1" / "checkpoint"
+    cp_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(cp_dir / "checkpoint.json", checkpoint)
 
 
 def _eval_and_save(harness, spec, patch, json_path, label, result):
