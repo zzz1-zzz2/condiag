@@ -131,35 +131,33 @@ class InstanceSignals(BaseModel):
 
 
 class PatchSignals(BaseModel):
-    """Signals extracted from the R1 git diff patch.
+    """Signals extracted from the R1 git diff patch."""
 
-    Source: _canonical_patch() → git diff output → regex analysis
-    """
-
-    edited_files: list[str] = Field(default_factory=list, description="Files modified in the patch")
-    patch_size_chars: int = Field(0, description="Total patch size in characters")
-    patch_size_lines: int = Field(0, description="Number of lines changed (+/-)")
-    introduced_config_change: bool = Field(
-        default=False,
-        description="True if patch modifies pyproject.toml, setup.cfg, or similar config files",
-    )
+    edited_files: list[str] = Field(default_factory=list)
+    patch_size_chars: int = 0
+    patch_size_lines: int = 0
+    changed_lines: int = 0
+    added_lines: int = 0
+    deleted_lines: int = 0
+    hunk_count: int = 0
+    diff_total_lines: int = 0
+    introduced_config_change: bool = False
 
 
 class TrajectorySignals(BaseModel):
     """Signals extracted from the R1 agent trajectory.
 
-    Source: R1 trajectory → message analysis
-
-    TODO(phase-2): Enrich with exploration pattern detection, file viewing stats.
-    Currently limited to what the existing trajectory_signals.py provides.
+    Source: R1 trajectory → message analysis (tool calls, viewed files).
     """
 
     total_tool_calls: int = 0
-    format_error_count: int = Field(0, description="Number of consecutive format errors")
-    iteration_signal: str = Field(
-        default="normal_exploring",
-        description="Detected iteration behavior pattern (see IterationSignal enum values)",
-    )
+    assistant_turn_count: int = 0
+    format_error_count: int = 0
+    tool_type_counts: dict[str, int] = Field(default_factory=dict)
+    viewed_files: list[str] = Field(default_factory=list)
+    bash_commands_run: int = 0
+    test_commands_run: int = 0
+    exploration_concentration: float = 0.0
 
 
 # ════════════════════════════════════════════════════════════════════

@@ -23,6 +23,7 @@ from condiag.diagnosis.signals.schema import (
     StackFrame,
     TestLogSignals,
 )
+from condiag.diagnosis.signals.frame_normalizer import normalize_frame
 
 logger = logging.getLogger("condiag.diagnosis.signals.pytest_extractor")
 
@@ -159,13 +160,7 @@ def _extract_stack_frames(
             if not fpath.startswith("/"):
                 fpath = _resolve_repo_path(fpath)
             signals.stack_frames.append(
-                StackFrame(
-                    file=fpath,
-                    line=int(m.group(2)),
-                    function=m.group(3),
-                    is_repo_frame=not _is_system_path(fpath),
-                    is_test_file="test_" in fpath or "/tests/" in fpath or "\\tests\\" in fpath,
-                )
+                normalize_frame(fpath, int(m.group(2)), m.group(3))
             )
             continue
 
@@ -176,12 +171,7 @@ def _extract_stack_frames(
             if fpath.startswith("/testbed/"):
                 fpath = fpath[len("/testbed/"):]
             signals.stack_frames.append(
-                StackFrame(
-                    file=fpath,
-                    line=int(m.group(2)),
-                    function=m.group(3) or "",
-                    is_repo_frame=not _is_system_path(fpath),
-                )
+                normalize_frame(fpath, int(m.group(2)), m.group(3) or "")
             )
             continue
 
@@ -192,12 +182,7 @@ def _extract_stack_frames(
         if m:
             fpath = m.group(1)
             signals.build_frames.append(
-                StackFrame(
-                    file=fpath,
-                    line=int(m.group(2)),
-                    function=m.group(3) or "",
-                    is_repo_frame=not _is_system_path(fpath),
-                )
+                normalize_frame(fpath, line=int(m.group(2)), function=m.group(3) or "")
             )
 
 

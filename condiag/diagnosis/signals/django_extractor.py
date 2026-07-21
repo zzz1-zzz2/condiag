@@ -27,6 +27,7 @@ from condiag.diagnosis.signals.schema import (
     StackFrame,
     TestLogSignals,
 )
+from condiag.diagnosis.signals.frame_normalizer import normalize_frame
 
 logger = logging.getLogger("condiag.diagnosis.signals.django_extractor")
 
@@ -185,13 +186,7 @@ def _extract_frames_and_errors(
                 if fpath.startswith("/testbed/"):
                     fpath = fpath[len("/testbed/"):]
                 signals.stack_frames.append(
-                    StackFrame(
-                        file=fpath,
-                        line=int(fm.group(2)),
-                        function=fm.group(3) or "",
-                        is_repo_frame="testbed" in fpath or not _is_system_path(fpath),
-                        is_test_file="/tests/" in fpath or "\\tests\\" in fpath,
-                    )
+                    normalize_frame(fpath, int(fm.group(2)), fm.group(3) or "")
                 )
                 continue
 
@@ -207,13 +202,7 @@ def _extract_frames_and_errors(
                 key = (fpath, int(fm.group(2)), fm.group(3) or "")
                 if key not in existing and not _is_system_path(fpath):
                     signals.stack_frames.append(
-                        StackFrame(
-                            file=fpath,
-                            line=int(fm.group(2)),
-                            function=fm.group(3) or "",
-                            is_repo_frame=True,
-                            is_test_file="/tests/" in fpath or "\\tests\\" in fpath,
-                        )
+                        normalize_frame(fpath, int(fm.group(2)), fm.group(3) or "")
                     )
 
     # Fallback: if no error section was detected, extract error from full text
