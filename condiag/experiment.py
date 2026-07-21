@@ -171,6 +171,8 @@ def run_experiment(
         if not r1_integrity.ok:
             logger.info("[%s] R1 patch failed integrity — episode invalid", instance_id)
             out.verdict = f"invalid_r1_patch:{r1_integrity.status}"
+            out.round1["integrity_ok"] = r1_integrity.ok
+            out.round1["integrity_status"] = r1_integrity.status
             return out
 
         # ═══════ Official eval R1 ═══════
@@ -207,7 +209,11 @@ def run_experiment(
         if not eligibility.ok:
             logger.info("[%s] Episode ineligible: %s", instance_id, eligibility.status)
             out.verdict = f"ineligible:{eligibility.status}"
+            out.round1["eligibility_ok"] = eligibility.ok
+            out.round1["eligibility_status"] = eligibility.status
             return out
+        out.round1["eligibility_ok"] = eligibility.ok
+        out.round1["eligibility_status"] = eligibility.status
 
         # ═══════ FW + Checkpoint ═══════
         fw = fw_temp
@@ -217,7 +223,8 @@ def run_experiment(
         out.r1_messages_sha = _sha(r1.messages)
         out.r1_patch_sha = _sha(r1.patch_text)
         out.failure_witness_sha = _sha(fw)
-        _save_checkpoint(checkpointer, r1, base_commit)
+        _write_json(inst_dir / "round1" / "failure_witness.json", fw)
+        _save_checkpoint(inst_dir, r1, base_commit)
 
         # ═══════ Workspace Snapshot ═══════
         # Captured in run_round1() from the live container
@@ -368,11 +375,29 @@ def run_experiment(
         logger.info("[%s] fairness: r1_ws=%s sf_ws=%s cd_ws=%s ok=%s",
                      instance_id, r1_ws, sf_ws, cd_ws, fairness_ok)
 
+        # ═══════ Branch Eval Validity ═══════
+        VALID_BRANCH_STATUSES = {"RESOLVED", "UNRESOLVED"}
+        sf_hs = out.sf.get("harness_status", "")
+        sf_eval_valid = sf_integrity.ok and (sf_hs in VALID_BRANCH_STATUSES)
+        out.sf["eval_valid"] = sf_eval_valid
+        if out.cd_run:
+            cd_hs = out.cd.get("harness_status", "")
+            cd_eval_valid = cd_integrity.ok and (cd_hs in VALID_BRANCH_STATUSES)
+            out.cd["eval_valid"] = cd_eval_valid
+        else:
+            cd_eval_valid = True
+
         # ═══════ Verdict ═══════
         if not fairness_ok:
             out.verdict = "invalid_fairness"
         elif not out.cd_run:
             out.verdict = "cd_disabled"
+        elif not sf_eval_valid and not cd_eval_valid:
+            out.verdict = "invalid_both_branches"
+        elif not sf_eval_valid:
+            out.verdict = "invalid_branch_sf"
+        elif not cd_eval_valid:
+            out.verdict = "invalid_branch_cd"
         elif out.sf_resolved and out.cd_resolved:
             out.verdict = "both_succeed"
         elif out.sf_resolved and not out.cd_resolved:
@@ -425,27 +450,29 @@ def _write_trajectory(p: Path, data: dict):
     except Exception: pass
 
 
-def _save_checkpoint(checkpointer, r1: Round1Result, base_commit: str):
-    class _Cfg:
-        def model_dump(self, mode="json"):
-            return {}
-    class _Mod:
-        model_name = ""
-        model_kwargs = {}
-    class _Env:
-        container_id = ""
-    class _Stub:
-        messages = r1.messages
-        phase = "round1"
-        cost = r1.cost
-        n_calls = r1.n_calls
-        n_consecutive_format_errors = 0
-        _start_time = time.time() - r1.duration_seconds
-        extra_template_vars = {}
-        config = _Cfg()
-        model = _Mod()
-        env = _Env()
-    checkpointer.capture(_Stub(), base_commit=base_commit, round1_patch=r1.patch_text)
+def _save_checkpoint(inst_dir: Path, r1: Round1Result, base_commit: str):
+    """Save episode checkpoint directly from R1 artifacts, not from a Stub.
+
+    The checkpoint contains the data needed to restart an episode:
+    - messages (conversation history)
+    - costs and counters
+    - workspace patch and snapshot SHA
+    - evaluation patch
+    - failure witness SHA
+    """
+    checkpoint = {
+        "episode_run_id": inst_dir.parent.name,
+        "instance_id": r1.termination_reason,
+        "base_commit": base_commit,
+        "messages_count": len(r1.messages),
+        "n_calls": r1.n_calls,
+        "cost": r1.cost,
+        "duration_seconds": r1.duration_seconds,
+        "termination_reason": r1.termination_reason,
+        "workspace_state_sha": r1.workspace_snapshot.workspace_state_sha if r1.workspace_snapshot else "",
+        "evaluation_patch_sha": hashlib.sha256(r1.evaluation_patch.encode()).hexdigest()[:16] if r1.evaluation_patch else "",
+    }
+    _write_json(inst_dir / "round1" / "checkpoint" / "checkpoint.json", checkpoint)
 
 
 def _eval_and_save(harness, spec, patch, json_path, label, result):

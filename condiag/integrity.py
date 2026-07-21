@@ -59,6 +59,10 @@ def extract_changed_files(patch_text):
             continue
         if len(parts) != 4:
             continue
+        if parts[0] != "diff" or parts[1] != "--git":
+            continue
+        if not parts[2].startswith("a/") or not parts[3].startswith("b/"):
+            continue
         new_path = parts[3]
         if new_path.startswith("b/"):
             new_path = new_path[2:]

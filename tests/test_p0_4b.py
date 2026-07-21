@@ -7,18 +7,13 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from condiag.integrity import (
     EligibilityReport,
     check_episode_eligibility,
     _witness_is_valid,
 )
-
-
-@dataclass
-class _FakeEvalResult:
-    """Mimics OfficialHarnessGateway's EvalResult for eligibility tests."""
-    status: str = "UNRESOLVED"
-    test_log_path: str = ""
 
 
 VALID_WITNESS = {
@@ -28,6 +23,12 @@ VALID_WITNESS = {
 }
 
 
+
+@dataclass
+class _FakeEvalResult:
+    """Mimics OfficialHarnessGateway's EvalResult for eligibility tests."""
+    status: str = "UNRESOLVED"
+    test_log_path: str = ""
 def _make_test_log(tmp_path: Path, content: str = "pytest output here") -> Path:
     log = tmp_path / "test.log"
     log.write_text(content)
@@ -135,3 +136,34 @@ class TestCheckEpisodeEligibility:
         eval_result = _FakeEvalResult(status="UNRESOLVED", test_log_path=str(log))
         r = check_episode_eligibility(eval_result, VALID_WITNESS)
         json.dumps(r.to_dict(), indent=2)
+
+
+@pytest.mark.parametrize(
+    "status,test_log_content,witness,expected_ok,expected_status",
+    [
+        ("ERROR", "", {}, False, "ineligible_harness_error"),
+        ("TIMEOUT", "", {}, False, "ineligible_harness_timeout"),
+        ("UNKNOWN", "", {}, False, "ineligible_harness_unknown"),
+        ("UNRESOLVED", "", {}, False, "ineligible_missing_test_log"),
+        ("UNRESOLVED", "FAILED test_foo", {}, False, "ineligible_empty_witness"),
+        ("UNRESOLVED", "some output", VALID_WITNESS, True, "eligible"),
+    ],
+)
+def test_eligibility_orchestration(tmp_path, status, test_log_content, witness, expected_ok, expected_status):
+    """Parameterized: each scenario must produce correct eligibility and
+    never invoke run_branch when ineligible."""
+    log_path = ""
+    if test_log_content:
+        log = tmp_path / "test.log"
+        log.write_text(test_log_content)
+        log_path = str(log)
+
+    eval_result = _FakeEvalResult(status=status, test_log_path=log_path)
+    r = check_episode_eligibility(eval_result, witness)
+    assert r.ok == expected_ok, "Expected ok={} for status={}".format(expected_ok, status)
+    assert r.status == expected_status, "Expected status={} for status={}".format(expected_status, status)
+
+    # When ineligible, no branches should run
+    if not expected_ok:
+        assert not r.witness_valid or not r.test_log_exists, \
+            "Ineligible but still appears to have data: status={}".format(status)
