@@ -163,30 +163,49 @@ class TrajectorySignals(BaseModel):
 
 
 # ════════════════════════════════════════════════════════════════════
-# Layer 2: Aggregated diagnosis input (one fused object)
+# Layer 2: Runtime-safe vs Oracle separation
+# ════════════════════════════════════════════════════════════════════
+
+
+class RuntimeInstanceSignals(BaseModel):
+    """Runtime-safe instance fields — NO gold data.
+
+    This is what the Diagnoser receives at inference time.
+    """
+
+    instance_id: str = ""
+    repo: str = ""
+    base_commit: str = ""
+    version: str = ""
+
+
+class RuntimeFailureFeatureBundle(BaseModel):
+    """Diagnoser input — runtime-safe version.
+
+    Contains only fields available at inference time.
+    NO fail_to_pass, pass_to_pass, gold_context, or has_gold_context.
+    """
+
+    test_log: TestLogSignals = Field(default_factory=TestLogSignals)
+    instance: RuntimeInstanceSignals = Field(default_factory=RuntimeInstanceSignals)
+    patch: PatchSignals = Field(default_factory=PatchSignals)
+    trajectory: TrajectorySignals = Field(default_factory=TrajectorySignals)
+
+
+# ════════════════════════════════════════════════════════════════════
+# Layer 3: Full bundle with Oracle fields (for offline evaluation)
 # ════════════════════════════════════════════════════════════════════
 
 
 class FailureFeatureBundle(BaseModel):
-    """STANDARD ENTRY POINT for the Diagnoser.
-
-    All signal extraction modules produce this same type.
-    The Diagnoser consumes ONLY this object — never raw data sources.
-
-    Fields are organized by data source provenance:
-      - test_log: from the SWE-bench evaluation stdout
-      - instance: from the SWE-bench dataset row (gold labels)
-      - patch: from the git diff
-      - trajectory: from the agent interaction history
-
-    Design rule:
-      Every nested model above maps to a verified extraction pathway.
-      Optional fields are marked with Field(default=...) and documented as "when available".
+    """Full bundle including Oracle fields — for offline evaluation ONLY.
+    NOT for Diagnoser at inference time.
     """
 
     test_log: TestLogSignals = Field(default_factory=TestLogSignals)
     instance: InstanceSignals = Field(default_factory=InstanceSignals)
     patch: PatchSignals = Field(default_factory=PatchSignals)
+    trajectory: TrajectorySignals = Field(default_factory=TrajectorySignals)
     trajectory: TrajectorySignals = Field(default_factory=TrajectorySignals)
 
     def to_flat_dict(self) -> dict[str, Any]:

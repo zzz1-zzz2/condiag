@@ -16,7 +16,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from condiag.diagnosis.signals.schema import FailureFeatureBundle
+from condiag.diagnosis.signals.schema import RuntimeFailureFeatureBundle
 from condiag.diagnosis.taxonomy import ContextDeficiencyType, ConfidenceLevel
 
 
@@ -59,7 +59,7 @@ class DiagnoserCore:
     Each rule is one (signal_pattern → diagnosis) mapping, weighted by confidence.
     """
 
-    def diagnose(self, bundle: FailureFeatureBundle) -> DiagnosisResult:
+    def diagnose(self, bundle: RuntimeFailureFeatureBundle) -> DiagnosisResult:
         """Run all rules against the signal bundle, return aggregated diagnosis."""
 
         findings: list[DeficiencyFinding] = []
@@ -131,7 +131,7 @@ class DiagnoserCore:
             findings.append(DeficiencyFinding(
                 type=ContextDeficiencyType.API_DEFINITION,
                 confidence="low",
-                evidence=["No strong signal pattern matched — defaulting to API_DEFINITION"],
+                evidence=["No strong signal pattern matched"],
             ))
 
         # Sort by confidence, pick primary

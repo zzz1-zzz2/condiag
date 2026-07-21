@@ -242,11 +242,38 @@ def run_experiment(
             out.verdict = "invalid_snapshot"
             return out
 
-        # ═══════ Diagnosis ═══════
-        diag = None
-        if diagnosis_builder_cls and fw.get("failed_tests"):
-            from condiag.diagnosis_prompt_builder import DiagnosisPromptBuilder, TrajectorySnapshot
-            diag = DiagnosisPromptBuilder().build(fw, TrajectorySnapshot())
+        # ═══════ P1: Build FailureFeatureBundle + DiagnoserCore ═══════
+        from condiag.diagnosis.bundle_builder import build_failure_feature_bundle
+        from condiag.diagnosis.diagnoser_core import DiagnoserCore
+        from condiag.diagnosis.signals import extract_test_log
+        from condiag.patch_artifacts import sha256_full
+
+        # Extract test log signals if test_log_path is available
+        test_log = None
+        if getattr(r1_eval, "test_log_path", ""):
+            try:
+                test_log = extract_test_log(r1_eval.test_log_path)
+            except Exception as e:
+                logger.warning("[%s] test_log extraction failed: %s", instance_id, e)
+
+        bundle = build_failure_feature_bundle(
+            failure_witness=fw,
+            evaluation_patch=r1.evaluation_patch,
+            workspace_patch=r1.patch_text,
+            trajectory=getattr(r1, "trajectory", None),
+            instance_spec=instance_spec,
+            test_log=test_log,
+        )
+        _write_json(inst_dir / "cd" / "failure_feature_bundle.json", bundle.model_dump())
+
+        # Run diagnosis (CD only; SF uses same bundle for reference)
+        diagnosis = DiagnoserCore().diagnose(bundle)
+        _write_json(inst_dir / "cd" / "diagnosis.json", diagnosis.model_dump())
+        logger.info("[%s] Diagnosis: primary=%s confidence=%s",
+                     instance_id, diagnosis.primary.type.value, diagnosis.primary.confidence.value)
+
+        # Build diagnosis prompt for CD branch
+        diag_text = _render_diagnosis_prompt(diagnosis)
 
         # ═══════ Compression ═══════
         compressed_messages = compress_messages(
@@ -315,7 +342,7 @@ def run_experiment(
                 checkpoint_messages=compressed_messages,
                 base_commit=base_commit, task=task,
                 r1_n_calls=r1.n_calls, r1_cost=r1.cost,
-                failure_witness=fw, diagnosis=diag, mode="condiag",
+                failure_witness=fw, diagnosis=diag_text, mode="condiag",
                 protocol_config=revision_config,
                 workspace_snapshot=r1_snapshot,
             )
@@ -495,6 +522,35 @@ def _write_comparison(inst_dir: Path, out: ComparisonOutput):
     p = inst_dir / "comparison.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(out.to_dict(), indent=2))
+
+
+def _render_diagnosis_prompt(diagnosis) -> str:
+    """Render a DiagnosisResult into a natural-language prompt for CD branch."""
+    from condiag.diagnosis.taxonomy import ContextDeficiencyType
+    parts = [
+        "## Diagnosis - Targeted Repair Guidance",
+        "",
+        "Your patch did not pass validation. Below is a structured analysis",
+        "of what the failure signals suggest about potentially missing context.",
+        "",
+        f"### Primary Deficiency: {diagnosis.primary.type.value}",
+        f"Confidence: {diagnosis.primary.confidence.value}",
+    ]
+    if diagnosis.primary.evidence:
+        parts.append("Evidence:")
+        for e in diagnosis.primary.evidence:
+            parts.append(f"  - {e}")
+    if diagnosis.secondary:
+        parts.append(f"\nSecondary considerations ({len(diagnosis.secondary)}):")
+        for s in diagnosis.secondary:
+            parts.append(f"  - {s.type.value} ({s.confidence.value})")
+    if diagnosis.rejected_assumptions:
+        parts.append("\nRejected assumptions:")
+        for r in diagnosis.rejected_assumptions:
+            parts.append(f"  - {r}")
+    parts.append("")
+    parts.append("Please investigate and revise your patch.")
+    return "\n".join(parts)
 
 
 def _get_git_commit() -> str:
