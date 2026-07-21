@@ -94,8 +94,27 @@ def _populate_test_log_from_fw(
             path = frame.get("file", "")
             # /testbed/... path is definitely repo; non-system relative paths are repo
             from condiag.diagnosis.signals.schema import StackFrame
+            from pathlib import PurePosixPath
+
+            path = frame.get("file", "") or ""
+            function = frame.get("function", frame.get("func", "")) or ""
+
             is_repo = "/testbed/" in path or not path.startswith(("/", "<"))
-            is_test = "/test" in path.lower() or "test_" in frame.get("function", "")
+
+            # Infer is_test: strip /testbed/ prefix, then check path components and function name
+            if "/testbed/" in path:
+                repo_path = path.split("/testbed/", 1)[1]
+            else:
+                repo_path = path
+            parts = [p.lower() for p in PurePosixPath(repo_path).parts]
+            filename = PurePosixPath(repo_path).name.lower()
+            is_test = (
+                any(part in {"test", "tests", "testing"} for part in parts[:-1])
+                or filename.startswith("test_")
+                or filename.endswith("_test.py")
+                or function.lower().startswith("test_")
+            )
+
             signals.stack_frames.append(
                 StackFrame(
                     file=path,

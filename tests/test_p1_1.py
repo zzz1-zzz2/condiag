@@ -123,7 +123,35 @@ class TestAbstentionBehavior:
             assert diagnosis.primary.type.value in text
 
 
-class TestLocalizationGuard:
+class TestTestFileClassification:
+    """Verify is_test_file is correctly inferred for various path patterns."""
+
+    def test_testbed_source_frame_is_not_test(self):
+        """/testbed/astropy/baseframe.py -> repo=True, test=False."""
+        fw = _make_fw(frames=[{"file": "/testbed/astropy/baseframe.py", "line": 42, "function": "transform_to"}])
+        b = build_failure_feature_bundle(failure_witness=fw)
+        assert len(b.test_log.stack_frames) == 1
+        f = b.test_log.stack_frames[0]
+        assert f.is_repo_frame is True
+        assert f.is_test_file is False, f"{f.file} should NOT be a test file"
+
+    def test_testbed_test_frame_is_test(self):
+        """/testbed/astropy/tests/test_baseframe.py -> repo=True, test=True."""
+        fw = _make_fw(frames=[{"file": "/testbed/astropy/tests/test_baseframe.py", "line": 42, "function": "test_something"}])
+        b = build_failure_feature_bundle(failure_witness=fw)
+        assert len(b.test_log.stack_frames) == 1
+        f = b.test_log.stack_frames[0]
+        assert f.is_repo_frame is True
+        assert f.is_test_file is True, f"{f.file} should be a test file"
+
+    def test_external_system_frame_is_not_repo(self):
+        """/usr/lib/python/os.py -> repo=False, test=False."""
+        fw = _make_fw(frames=[{"file": "/usr/lib/python3.9/os.py", "line": 99, "function": "walk"}])
+        b = build_failure_feature_bundle(failure_witness=fw)
+        assert len(b.test_log.stack_frames) == 1
+        f = b.test_log.stack_frames[0]
+        assert f.is_repo_frame is False
+        assert f.is_test_file is False
     def test_all_test_frames_does_not_trigger_localization(self):
         """If all stack frames are test files, localization must not trigger."""
         from condiag.diagnosis.signals.schema import StackFrame
