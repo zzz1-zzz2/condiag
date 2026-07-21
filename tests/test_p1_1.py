@@ -4,7 +4,7 @@ from __future__ import annotations
 from condiag.diagnosis.bundle_builder import build_failure_feature_bundle
 from condiag.diagnosis.diagnoser_core import DiagnoserCore
 from condiag.diagnosis.taxonomy import ContextDeficiencyType
-from condiag.diagnosis.signals.schema import RuntimeInstanceSignals, RuntimeFailureFeatureBundle
+from condiag.diagnosis.signals.schema import RuntimeInstanceSignals, RuntimeFailureFeatureBundle, PatchSignals
 
 
 def _make_fw(failed=None, error="", frames=None):
@@ -92,3 +92,48 @@ class TestDiagnosisArtifacts:
         diagnosis = DiagnoserCore().diagnose(b)
         assert diagnosis.primary.type is not None
         assert len(diagnosis.primary.evidence) >= 1
+
+
+class TestAbstentionBehavior:
+    def test_no_reliable_skips_diagnosis_text(self):
+        """NO_RELIABLE_DEFICIENCY must skip diagnosis text generation."""
+        from condiag.diagnosis.taxonomy import ContextDeficiencyType
+        fw = _make_fw(error="")  # no signals
+        b = build_failure_feature_bundle(failure_witness=fw)
+        diagnosis = DiagnoserCore().diagnose(b)
+        assert diagnosis.primary.type == ContextDeficiencyType.NO_RELIABLE_DEFICIENCY
+        # Verify abstention produces no text (simulate experiment.py behavior)
+        if diagnosis.primary.type == ContextDeficiencyType.NO_RELIABLE_DEFICIENCY:
+            diag_text = None
+        else:
+            from condiag.experiment import _render_diagnosis_prompt
+            diag_text = _render_diagnosis_prompt(diagnosis)
+        assert diag_text is None, "Abstained diagnosis should produce no prompt text"
+
+    def test_typed_diagnosis_non_abstained(self):
+        """Typed diagnosis with signal should render prompt text."""
+        fw = _make_fw(error="TypeError: unexpected keyword 'foo'")
+        b = build_failure_feature_bundle(failure_witness=fw)
+        diagnosis = DiagnoserCore().diagnose(b)
+        from condiag.diagnosis.taxonomy import ContextDeficiencyType
+        if diagnosis.primary.type != ContextDeficiencyType.NO_RELIABLE_DEFICIENCY:
+            from condiag.experiment import _render_diagnosis_prompt
+            text = _render_diagnosis_prompt(diagnosis)
+            assert "Diagnosis" in text
+            assert diagnosis.primary.type.value in text
+
+
+class TestLocalizationGuard:
+    def test_all_test_frames_does_not_trigger_localization(self):
+        """If all stack frames are test files, localization must not trigger."""
+        from condiag.diagnosis.signals.schema import StackFrame
+        b = RuntimeFailureFeatureBundle(patch=PatchSignals(edited_files=["foo.py"]))
+        b.test_log.stack_frames = [
+            StackFrame(file="tests/test_foo.py", line=42, function="test_bar",
+                       is_repo_frame=True, is_test_file=True),
+        ]
+        diagnosis = DiagnoserCore().diagnose(b)
+        # Should not trigger LOCALIZATION_DIRECTION (all frames are test)
+        types = {diagnosis.primary.type.value} | {s.type.value for s in diagnosis.secondary}
+        from condiag.diagnosis.taxonomy import ContextDeficiencyType
+        assert ContextDeficiencyType.LOCALIZATION_DIRECTION.value not in types

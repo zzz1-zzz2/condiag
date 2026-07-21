@@ -269,11 +269,18 @@ def run_experiment(
         diagnosis = None
         diag_text = None
         if run_cd:
+            from condiag.diagnosis.taxonomy import ContextDeficiencyType
             diagnosis = DiagnoserCore().diagnose(bundle)
             _write_json(inst_dir / "cd" / "diagnosis.json", diagnosis.model_dump())
             logger.info("[%s] Diagnosis: primary=%s confidence=%s",
                          instance_id, diagnosis.primary.type.value, diagnosis.primary.confidence.value)
-            diag_text = _render_diagnosis_prompt(diagnosis)
+            # Behavioral abstention: NO_RELIABLE_DEFICIENCY -> skip diagnosis injection
+            if diagnosis.primary.type == ContextDeficiencyType.NO_RELIABLE_DEFICIENCY:
+                diag_text = None
+                logger.info("[%s] Diagnosis abstained (NO_RELIABLE_DEFICIENCY)", instance_id)
+            else:
+                diag_text = _render_diagnosis_prompt(diagnosis)
+            out.cd["diagnosis_abstained"] = (diag_text is None)
 
         # ═══════ Compression ═══════
         compressed_messages = compress_messages(

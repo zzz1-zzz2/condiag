@@ -120,7 +120,7 @@ class DiagnoserCore:
             error_files_short = {f.split("/")[-1] for f in error_files}
             edit_files_short = {f.split("/")[-1] for f in edit_files}
             overlap = edit_files_short & error_files_short
-            if len(overlap) == 0:
+            if error_files and len(overlap) == 0:
                 key_loc = "; ".join(list(error_files)[:3])
                 findings.append(DeficiencyFinding(
                     type=ContextDeficiencyType.LOCALIZATION_DIRECTION,

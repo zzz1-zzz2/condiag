@@ -95,12 +95,14 @@ def _populate_test_log_from_fw(
             # /testbed/... path is definitely repo; non-system relative paths are repo
             from condiag.diagnosis.signals.schema import StackFrame
             is_repo = "/testbed/" in path or not path.startswith(("/", "<"))
+            is_test = "/test" in path.lower() or "test_" in frame.get("function", "")
             signals.stack_frames.append(
                 StackFrame(
                     file=path,
                     line=frame.get("line", 0),
                     function=frame.get("function", frame.get("func", "")),
                     is_repo_frame=is_repo,
+                    is_test_file=is_test,
                 )
             )
 
