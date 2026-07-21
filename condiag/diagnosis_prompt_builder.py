@@ -1,5 +1,8 @@
 """ConDiag v4 Diagnosis Prompt Builder.
 
+⚠️ FROZEN (2026-07-19): v4 soft diagnosis prompt. Replaced by the new
+`condiag/diagnosis/` module (AAAI direction). Do NOT modify.
+
 Pure rule extraction + template filling.
 No semantic inference, no LLM calls, no CDType classification.
 """

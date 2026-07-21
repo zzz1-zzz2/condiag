@@ -1,7 +1,7 @@
 """Build a RuntimeFailureFeatureBundle from available episode data.
 
 Standard entry point for the Diagnoser's input.
-Multi-source fusion: parsed test log + FailureWitness → merged TestLogSignals.
+Multi-source fusion: parsed test log + FailureWitness -> merged TestLogSignals.
 """
 from __future__ import annotations
 
@@ -10,11 +10,9 @@ from typing import Any
 
 from condiag.diagnosis.signals.frame_normalizer import normalize_frame
 from condiag.diagnosis.signals.schema import (
-    PatchSignals,
     RuntimeFailureFeatureBundle,
     RuntimeInstanceSignals,
     TestLogSignals,
-    TrajectorySignals,
 )
 
 logger = logging.getLogger("condiag.diagnosis.bundle_builder")
@@ -31,35 +29,29 @@ def build_failure_feature_bundle(
     """Construct a RuntimeFailureFeatureBundle from all available episode data.
 
     Multi-source fusion: parsed test_log (if available) is the primary source,
-    FailureWitness fills in gaps and deduplicates.
-
-    Returns:
-        RuntimeFailureFeatureBundle ready for DiagnoserCore.diagnose().
+    FailureWitness fills in gaps and adds non-duplicate evidence.
     """
     bundle = RuntimeFailureFeatureBundle()
 
-    # ── Test log signals: fusion of parsed + FW ──────────────
+    # Test log signals: fusion of parsed + FW
     _merge_test_log_signals(bundle.test_log, test_log, failure_witness)
 
-    # ── Patch signals ────────────────────────────────────────
+    # Patch signals
     patch_text = evaluation_patch or workspace_patch or ""
     if patch_text.strip():
         from condiag.diagnosis.signals.patch_extractor import extract_patch_signals
         bundle.patch = extract_patch_signals(patch_text)
 
-    # ── Trajectory signals ───────────────────────────────────
+    # Trajectory signals
     if trajectory:
         from condiag.diagnosis.signals.trajectory_extractor import extract_trajectory_signals
         bundle.trajectory = extract_trajectory_signals(trajectory)
 
-    # ── Instance signals (runtime-safe) ──────────────────────
+    # Instance signals (runtime-safe)
     if instance_spec:
         _populate_instance_signals(bundle.instance, instance_spec)
 
     return bundle
-
-
-# ─── Fusion: parsed test log + FailureWitness ──────────────────────
 
 
 def _merge_test_log_signals(
@@ -70,9 +62,12 @@ def _merge_test_log_signals(
     """Merge parsed test log signals with FailureWitness data.
 
     Rules:
-      - parsed is the primary source (more detailed)
-      - FW fills in gaps where parsed is empty
-      - Stack frames are deduplicated by (file, line, function)
+      - Parsed is primary source; its stack_frames/build_frames are kept.
+      - FW fills in gaps (missing failed_tests, error messages).
+      - Stack frames deduplicated using NORMALIZED repo-relative path key
+        (both /testbed/pkg/x.py and pkg/x.py -> key = "pkg/x.py").
+      - Error types only counted for NEW error evidence (not already in parsed).
+      - Failed tests: stable union (order preserved, duplicates removed).
     """
     if parsed is not None:
         target.framework = parsed.framework
@@ -84,8 +79,10 @@ def _merge_test_log_signals(
         target.first_error_message = parsed.first_error_message
         target.failure_assertions = list(parsed.failure_assertions)
         target.call_chains = list(parsed.call_chains)
+        # Critical: copy parsed stack frames and build frames
+        target.stack_frames = list(parsed.stack_frames)
+        target.build_frames = list(parsed.build_frames)
 
-    # FW as fallback/supplement
     if fw is None:
         return
 
@@ -93,36 +90,43 @@ def _merge_test_log_signals(
     fw_error = fw.get("error_message") or ""
     fw_frames = fw.get("stack_frames") or []
 
-    # Fill failed tests
-    if not target.failed_tests and fw_failed:
-        target.failed_tests = list(fw_failed)
+    # Failed tests: stable union (preserve order, remove duplicates)
+    seen_failed = set(str(t) for t in target.failed_tests)
+    for t in fw_failed:
+        s = str(t)
+        if s not in seen_failed:
+            seen_failed.add(s)
+            target.failed_tests.append(s)
 
-    # Fill error messages
+    # Error messages: only count types for genuinely NEW evidence
     if fw_error:
         if not target.first_error_message:
             target.first_error_message = fw_error
         if fw_error not in target.error_messages:
             target.error_messages.append(fw_error)
+            for etype_name in ("TypeError", "AssertionError", "AttributeError", "ValueError", "ImportError"):
+                if etype_name in fw_error:
+                    target.error_types[etype_name] = target.error_types.get(etype_name, 0) + 1
 
-        for etype_name in ("TypeError", "AssertionError", "AttributeError", "ValueError", "ImportError"):
-            if etype_name in fw_error:
-                target.error_types[etype_name] = target.error_types.get(etype_name, 0) + 1
+    # Stack frames: dedup using repo-relative path (normalized)
+    existing = set()
+    for f in target.stack_frames:
+        path = f.file
+        if "/testbed/" in path:
+            path = path.split("/testbed/", 1)[1]
+        existing.add((path, f.line, f.function))
 
-    # Fill stack frames (deduplicated)
-    existing_keys = {(f.file, f.line, f.function) for f in target.stack_frames}
     for raw_frame in fw_frames:
         if not isinstance(raw_frame, dict):
             continue
         path = raw_frame.get("file", "") or ""
         func = raw_frame.get("function", raw_frame.get("func", "")) or ""
         line = raw_frame.get("line", 0)
-        key = (path, line, func)
-        if key not in existing_keys:
-            existing_keys.add(key)
-            target.stack_frames.append(normalize_frame(path, line, func))
-
-
-# ─── Instance signals ──────────────────────────────────────────────
+        nf = normalize_frame(path, line, func)
+        key = (nf.file, nf.line, nf.function)
+        if key not in existing:
+            existing.add(key)
+            target.stack_frames.append(nf)
 
 
 def _populate_instance_signals(
@@ -134,7 +138,6 @@ def _populate_instance_signals(
         if isinstance(instance_spec, dict):
             return instance_spec.get(key, default)
         return getattr(instance_spec, key, default)
-
     signals.instance_id = _get("instance_id")
     signals.repo = _get("repo")
     signals.base_commit = _get("base_commit")

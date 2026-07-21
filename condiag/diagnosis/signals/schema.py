@@ -155,9 +155,12 @@ class TrajectorySignals(BaseModel):
     format_error_count: int = 0
     tool_type_counts: dict[str, int] = Field(default_factory=dict)
     viewed_files: list[str] = Field(default_factory=list)
+    file_view_counts: dict[str, int] = Field(default_factory=dict)
     bash_commands_run: int = 0
     test_commands_run: int = 0
     exploration_concentration: float = 0.0
+    # P1-1 compat: kept for backward compatibility with old bundles
+    iteration_signal: str = "normal_exploring"
 
 
 # ════════════════════════════════════════════════════════════════════

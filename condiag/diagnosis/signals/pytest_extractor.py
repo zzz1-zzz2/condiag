@@ -204,17 +204,23 @@ def _extract_errors(signals: TestLogSignals, lines: list[str]) -> None:
             error_type_counts[etype] = error_type_counts.get(etype, 0) + 1
             if not signals.first_error_message:
                 signals.first_error_message = f"{etype}: {msg}"
+                full_msg = f"{etype}: {msg}"
+                if full_msg not in signals.error_messages:
+                    signals.error_messages.append(full_msg)
             signals.error_messages.append(f"{etype}: {msg}")
             continue
 
         # Fallback: also match error message in summary lines
         m = _RE_ERROR_GENERIC.search(stripped)
-        if m and "FAILURES" not in stripped and "Error" not in stripped:
+        if m and "FAILURES" not in stripped:
             etype = m.group(1)
             msg = m.group(2) or ""
             error_type_counts[etype] = error_type_counts.get(etype, 0) + 1
             if not signals.first_error_message:
                 signals.first_error_message = f"{etype}: {msg}"
+                full_msg = f"{etype}: {msg}"
+                if full_msg not in signals.error_messages:
+                    signals.error_messages.append(full_msg)
 
         # Assertion detail lines: >       cirsnod = inod.transform_to(cframe1)
         if _RE_ASSERTION_LINE.search(stripped):
@@ -235,12 +241,16 @@ def _extract_call_chains(signals: TestLogSignals) -> None:
     if not signals.stack_frames:
         return
 
-    # A simpler heuristic: if there are N failed tests, we try to distribute
-    # frames proportionally. This is imperfect but better than a flat list.
-    # For now, store the full frame list — call chain segmentation is a
-    # future improvement when we have more test_log samples.
-    # signals.call_chains = [signals.stack_frames]  # single chain
-    pass  # Reserved for Phase 2 improvement
+    n_failed = max(len(signals.failed_tests), 1)
+    total = len(signals.stack_frames)
+    per_chain = total // n_failed if n_failed > 0 else total
+    remainder = total % n_failed
+    idx = 0
+    for i in range(n_failed):
+        size = per_chain + (1 if i < remainder else 0)
+        chain = list(signals.stack_frames[idx:idx + size])
+        signals.call_chains.append(chain)
+        idx += size
 
 
 # ── Helpers ──────────────────────────────────────────────────────────

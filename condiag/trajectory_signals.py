@@ -1,5 +1,9 @@
 """Trajectory Signals — extract diagnostic signals from mini-SWE-agent trajectories.
 
+⚠️ FROZEN (2026-07-19): This module is from the v2/v4 architecture.
+Useful runtime signal extraction logic will be migrated to `condiag/diagnosis/signals/`.
+Do NOT modify. For the new AAAI direction, see `docs/research_baseline.md`.
+
 Two output namespaces:
   - runtime_signals: signals visible at runtime (enter contract / agent input)
   - oracle_audit:    gold-based signals (eval-only, NOT for runtime/contract)
