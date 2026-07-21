@@ -42,6 +42,11 @@ class ComparisonOutput:
     fairness_ok: bool = False
     sf_preflight_sha: str = ""
     cd_preflight_sha: str = ""
+    # Diagnosis
+    diagnosis_abstained: bool | None = None
+    diagnosis_type: str = ""
+    diagnosis_confidence: str = ""
+    intervention_applied: bool = False
     # R1
     r1_messages_sha: str = ""
     r1_preflight_workspace_sha: str = ""
@@ -275,12 +280,15 @@ def run_experiment(
             logger.info("[%s] Diagnosis: primary=%s confidence=%s",
                          instance_id, diagnosis.primary.type.value, diagnosis.primary.confidence.value)
             # Behavioral abstention: NO_RELIABLE_DEFICIENCY -> skip diagnosis injection
-            if diagnosis.primary.type == ContextDeficiencyType.NO_RELIABLE_DEFICIENCY:
-                diag_text = None
+            abstained = (diagnosis.primary.type == ContextDeficiencyType.NO_RELIABLE_DEFICIENCY)
+            diag_text = None if abstained else _render_diagnosis_prompt(diagnosis)
+            if abstained:
                 logger.info("[%s] Diagnosis abstained (NO_RELIABLE_DEFICIENCY)", instance_id)
-            else:
-                diag_text = _render_diagnosis_prompt(diagnosis)
-            out.cd["diagnosis_abstained"] = (diag_text is None)
+            # Save diagnosis stats to ComparisonOutput (not out.cd - that gets overwritten)
+            out.diagnosis_abstained = abstained
+            out.diagnosis_type = diagnosis.primary.type.value
+            out.diagnosis_confidence = diagnosis.primary.confidence.value
+            out.intervention_applied = not abstained
 
         # ═══════ Compression ═══════
         compressed_messages = compress_messages(

@@ -99,7 +99,7 @@ def _populate_test_log_from_fw(
             path = frame.get("file", "") or ""
             function = frame.get("function", frame.get("func", "")) or ""
 
-            is_repo = "/testbed/" in path or not path.startswith(("/", "<"))
+            is_repo = bool(path) and ("/testbed/" in path or not path.startswith(("/", "<")))
 
             # Infer is_test: strip /testbed/ prefix, then check path components and function name
             if "/testbed/" in path:
