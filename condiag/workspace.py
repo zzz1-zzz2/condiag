@@ -171,8 +171,6 @@ def archive_untracked_files(agent: Any, snapshot_dir: Path) -> str:
     rc, _ = _exec(agent, f"cd /testbed && bash -o pipefail -c {shlex.quote(archive_script)} 2>&1")
     if rc != 0:
         return ""
-    if rc != 0:
-        return ""
 
     # Copy out
     import subprocess

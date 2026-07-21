@@ -157,6 +157,22 @@ def run_experiment(
             out.verdict = "r1_not_submitted"
             return out
 
+        # ═══════ P0-4a: Patch Integrity Gate (R1) ═══════
+        from condiag.integrity import check_patch_integrity
+        r1_integrity = check_patch_integrity(
+            termination_reason=r1.termination_reason,
+            agent_submission=r1.agent_submission,
+            workspace_patch=r1.patch_text,
+            evaluation_patch=r1.evaluation_patch,
+        )
+        _write_json(inst_dir / "round1" / "integrity_report.json", r1_integrity.to_dict())
+        logger.info("[%s] R1 integrity: ok=%s status=%s",
+                     instance_id, r1_integrity.ok, r1_integrity.status)
+        if not r1_integrity.ok:
+            logger.info("[%s] R1 patch failed integrity — episode invalid", instance_id)
+            out.verdict = f"invalid_r1_patch:{r1_integrity.status}"
+            return out
+
         # ═══════ Official eval R1 ═══════
         logger.info("[%s] Eval R1 patch", instance_id)
         r1_eval = harness.evaluate(instance_spec, model_patch=r1.evaluation_patch,
@@ -240,11 +256,29 @@ def run_experiment(
         _write_patch(inst_dir / "sf" / "patch.diff", sf.patch_text)
         _write_patch(inst_dir / "sf" / "final_evaluation.patch", sf.final_evaluation_patch)
         _write_trajectory(inst_dir / "sf" / "trajectory.json", sf.trajectory)
-        if sf.termination_reason == "submitted":
+
+        # P0-4a: SF integrity gate
+        sf_integrity = check_patch_integrity(
+            termination_reason=sf.termination_reason,
+            agent_submission=getattr(sf, "agent_submission", None),
+            workspace_patch=sf.patch_text,
+            evaluation_patch=sf.final_evaluation_patch,
+        )
+        _write_json(inst_dir / "sf" / "integrity_report.json", sf_integrity.to_dict())
+        # Save P0-3 SF artifacts
+        if getattr(sf, "agent_submission", None):
+            _write_json(inst_dir / "sf" / "agent_submission.json",
+                        sf.agent_submission.to_dict())
+        _write_patch(inst_dir / "sf" / "agent_submitted.patch",
+                     getattr(sf.agent_submission, "selected_patch", "") or sf.patch_text)
+        _write_patch(inst_dir / "sf" / "workspace.patch", sf.patch_text)
+
+        if sf_integrity.ok and sf.termination_reason == "submitted":
             _eval_and_save(harness, instance_spec, sf.final_evaluation_patch, inst_dir / "sf" / "harness_eval.json",
                            "sf", sf)
         else:
-            logger.info("[%s] SF not submitted (%s) — skip eval", instance_id, sf.termination_reason)
+            logger.info("[%s] SF not submitted or invalid (%s) — skip eval",
+                        instance_id, sf_integrity.status)
         out.sf = asdict_skip(sf, ["messages", "trajectory"])
         out.sf_messages_sha = _sha([m for m in sf.messages if m.get("role") != "exit"])
         out.sf_resolved = (sf.termination_reason == "submitted" and
@@ -266,11 +300,28 @@ def run_experiment(
             _write_patch(inst_dir / "cd" / "patch.diff", cd.patch_text)
             _write_patch(inst_dir / "cd" / "final_evaluation.patch", cd.final_evaluation_patch)
             _write_trajectory(inst_dir / "cd" / "trajectory.json", cd.trajectory)
-            if cd.termination_reason == "submitted":
+
+            # P0-4a: CD integrity gate
+            cd_integrity = check_patch_integrity(
+                termination_reason=cd.termination_reason,
+                agent_submission=getattr(cd, "agent_submission", None),
+                workspace_patch=cd.patch_text,
+                evaluation_patch=cd.final_evaluation_patch,
+            )
+            _write_json(inst_dir / "cd" / "integrity_report.json", cd_integrity.to_dict())
+            if getattr(cd, "agent_submission", None):
+                _write_json(inst_dir / "cd" / "agent_submission.json",
+                            cd.agent_submission.to_dict())
+            _write_patch(inst_dir / "cd" / "agent_submitted.patch",
+                         getattr(cd.agent_submission, "selected_patch", "") or cd.patch_text)
+            _write_patch(inst_dir / "cd" / "workspace.patch", cd.patch_text)
+
+            if cd_integrity.ok and cd.termination_reason == "submitted":
                 _eval_and_save(harness, instance_spec, cd.final_evaluation_patch, inst_dir / "cd" / "harness_eval.json",
                                "cd", cd)
             else:
-                logger.info("[%s] CD not submitted (%s) — skip eval", instance_id, cd.termination_reason)
+                logger.info("[%s] CD not submitted or invalid (%s) — skip eval",
+                            instance_id, cd_integrity.status)
             out.cd = asdict_skip(cd, ["messages", "trajectory"])
             out.cd_messages_sha = _sha([m for m in cd.messages if m.get("role") != "exit"])
             out.cd_resolved = (cd.termination_reason == "submitted" and
