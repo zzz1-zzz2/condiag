@@ -117,6 +117,20 @@ class TestBranchBuilderOrder:
         assert len(c1) == 1 and c1[0]["content"] == "real1"
         assert len(c2) == 1 and c2[0]["content"] == "real2"
 
+    def test_duplicate_call_id_across_sources_gets_one_synthetic(self):
+        """Same ID in tool_calls + extra.actions must dedup to one synthetic."""
+        msgs = [{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "function": {"name": "bash", "arguments": "{}"}}],
+            "extra": {"actions": [{"tool_call_id": "c1"}]},
+        }]
+        result = build_branch_messages(msgs, failure_witness=None)
+        c1_responses = [m for m in result
+                        if m.get("role") == "tool" and m.get("tool_call_id") == "c1"]
+        assert len(c1_responses) == 1, \
+            f"Expected 1 c1 response, got {len(c1_responses)}"
+
 
 class TestTrajectoryNoIDDedup:
     """Anonymous tool calls must dedup by content, not just by source:type."""

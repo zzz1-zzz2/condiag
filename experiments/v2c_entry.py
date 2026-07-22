@@ -56,10 +56,6 @@ def run_single(instance_id: str, args: argparse.Namespace) -> dict:
     rev_config = RevisionProtocolConfig()
     agent_factory = build_agent_factory(config, instance_id)
 
-    # TODO(P1-5): Replace with condiag.diagnosis.diagnoser_core.DiagnoserCore
-    from condiag.diagnosis_prompt_builder import DiagnosisPromptBuilder
-    diagnosis_builder_cls = None if args.no_condiag else DiagnosisPromptBuilder
-
     result = run_experiment(
         instance_id=instance_id,
         agent_factory=agent_factory,
@@ -67,7 +63,6 @@ def run_single(instance_id: str, args: argparse.Namespace) -> dict:
         checkpointer=checkpointer,
         output_dir=V2C_ARTIFACTS,
         instance_spec=spec,
-        diagnosis_builder_cls=diagnosis_builder_cls,
         run_cd=(not args.no_condiag),
         agent_config=config,
         revision_config=rev_config,

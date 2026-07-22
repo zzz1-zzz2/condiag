@@ -105,7 +105,12 @@ def _flush_turn(
 
 
 def _collect_call_ids(msg: dict) -> list[str]:
-    """Extract tool_call_ids from both top-level tool_calls and extra.actions."""
+    """Extract tool_call_ids from both top-level tool_calls and extra.actions.
+
+    Deduplicates by ID (preserving first occurrence order). The same call
+    can be represented in both tool_calls and extra.actions, so we must
+    not generate duplicate synthetic responses for the same ID.
+    """
     ids = []
     for tc in msg.get("tool_calls") or []:
         if isinstance(tc, dict):
@@ -113,7 +118,8 @@ def _collect_call_ids(msg: dict) -> list[str]:
     for act in (msg.get("extra") or {}).get("actions", []) or []:
         if isinstance(act, dict):
             ids.append(act.get("tool_call_id") or "")
-    return [t for t in ids if t]
+    # Dedupe, preserve order
+    return list(dict.fromkeys(t for t in ids if t))
 
 
 def _format_fw(fw: dict) -> str:
