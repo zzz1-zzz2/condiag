@@ -51,10 +51,15 @@ def build_branch_messages(
                 if rm.get("role") == "tool" and rm.get("tool_call_id"):
                     seen_tool_ids.add(rm.get("tool_call_id"))
         elif role == "tool":
+            # CRITICAL: flush pending assistant BEFORE adding tool to result
+            # Otherwise the order is [tool, assistant] violating tool protocol
+            if pending_assistant is not None:
+                _flush_turn(result, pending_assistant, pending_call_ids, seen_tool_ids)
+                pending_assistant = None
+                pending_call_ids = []
             tid = m.get("tool_call_id", "")
             if tid:
                 seen_tool_ids.add(tid)
-            # If we have a pending assistant, add this tool to it
             result.append(m)
         else:
             # Flush any pending assistant first

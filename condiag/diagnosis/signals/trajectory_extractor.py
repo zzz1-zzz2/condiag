@@ -25,15 +25,33 @@ def _repo_path(fp: str) -> str:
     return fp
 
 
-def _tool_event_key(event_id: str, name: str, source: str) -> str:
+def _tool_event_key(
+    event_id: str,
+    name: str,
+    source: str,
+    turn_index: int = 0,
+    arguments: Any = None,
+) -> str:
     """Generate a canonical key for a tool event across tool_calls and actions.
 
-    If event_id is non-empty, use it. Otherwise produce a content-based hash
-    using (source_type, tool_name).
+    If event_id is non-empty, use it (same call dedup'd across tool_calls/actions).
+    Otherwise produce a content-based hash using (turn_index, source_type, tool_name,
+    normalized arguments). This ensures multiple anonymous calls are distinct
+    while a call replicated in both tool_calls and extra.actions dedupes.
     """
     if event_id:
         return f"evt:{event_id}"
-    return f"evt:{source}:{name}"
+    import json
+    canonical = json.dumps(
+        {
+            "turn": turn_index,
+            "source": source,
+            "name": name,
+            "args": arguments if arguments is not None else "",
+        },
+        sort_keys=True,
+    )
+    return "anon:" + hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def extract_trajectory_signals(trajectory: dict) -> TrajectorySignals:
@@ -51,6 +69,7 @@ def extract_trajectory_signals(trajectory: dict) -> TrajectorySignals:
     bash_command_count = 0
     test_command_count = 0
     seen_events: set[str] = set()  # canonical keys for dedup
+    turn_index = 0
 
     for msg in messages:
         role = msg.get("role", "")
@@ -59,6 +78,7 @@ def extract_trajectory_signals(trajectory: dict) -> TrajectorySignals:
             tc = msg.get("tool_calls") or []
             actions = (msg.get("extra") or {}).get("actions") or []
             signals.assistant_turn_count += 1
+            turn_index += 1
 
             # Collect command texts from arguments
             cmd_texts: list[str] = []
@@ -74,7 +94,7 @@ def extract_trajectory_signals(trajectory: dict) -> TrajectorySignals:
                     elif isinstance(args_raw, dict):
                         cmd_texts.append(str(args_raw))
                     eid = t.get("id", "") or t.get("tool_call_id", "")
-                    key = _tool_event_key(eid, name, "tc")
+                    key = _tool_event_key(eid, name, "tc", turn_index, args_raw)
                     if key not in seen_events:
                         seen_events.add(key)
                         tool_call_counter[name] += 1
@@ -87,7 +107,8 @@ def extract_trajectory_signals(trajectory: dict) -> TrajectorySignals:
                     if isinstance(act_cmd, str) and act_cmd.strip():
                         cmd_texts.append(act_cmd)
                     eid = act.get("id", "") or act.get("tool_call_id", "")
-                    key = _tool_event_key(eid, act_name, "act")
+                    # Use same canonical key as tool_calls for the same call
+                    key = _tool_event_key(eid, act_name, "tc", turn_index, act_cmd)
                     if key not in seen_events:
                         seen_events.add(key)
                         tool_call_counter[act_name] += 1
