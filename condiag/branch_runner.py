@@ -63,14 +63,15 @@ def restore_workspace(agent, snapshot, base_commit: str) -> RestoreResult:
         if not cid:
             return RestoreResult(ok=False, reason="no_container_id")
 
-        # Protection 1: Verify container HEAD
-        head_r = agent.env.execute({"command": "cd /testbed && git rev-parse HEAD 2>/dev/null"})
-        if head_r.get("returncode") != 0 or head_r.get("output", "").strip() != base_commit:
-            return RestoreResult(ok=False, reason=f"HEAD mismatch: expected {base_commit}")
-
-        # Protection 2: Clean workspace
+        # Protection 1: Clean workspace to base_commit FIRST
+        # (SWE-bench images may have HEAD at a different commit; we reset to known state)
         agent.env.execute({"command": f"cd /testbed && git reset --hard {base_commit} 2>/dev/null"})
         agent.env.execute({"command": "cd /testbed && git clean -fd 2>/dev/null"})
+
+        # Protection 2: Verify HEAD is now at base_commit
+        head_r = agent.env.execute({"command": "cd /testbed && git rev-parse HEAD 2>/dev/null"})
+        if head_r.get("returncode") != 0 or head_r.get("output", "").strip() != base_commit:
+            return RestoreResult(ok=False, reason=f"HEAD mismatch after reset: expected {base_commit}")
 
         if not snapshot or (not snapshot.tracked_diff and not snapshot.untracked_manifest):
             return RestoreResult(ok=True, workspace_sha="clean_base", reason="no_diff_or_untracked")
