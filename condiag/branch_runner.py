@@ -116,10 +116,10 @@ def restore_workspace(agent, snapshot, base_commit: str) -> RestoreResult:
         if not restored_cr.ok or restored_cr.snapshot is None:
             return RestoreResult(ok=False, reason=f"fingerprint failed after restore: {restored_cr.reason}")
 
-        if restored_cr.snapshot.workspace_state_sha != snapshot.workspace_state_sha:
+        if restored_cr.snapshot.tracked_diff_sha != snapshot.tracked_diff_sha:
             return RestoreResult(
                 ok=False,
-                reason=f"state SHA mismatch: {restored_cr.snapshot.workspace_state_sha} != {snapshot.workspace_state_sha}",
+                reason=f"tracked_diff SHA mismatch: {restored_cr.snapshot.tracked_diff_sha} != {snapshot.tracked_diff_sha}",
             )
 
         return RestoreResult(ok=True, workspace_sha=restored_cr.snapshot.workspace_state_sha)
