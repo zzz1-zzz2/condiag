@@ -1,6 +1,7 @@
 """Trajectory extractor — extract structured signals from agent trajectory."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from collections import Counter
@@ -24,6 +25,17 @@ def _repo_path(fp: str) -> str:
     return fp
 
 
+def _tool_event_key(event_id: str, name: str, source: str) -> str:
+    """Generate a canonical key for a tool event across tool_calls and actions.
+
+    If event_id is non-empty, use it. Otherwise produce a content-based hash
+    using (source_type, tool_name).
+    """
+    if event_id:
+        return f"evt:{event_id}"
+    return f"evt:{source}:{name}"
+
+
 def extract_trajectory_signals(trajectory: dict) -> TrajectorySignals:
     """Extract structured signals from a mini-SWE-agent trajectory dict.
 
@@ -38,7 +50,7 @@ def extract_trajectory_signals(trajectory: dict) -> TrajectorySignals:
     format_error_count = 0
     bash_command_count = 0
     test_command_count = 0
-    seen_tool_events: set[str] = set()
+    seen_events: set[str] = set()  # canonical keys for dedup
 
     for msg in messages:
         role = msg.get("role", "")
@@ -51,6 +63,7 @@ def extract_trajectory_signals(trajectory: dict) -> TrajectorySignals:
             # Collect command texts from arguments
             cmd_texts: list[str] = []
 
+            # Process tool_calls
             for t in tc:
                 fn = t.get("function", {}) if isinstance(t, dict) else {}
                 if isinstance(fn, dict):
@@ -60,19 +73,24 @@ def extract_trajectory_signals(trajectory: dict) -> TrajectorySignals:
                         cmd_texts.append(args_raw)
                     elif isinstance(args_raw, dict):
                         cmd_texts.append(str(args_raw))
-                    tool_call_counter[name] += 1
-                tid = t.get("id", "")
-                if tid:
-                    seen_tool_events.add(f"tc:{tid}")
+                    eid = t.get("id", "") or t.get("tool_call_id", "")
+                    key = _tool_event_key(eid, name, "tc")
+                    if key not in seen_events:
+                        seen_events.add(key)
+                        tool_call_counter[name] += 1
 
+            # Process extra.actions
             for act in actions:
                 if isinstance(act, dict):
-                    aid = act.get("id", "")
-                    if aid:
-                        seen_tool_events.add(f"act:{aid}")
-                    else:
-                        seen_tool_events.add(f"act:{hash(str(act)[:100])}")
-                    cmd_texts.append(act.get("command", act.get("arguments", "")))
+                    act_name = act.get("type", "bash")
+                    act_cmd = act.get("command", act.get("arguments", ""))
+                    if isinstance(act_cmd, str) and act_cmd.strip():
+                        cmd_texts.append(act_cmd)
+                    eid = act.get("id", "") or act.get("tool_call_id", "")
+                    key = _tool_event_key(eid, act_name, "act")
+                    if key not in seen_events:
+                        seen_events.add(key)
+                        tool_call_counter[act_name] += 1
 
             # Extract viewed files from command arguments
             for txt in cmd_texts:
@@ -105,14 +123,8 @@ def extract_trajectory_signals(trajectory: dict) -> TrajectorySignals:
             if "No tool calls found" in content or "Error parsing tool call" in content:
                 format_error_count += 1
 
-    # Compute total tool calls after loop (using deduplicated IDs)
-    if seen_tool_events:
-        signals.total_tool_calls = len(seen_tool_events)
-    else:
-        signals.total_tool_calls = sum(
-            len(m.get("tool_calls") or []) + len((m.get("extra") or {}).get("actions") or [])
-            for m in messages if m.get("role") == "assistant"
-        )
+    # Total unique events
+    signals.total_tool_calls = len(seen_events)
 
     signals.format_error_count = format_error_count
     signals.tool_type_counts = dict(tool_call_counter)

@@ -15,52 +15,82 @@ def build_branch_messages(
 
     Given R1 checkpoint messages, produces:
       R1 messages (deep-copied)
-      + tool response (if last assistant has tool_calls and no tool response follows)
+      + synthetic tool responses for any ASSISTANT with missing responses
+        (inserted immediately after their assistant, not at end of list)
       + FailureWitness (user message)
       + [Diagnosis (user message, ConDiag only)]
 
-    Args:
-        checkpoint_messages: R1 messages (exit roles already stripped).
-        failure_witness: FW dict (None = skip FW, for testing).
-        diagnosis: Diagnosis prompt string (None or "" = skip, ConDiag only).
-        style: "stateful_feedback" (FW only) or "condiag" (FW + diagnosis).
-
-    Returns:
-        Message list ready for Round 2 agent.step().
+    This function repairs ALL incomplete turns, not just the last one.
+    Each missing tool response is inserted right after its assistant,
+    preserving the tool_call chain order for the API.
     """
     msgs = deepcopy(checkpoint_messages)
 
-    # Clean exit roles just in case
+    # Clean exit roles
     msgs = [m for m in msgs if m.get("role") != "exit"]
 
-    # 1. Inject tool response for the LAST assistant message with tool_calls
-    #    if no tool response already exists for that call.
-    for i in range(len(msgs) - 1, -1, -1):
-        prev = msgs[i]
-        if prev.get("role") != "assistant":
-            continue
-        # Collect tool_call_ids from top-level tool_calls and extra.actions
-        call_ids = _collect_call_ids(prev)
-        if not call_ids:
-            continue
-        # Check which IDs already have responses
-        existing = {m.get("tool_call_id") for m in msgs if m.get("role") == "tool"}
-        missing = [tid for tid in call_ids if tid and tid not in existing]
-        for tid in missing:
-            msgs.append({"role": "tool", "tool_call_id": tid,
-                          "content": "(output)"})
-        if missing:
-            break  # only process the last assistant with missing responses
+    # Build result by processing turns in order
+    result: list[dict] = []
+    pending_assistant = None
+    pending_call_ids: list[str] = []
+    seen_tool_ids: set[str] = set()
+
+    for m in msgs:
+        role = m.get("role", "")
+
+        if role == "assistant":
+            # If we have a pending assistant, flush it (checking for missed tools)
+            if pending_assistant is not None:
+                _flush_turn(result, pending_assistant, pending_call_ids, seen_tool_ids)
+                pending_call_ids = []
+            pending_assistant = m
+            # Collect call IDs from both tool_calls and extra.actions
+            pending_call_ids = _collect_call_ids(m)
+            # Also track any IDs seen so far in the result
+            for rm in result:
+                if rm.get("role") == "tool" and rm.get("tool_call_id"):
+                    seen_tool_ids.add(rm.get("tool_call_id"))
+        elif role == "tool":
+            tid = m.get("tool_call_id", "")
+            if tid:
+                seen_tool_ids.add(tid)
+            # If we have a pending assistant, add this tool to it
+            result.append(m)
+        else:
+            # Flush any pending assistant first
+            if pending_assistant is not None:
+                _flush_turn(result, pending_assistant, pending_call_ids, seen_tool_ids)
+                pending_assistant = None
+                pending_call_ids = []
+            result.append(m)
+
+    # Flush final pending assistant
+    if pending_assistant is not None:
+        _flush_turn(result, pending_assistant, pending_call_ids, seen_tool_ids)
 
     # 2. Inject FailureWitness
     if failure_witness:
-        msgs.append({"role": "user", "content": _format_fw(failure_witness)})
+        result.append({"role": "user", "content": _format_fw(failure_witness)})
 
     # 3. Inject Diagnosis (ConDiag only)
     if style == "condiag" and diagnosis:
-        msgs.append({"role": "user", "content": diagnosis})
+        result.append({"role": "user", "content": diagnosis})
 
-    return msgs
+    return result
+
+
+def _flush_turn(
+    result: list[dict],
+    assistant: dict,
+    call_ids: list[str],
+    seen_ids: set[str],
+) -> None:
+    """Append the assistant message and any missing synthetic tool responses."""
+    result.append(assistant)
+    for tid in call_ids:
+        if tid and tid not in seen_ids:
+            seen_ids.add(tid)
+            result.append({"role": "tool", "tool_call_id": tid, "content": "(output)"})
 
 
 def _collect_call_ids(msg: dict) -> list[str]:
