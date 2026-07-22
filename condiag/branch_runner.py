@@ -155,12 +155,12 @@ def restore_workspace(agent, snapshot, base_commit: str,
                 )
                 return restore
 
-            r2 = agent.env.execute({"command": "cd /testbed && git apply --check /tmp/restore.patch 2>&1"})
+            r2 = agent.env.execute({"command": "cd /testbed && git apply --check --index /tmp/restore.patch 2>&1"})
             if r2.get("returncode") != 0:
                 restore.reason = "git apply --check failed for tracked diff"
                 return restore
 
-            r3 = agent.env.execute({"command": "cd /testbed && git apply --whitespace=nowarn /tmp/restore.patch 2>&1"})
+            r3 = agent.env.execute({"command": "cd /testbed && git apply --whitespace=nowarn --index /tmp/restore.patch 2>&1"})
             if r3.get("returncode") != 0:
                 restore.reason = "git apply failed for tracked diff"
                 return restore
