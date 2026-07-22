@@ -42,6 +42,8 @@ class ComparisonOutput:
     fairness_ok: bool = False
     sf_preflight_sha: str = ""
     cd_preflight_sha: str = ""
+    fairness_tracked: dict = field(default_factory=dict)
+    untracked_audit: dict = field(default_factory=dict)
     # Diagnosis
     diagnosis_abstained: bool | None = None
     diagnosis_type: str = ""
@@ -314,6 +316,7 @@ def run_experiment(
             failure_witness=fw, diagnosis=None, mode="sf",
             protocol_config=revision_config,
             workspace_snapshot=r1_snapshot,
+            fairness_debug_dir=str(inst_dir / "fairness_debug" / "sf"),
         )
         _write_patch(inst_dir / "sf" / "patch.diff", sf.patch_text)
         _write_patch(inst_dir / "sf" / "final_evaluation.patch", sf.final_evaluation_patch)
@@ -360,6 +363,7 @@ def run_experiment(
                 failure_witness=fw, diagnosis=diag_text, mode="condiag",
                 protocol_config=revision_config,
                 workspace_snapshot=r1_snapshot,
+                fairness_debug_dir=str(inst_dir / "fairness_debug" / "cd"),
             )
             _write_patch(inst_dir / "cd" / "patch.diff", cd.patch_text)
             _write_patch(inst_dir / "cd" / "final_evaluation.patch", cd.final_evaluation_patch)
@@ -398,25 +402,51 @@ def run_experiment(
             out.cd_run = False
 
         # ═══════ Fairness Check ═══════
-        sf_ws = sf.workspace_sha_before_first_step if hasattr(sf, "workspace_sha_before_first_step") else ""
-        cd_ws = cd.workspace_sha_before_first_step if (out.cd_run and hasattr(cd, "workspace_sha_before_first_step")) else ""
-        r1_ws = r1_snapshot.tracked_diff_sha if r1_snapshot else "no_snapshot"
+        # BLOCKING tracked-code gate: SHAs must match across R1, SF, CD.
+        # Restore success itself is tracked via each branch's RestoreResult.
+        # Untracked manifest gaps are recorded but do not block.
+        sf_ws = sf.workspace_sha_before_first_step or ""
+        cd_ws = (cd.workspace_sha_before_first_step
+                 if (out.cd_run and hasattr(cd, "workspace_sha_before_first_step"))
+                 else "")
+
+        r1_sha = r1_snapshot.tracked_diff_sha if r1_snapshot else ""
+        sf_ok = bool(r1_sha) and bool(sf_ws) and (sf_ws == r1_sha)
+        cd_ok = (bool(r1_sha) and bool(cd_ws) and (cd_ws == r1_sha)) if out.cd_run else True
+        tracked_gate = {
+            "r1_vs_sf_tracked_ok": sf_ok,
+            "r1_vs_cd_tracked_ok": cd_ok if out.cd_run else None,
+            "all_ok": sf_ok and cd_ok,
+        }
+
         cd_restore_ok = cd.restore_result.ok if out.cd_run else True
-        # Fairness: compare tracked diff SHA (untracked files may vary between containers)
-        cd_ws_ok = bool(cd_ws) and cd_ws == r1_ws if out.cd_run else True
-        fairness_ok = (
-            r1_snapshot is not None
-            and sf.restore_result.ok
-            and cd_restore_ok
-            and sf_ws == r1_ws
-            and cd_ws_ok
-        )
+        fairness_ok = bool(tracked_gate["all_ok"]) and sf.restore_result.ok and cd_restore_ok
+
         out.fairness_ok = fairness_ok
-        out.r1_preflight_workspace_sha = r1_ws
+        out.r1_preflight_workspace_sha = r1_sha or "no_snapshot"
         out.sf_preflight_sha = sf_ws
         out.cd_preflight_sha = cd_ws
-        logger.info("[%s] fairness: r1_ws=%s sf_ws=%s cd_ws=%s ok=%s",
-                     instance_id, r1_ws, sf_ws, cd_ws, fairness_ok)
+        out.fairness_tracked = {
+            "r1_vs_sf_ok": tracked_gate["r1_vs_sf_tracked_ok"],
+            "r1_vs_cd_ok": tracked_gate["r1_vs_cd_tracked_ok"],
+        }
+        # Untracked audit info per branch (audit-only, not blocking).
+        out.untracked_audit = {
+            "sf": (sf.restore_result.to_dict()
+                   if hasattr(sf.restore_result, "to_dict") else {}),
+        }
+        if out.cd_run:
+            out.untracked_audit["cd"] = (
+                cd.restore_result.to_dict()
+                if hasattr(cd.restore_result, "to_dict") else {}
+            )
+
+        logger.info(
+            "[%s] fairness: r1_ws=%s sf_ws=%s cd_ws=%s tracked_ok=%s gate_ok=%s",
+            instance_id,
+            out.r1_preflight_workspace_sha, out.sf_preflight_sha, out.cd_preflight_sha,
+            tracked_gate["all_ok"], fairness_ok,
+        )
 
         # ═══════ Branch Eval Validity ═══════
         VALID_BRANCH_STATUSES = {"RESOLVED", "UNRESOLVED"}

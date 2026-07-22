@@ -184,20 +184,112 @@ def archive_untracked_files(agent: Any, snapshot_dir: Path) -> str:
     return archive_path
 
 
+def check_tracked_code_fairness(
+    r1_snapshot: "WorkspaceSnapshot | None",
+    sf_snapshot: "WorkspaceSnapshot | None",
+    cd_snapshot: "WorkspaceSnapshot | None" = None,
+) -> dict[str, Any]:
+    """Verify that all branches start from the same TRACKED code state.
+
+    This is the BLOCKING preflight gate before any R2 agent step runs.
+    We compare tracked_diff_sha only — untracked files (scratch, reproduce
+    scripts) are allowed to vary between containers because they do not
+    participate in Harness evaluation.
+
+    Returns a dict of per-pair booleans plus an `all_ok` summary.
+
+    Two snapshots are considered equal at the tracked-code level iff
+    `tracked_diff_sha` matches. Missing snapshots are treated as a failure
+    (we require an explicit baseline).
+    """
+    result: dict[str, Any] = {}
+    if r1_snapshot is None or sf_snapshot is None:
+        result["r1_vs_sf_tracked_ok"] = False
+    else:
+        result["r1_vs_sf_tracked_ok"] = (
+            r1_snapshot.tracked_diff_sha == sf_snapshot.tracked_diff_sha
+        )
+    if cd_snapshot is not None:
+        if r1_snapshot is None or cd_snapshot is None:
+            result["r1_vs_cd_tracked_ok"] = False
+        else:
+            result["r1_vs_cd_tracked_ok"] = (
+                r1_snapshot.tracked_diff_sha == cd_snapshot.tracked_diff_sha
+            )
+    pairs_with_value = [v for v in result.values() if isinstance(v, bool)]
+    result["all_ok"] = bool(pairs_with_value) and all(pairs_with_value)
+    return result
+
+
+def check_full_workspace_equivalence(
+    r1_snapshot: "WorkspaceSnapshot | None",
+    sf_snapshot: "WorkspaceSnapshot | None",
+    cd_snapshot: "WorkspaceSnapshot | None" = None,
+) -> dict[str, Any]:
+    """Audit-only: verify that all branches match at the full-workspace level.
+
+    Compares both tracked diff SHA AND untracked manifest SHA. This is the
+    stricter equivalence check. Use it ONLY for forensic / audit purposes —
+    it WILL fail whenever containers differ in reproduce scripts or other
+    scratch artifacts, even when the underlying code state is identical.
+
+    Recorded values (per-pair) plus a summary `all_ok`. Missing snapshots
+    fail the comparison.
+    """
+    result: dict[str, Any] = {}
+    if r1_snapshot is None or sf_snapshot is None:
+        result["r1_vs_sf_tracked_ok"] = False
+        result["r1_vs_sf_state_ok"] = False
+    else:
+        result["r1_vs_sf_tracked_ok"] = (
+            r1_snapshot.tracked_diff_sha == sf_snapshot.tracked_diff_sha
+        )
+        result["r1_vs_sf_state_ok"] = (
+            r1_snapshot.workspace_state_sha == sf_snapshot.workspace_state_sha
+        )
+    if cd_snapshot is not None:
+        if r1_snapshot is None or cd_snapshot is None:
+            result["r1_vs_cd_tracked_ok"] = False
+            result["r1_vs_cd_state_ok"] = False
+        else:
+            result["r1_vs_cd_tracked_ok"] = (
+                r1_snapshot.tracked_diff_sha == cd_snapshot.tracked_diff_sha
+            )
+            result["r1_vs_cd_state_ok"] = (
+                r1_snapshot.workspace_state_sha == cd_snapshot.workspace_state_sha
+            )
+    pairs_with_value = [v for v in result.values() if isinstance(v, bool)]
+    result["all_ok"] = bool(pairs_with_value) and all(pairs_with_value)
+    return result
+
+
 def check_workspace_fairness(
     r1_snapshot: WorkspaceSnapshot,
     sf_snapshot: WorkspaceSnapshot,
     cd_snapshot: WorkspaceSnapshot | None = None,
 ) -> dict[str, bool]:
-    """Verify that all branches start from the same workspace state."""
-    result = {
-        "r1_vs_sf_tracked_ok": r1_snapshot.tracked_diff_sha == sf_snapshot.tracked_diff_sha,
-        "r1_vs_sf_state_ok": r1_snapshot.workspace_state_sha == sf_snapshot.workspace_state_sha,
-    }
-    if cd_snapshot:
-        result["r1_vs_cd_tracked_ok"] = r1_snapshot.tracked_diff_sha == cd_snapshot.tracked_diff_sha
-        result["r1_vs_cd_state_ok"] = r1_snapshot.workspace_state_sha == cd_snapshot.workspace_state_sha
-        result["sf_vs_cd_tracked_ok"] = sf_snapshot.tracked_diff_sha == cd_snapshot.tracked_diff_sha
-        result["sf_vs_cd_state_ok"] = sf_snapshot.workspace_state_sha == cd_snapshot.workspace_state_sha
-    result["all_ok"] = all(result.values())
-    return result
+    """DEPRECATED alias for backward compatibility.
+
+    Splits into:
+      - check_tracked_code_fairness(...) — BLOCKING preflight gate
+      - check_full_workspace_equivalence(...) — audit-only forensic check
+
+    Existing callers should migrate to the two explicit functions. This
+    alias keeps the historical "all pairs AND all states" union so legacy
+    tests that assert `fairness["all_ok"]` on mixed mismatch (untracked
+    differs but tracked matches) still behave the same.
+    """
+    tracked = check_tracked_code_fairness(r1_snapshot, sf_snapshot, cd_snapshot)
+    full = check_full_workspace_equivalence(r1_snapshot, sf_snapshot, cd_snapshot)
+    merged: dict[str, bool] = {}
+    for k, v in tracked.items():
+        if k == "all_ok":
+            continue
+        merged[k] = bool(v)
+    for k, v in full.items():
+        if k == "all_ok":
+            continue
+        if k.endswith("_state_ok"):
+            merged[k] = bool(v)
+    merged["all_ok"] = all(merged.values()) if merged else False
+    return merged

@@ -9,6 +9,8 @@ from condiag.workspace import (
     UntrackedFile,
     WorkspaceSnapshot,
     check_workspace_fairness,
+    check_tracked_code_fairness,
+    check_full_workspace_equivalence,
 )
 
 
@@ -126,3 +128,201 @@ class TestWorkspace:
         ws2 = WorkspaceSnapshot(tracked_diff="diff b", base_commit_sha="abc")
         fairness = check_workspace_fairness(ws1, ws2, ws1)
         assert not fairness["all_ok"]
+
+
+class TestTrackedCodeFairness:
+    def test_tracked_matches(self):
+        r1 = WorkspaceSnapshot(tracked_diff="same", base_commit_sha="abc")
+        sf = WorkspaceSnapshot(tracked_diff="same", base_commit_sha="abc")
+        g = check_tracked_code_fairness(r1, sf)
+        assert g["r1_vs_sf_tracked_ok"] is True
+        assert g["all_ok"] is True
+
+    def test_tracked_mismatch(self):
+        r1 = WorkspaceSnapshot(tracked_diff="diff a", base_commit_sha="abc")
+        sf = WorkspaceSnapshot(tracked_diff="diff b", base_commit_sha="abc")
+        g = check_tracked_code_fairness(r1, sf)
+        assert g["r1_vs_sf_tracked_ok"] is False
+        assert g["all_ok"] is False
+
+    def test_tracked_with_cd(self):
+        r1 = WorkspaceSnapshot(tracked_diff="same", base_commit_sha="abc")
+        sf = r1
+        cd = r1
+        g = check_tracked_code_fairness(r1, sf, cd)
+        assert g["all_ok"] is True
+        assert g["r1_vs_cd_tracked_ok"] is True
+
+    def test_tracked_cd_mismatch(self):
+        r1 = WorkspaceSnapshot(tracked_diff="diff a", base_commit_sha="abc")
+        sf = WorkspaceSnapshot(tracked_diff="diff a", base_commit_sha="abc")
+        cd = WorkspaceSnapshot(tracked_diff="diff b", base_commit_sha="abc")
+        g = check_tracked_code_fairness(r1, sf, cd)
+        assert g["r1_vs_sf_tracked_ok"] is True
+        assert g["r1_vs_cd_tracked_ok"] is False
+        assert g["all_ok"] is False
+
+    def test_tracked_none_snapshot_fails(self):
+        g = check_tracked_code_fairness(None, WorkspaceSnapshot())
+        assert g["all_ok"] is False
+        assert g["r1_vs_sf_tracked_ok"] is False
+
+    def test_tracked_ignores_untracked_differences(self):
+        r1 = WorkspaceSnapshot(
+            tracked_diff="same",
+            untracked_manifest=[UntrackedFile("x.py", 10, "aaa")],
+            base_commit_sha="abc",
+        )
+        sf = WorkspaceSnapshot(
+            tracked_diff="same",
+            untracked_manifest=[UntrackedFile("y.py", 20, "bbb")],
+            base_commit_sha="abc",
+        )
+        # Tracked gate MUST pass even though untracked differs
+        g = check_tracked_code_fairness(r1, sf)
+        assert g["all_ok"] is True, "untracked differences must not affect tracked gate"
+
+
+class TestFullWorkspaceEquivalence:
+    def test_full_match(self):
+        r1 = WorkspaceSnapshot(tracked_diff="same", base_commit_sha="abc")
+        sf = WorkspaceSnapshot(tracked_diff="same", base_commit_sha="abc")
+        g = check_full_workspace_equivalence(r1, sf)
+        assert g["all_ok"] is True
+
+    def test_full_untracked_mismatch(self):
+        r1 = WorkspaceSnapshot(
+            tracked_diff="same",
+            untracked_manifest=[UntrackedFile("x.py", 10, "aaa")],
+            base_commit_sha="abc",
+        )
+        sf = WorkspaceSnapshot(
+            tracked_diff="same",
+            untracked_manifest=[UntrackedFile("x.py", 20, "bbb")],
+            base_commit_sha="abc",
+        )
+        # Full equivalence MUST catch untracked differences
+        g = check_full_workspace_equivalence(r1, sf)
+        assert g["all_ok"] is False
+        assert g["r1_vs_sf_state_ok"] is False
+        assert g["r1_vs_sf_tracked_ok"] is True
+
+    def test_full_none_fails(self):
+        g = check_full_workspace_equivalence(None, WorkspaceSnapshot())
+        assert g["all_ok"] is False
+
+    def test_full_cd(self):
+        r1 = WorkspaceSnapshot(tracked_diff="same", base_commit_sha="abc")
+        sf = r1
+        cd = r1
+        g = check_full_workspace_equivalence(r1, sf, cd)
+        assert g["all_ok"] is True
+
+
+class TestLegacyFairnessAlias:
+    def test_legacy_matches(self):
+        ws = WorkspaceSnapshot(tracked_diff="same", base_commit_sha="abc")
+        f = check_workspace_fairness(ws, ws, ws)
+        assert f["all_ok"]
+
+    def test_legacy_untracked_mismatch_still_fails(self):
+        r1 = WorkspaceSnapshot(
+            tracked_diff="same",
+            untracked_manifest=[UntrackedFile("x.py", 10, "aaa")],
+            base_commit_sha="abc",
+        )
+        sf = WorkspaceSnapshot(
+            tracked_diff="same",
+            untracked_manifest=[UntrackedFile("x.py", 20, "bbb")],
+            base_commit_sha="abc",
+        )
+        # Legacy alias unions both gates — mismatch in EITHER fails
+        f = check_workspace_fairness(r1, sf, sf)
+        assert not f["all_ok"]
+        assert f["r1_vs_sf_tracked_ok"] is True
+        assert f["r1_vs_sf_state_ok"] is False
+
+
+class TestRestoreResultAudit:
+    def test_restore_result_to_dict(self):
+        from condiag.branch_runner import RestoreResult
+        r = RestoreResult(
+            ok=True,
+            workspace_sha="abc123",
+            reason="test",
+            untracked_manifest_count=3,
+            untracked_manifest_sha="def456",
+            untracked_archive_expected=True,
+            untracked_archive_present=True,
+            untracked_archive_extracted=True,
+            untracked_restore_status="ok",
+            base_commit="abc",
+        )
+        d = r.to_dict()
+        assert d["ok"] is True
+        assert d["untracked_restore_status"] == "ok"
+        assert d["untracked_manifest_count"] == 3
+
+    def test_restore_result_default_to_dict(self):
+        from condiag.branch_runner import RestoreResult
+        r = RestoreResult()
+        d = r.to_dict()
+        assert d["ok"] is False
+        assert d["untracked_restore_status"] == "skipped"
+
+
+class TestDumpFairnessDebug:
+    def test_dump_writes_all_files(self, tmp_path):
+        from condiag.branch_runner import dump_fairness_debug
+        from condiag.workspace import WorkspaceSnapshot
+
+        expected = WorkspaceSnapshot(
+            tracked_diff="diff --git a/foo.py b/foo.py\n+new\n",
+            untracked_manifest=[
+                __import__('condiag.workspace', fromlist=['UntrackedFile']).UntrackedFile(
+                    "config.json", 42, "aaa"
+                )
+            ],
+            base_commit_sha="deadbeef",
+        )
+        actual = WorkspaceSnapshot(
+            tracked_diff="diff --git a/bar.py b/bar.py\n+other\n",
+            base_commit_sha="cafebabe",
+        )
+
+        debug_dir = tmp_path / "fairness_debug"
+        dump_fairness_debug(str(debug_dir), expected, actual, "deadbeef", label="sf")
+
+        assert (debug_dir / "expected_r1_tracked.diff").exists()
+        assert (debug_dir / "restored_preflight_tracked.diff").exists()
+        assert (debug_dir / "expected_sha.txt").exists()
+        assert (debug_dir / "actual_sha.txt").exists()
+        assert (debug_dir / "expected_head.txt").exists()
+        assert (debug_dir / "actual_head.txt").exists()
+        assert (debug_dir / "base_commit.txt").exists()
+        assert (debug_dir / "expected_files.json").exists()
+        assert (debug_dir / "actual_files.json").exists()
+        assert (debug_dir / "untracked_expected.json").exists()
+        assert (debug_dir / "untracked_actual.json").exists()
+        assert (debug_dir / "manifest.txt").exists()
+
+        # Verify content
+        assert (debug_dir / "expected_sha.txt").read_text().strip() == expected.tracked_diff_sha
+        assert (debug_dir / "actual_sha.txt").read_text().strip() == actual.tracked_diff_sha
+        assert (debug_dir / "base_commit.txt").read_text().strip() == "deadbeef"
+        import json
+        ef = json.loads((debug_dir / "expected_files.json").read_text())
+        assert "foo.py" in ef["files"]
+
+    def test_dump_no_debug_dir_does_nothing(self, tmp_path):
+        from condiag.branch_runner import dump_fairness_debug
+        from condiag.workspace import WorkspaceSnapshot
+        # Should not raise
+        dump_fairness_debug("", WorkspaceSnapshot(), WorkspaceSnapshot(), "abc")
+
+    def test_dump_missing_snapshots(self, tmp_path):
+        from condiag.branch_runner import dump_fairness_debug
+        # Both snapshots None — should still create files
+        debug_dir = tmp_path / "empty"
+        dump_fairness_debug(str(debug_dir), None, None, "abc")
+        assert (debug_dir / "manifest.txt").exists()
