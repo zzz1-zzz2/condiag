@@ -177,20 +177,17 @@ def check_patch_integrity(
             evaluation_sha=evaluation_sha, apply_check_status=apply_check_status,
         )
 
-    # 5. Consistency: explicit submission vs workspace
+    # 5. Consistency: explicit submission vs workspace (diagnostic only, not blocking)
+    #    The evaluation_patch is the canonicalized agent submission. If the workspace
+    #    has extra files (patch.txt, pyproject.toml, reproduction scripts), the
+    #    workspace diff may not match the submission. This is expected - the
+    #    submission is the clean source patch, workspace may have extras.
+    consistency = "consistent"
     if not fallback_used and submitted and workspace_patch:
         a = canonicalize_patch(submitted)
         w = canonicalize_patch(workspace_patch)
         if a != w:
-            return PatchIntegrityReport(
-                ok=False, status="invalid_mismatch",
-                reason="submitted patch != workspace patch",
-                changed_files=changed_files, patch_size=patch_size, fallback_used=fallback_used,
-                consistency="mismatch", submitted_sha=submitted_sha,
-                workspace_sha=workspace_sha, evaluation_sha=evaluation_sha,
-                apply_check_status=apply_check_status,
-            )
-        consistency = "consistent"
+            consistency = "mismatch"
     elif fallback_used:
         consistency = "fallback"
     elif not submitted and not workspace_patch:

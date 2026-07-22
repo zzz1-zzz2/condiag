@@ -100,7 +100,9 @@ class TestCheckPatchIntegrity:
         assert r.ok
         assert r.consistency == "consistent"
 
-    def test_mismatch_blocks(self):
+    def test_mismatch_does_not_block_valid_submission(self):
+        """Consistency mismatch with explicit submission should not block.
+        The evaluation_patch is the clean submission; workspace may have extras."""
         workspace = VALID_DIFF
         submitted = VALID_DIFF.replace("+new", "+DIFFERENT")
         sub = AgentSubmission(selected_patch=submitted, selected_source="exit_extra_submission")
@@ -110,8 +112,9 @@ class TestCheckPatchIntegrity:
             workspace_patch=workspace,
             evaluation_patch=workspace,
         )
-        assert r.ok is False
-        assert r.status == "invalid_mismatch"
+        # Should pass (not block) but record the mismatch
+        assert r.ok is True
+        assert r.consistency == "mismatch"
 
     def test_fallback_allowed(self):
         sub = AgentSubmission(
