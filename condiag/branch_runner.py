@@ -80,7 +80,8 @@ class BranchResult:
     final_evaluation_patch: str = ""  # What Harness actually receives
 
 
-def restore_workspace(agent, snapshot, base_commit: str) -> RestoreResult:
+def restore_workspace(agent, snapshot, base_commit: str,
+                      fairness_debug_dir: str | None = None) -> RestoreResult:
     """Restore a WorkspaceSnapshot into the agent's container.
 
     5 protections:
@@ -225,6 +226,15 @@ def restore_workspace(agent, snapshot, base_commit: str) -> RestoreResult:
                 f"{restored_cr.snapshot.tracked_diff_sha} != "
                 f"{snapshot.tracked_diff_sha}"
             )
+            # Dump diagnostic artifacts before returning.
+            if fairness_debug_dir:
+                dump_fairness_debug(
+                    fairness_debug_dir,
+                    snapshot,
+                    restored_cr.snapshot,
+                    base_commit,
+                    label=restore.base_commit or "restore",
+                )
             return restore
 
         restore.ok = True
@@ -423,7 +433,8 @@ def run_branch(
     ws_before = ""
     preflight_actual = None  # populated only if we run a preflight fingerprint
     if workspace_snapshot:
-        restore = restore_workspace(agent, workspace_snapshot, base_commit)
+        restore = restore_workspace(agent, workspace_snapshot, base_commit,
+                                      fairness_debug_dir=fairness_debug_dir)
         if not restore.ok:
             result = BranchResult(
                 mode=mode,
