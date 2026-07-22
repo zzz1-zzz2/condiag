@@ -101,20 +101,34 @@ class TestCheckPatchIntegrity:
         assert r.consistency == "consistent"
 
     def test_mismatch_does_not_block_valid_submission(self):
-        """Consistency mismatch with explicit submission should not block.
-        The evaluation_patch is the clean submission; workspace may have extras."""
-        workspace = VALID_DIFF
-        submitted = VALID_DIFF.replace("+new", "+DIFFERENT")
+        """Workspace mismatch with explicit submission should not block.
+        evaluation_patch must equal submitted patch, but workspace may have extras."""
+        submitted = VALID_DIFF
+        workspace = VALID_DIFF + "diff --git a/extra b/extra\n+extra\n"
         sub = AgentSubmission(selected_patch=submitted, selected_source="exit_extra_submission")
         r = check_patch_integrity(
             termination_reason="submitted",
             agent_submission=sub,
             workspace_patch=workspace,
-            evaluation_patch=workspace,
+            evaluation_patch=submitted,
         )
-        # Should pass (not block) but record the mismatch
+        # Should pass (not block) but record the workspace mismatch
         assert r.ok is True
         assert r.consistency == "mismatch"
+
+    def test_provenance_mismatch_blocks(self):
+        """evaluation_patch must equal submitted_patch when explicit submission is used."""
+        submitted = VALID_DIFF
+        different = VALID_DIFF.replace("+new", "+DIFFERENT")
+        sub = AgentSubmission(selected_patch=submitted, selected_source="exit_extra_submission")
+        r = check_patch_integrity(
+            termination_reason="submitted",
+            agent_submission=sub,
+            workspace_patch=submitted,
+            evaluation_patch=different,
+        )
+        assert r.ok is False
+        assert r.status == "invalid_provenance"
 
     def test_fallback_allowed(self):
         sub = AgentSubmission(
