@@ -122,7 +122,7 @@ def restore_workspace(agent, snapshot, base_commit: str) -> RestoreResult:
                 reason=f"tracked_diff SHA mismatch: {restored_cr.snapshot.tracked_diff_sha} != {snapshot.tracked_diff_sha}",
             )
 
-        return RestoreResult(ok=True, workspace_sha=restored_cr.snapshot.workspace_state_sha)
+        return RestoreResult(ok=True, workspace_sha=restored_cr.snapshot.tracked_diff_sha)
 
     except Exception as e:
         return RestoreResult(ok=False, reason=f"exception: {type(e).__name__}: {e}")
@@ -135,11 +135,12 @@ def restore_workspace(agent, snapshot, base_commit: str) -> RestoreResult:
 
 
 def capture_workspace_sha(agent, base_commit: str) -> str:
-    """Pre-step workspace SHA via unified fingerprint function."""
+    """Pre-step workspace SHA via unified fingerprint function.
+    Returns tracked_diff_sha only (untracked files may vary)."""
     from condiag.workspace import capture_workspace_fingerprint
     cr = capture_workspace_fingerprint(agent, base_commit)
     if cr.ok and cr.snapshot is not None:
-        return cr.snapshot.workspace_state_sha
+        return cr.snapshot.tracked_diff_sha
     return ""
 
 
@@ -206,7 +207,8 @@ def run_branch(
         ws_before = capture_workspace_sha(agent, base_commit)
         logger.info("[%s] Workspace restored, pre-step SHA=%s", mode.upper(), ws_before)
 
-        # Pre-step fairness gate: verify SHA matches expected snapshot
+        # Pre-step fairness gate: verify TRACKED changes match expected snapshot
+        # (untracked files may vary between containers; tracked code is what matters)
         if not ws_before:
             return BranchResult(
                 mode=mode, termination_reason="preflight_fairness_failed:empty_sha",
@@ -216,10 +218,13 @@ def run_branch(
                 cost_total=r1_cost, cost_incremental=0.0,
                 duration_seconds=time.time() - t0,
             )
-        if ws_before != workspace_snapshot.workspace_state_sha:
+        from condiag.workspace import capture_workspace_fingerprint
+        _cr = capture_workspace_fingerprint(agent, base_commit)
+        preflight_tracked = _cr.snapshot.tracked_diff_sha if (_cr.ok and _cr.snapshot) else ""
+        if not preflight_tracked or preflight_tracked != workspace_snapshot.tracked_diff_sha:
             return BranchResult(
-                mode=mode, termination_reason=f"preflight_fairness_failed:sha_mismatch",
-                restore_result=RestoreResult(ok=False, reason=f"preflight SHA {ws_before} != expected {workspace_snapshot.workspace_state_sha}"),
+                mode=mode, termination_reason=f"preflight_fairness_failed:tracked_mismatch",
+                restore_result=RestoreResult(ok=False, reason=f"tracked SHA {preflight_tracked} != expected {workspace_snapshot.tracked_diff_sha}"),
                 messages=list(agent.messages),
                 n_calls_total=r1_n_calls, n_calls_incremental=0,
                 cost_total=r1_cost, cost_incremental=0.0,

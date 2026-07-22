@@ -400,8 +400,9 @@ def run_experiment(
         # ═══════ Fairness Check ═══════
         sf_ws = sf.workspace_sha_before_first_step if hasattr(sf, "workspace_sha_before_first_step") else ""
         cd_ws = cd.workspace_sha_before_first_step if (out.cd_run and hasattr(cd, "workspace_sha_before_first_step")) else ""
-        r1_ws = r1_snapshot.workspace_state_sha if r1_snapshot else "no_snapshot"
+        r1_ws = r1_snapshot.tracked_diff_sha if r1_snapshot else "no_snapshot"
         cd_restore_ok = cd.restore_result.ok if out.cd_run else True
+        # Fairness: compare tracked diff SHA (untracked files may vary between containers)
         cd_ws_ok = bool(cd_ws) and cd_ws == r1_ws if out.cd_run else True
         fairness_ok = (
             r1_snapshot is not None
