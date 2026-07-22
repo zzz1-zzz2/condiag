@@ -13,71 +13,65 @@ def build_branch_messages(
 ) -> list[dict]:
     """Build the message sequence for a forked Round 2 branch.
 
-    Given R1 checkpoint messages, produces:
-      R1 messages (deep-copied)
-      + synthetic tool responses for any ASSISTANT with missing responses
-        (inserted immediately after their assistant, not at end of list)
-      + FailureWitness (user message)
-      + [Diagnosis (user message, ConDiag only)]
+    Repairs ALL incomplete assistant turns by inserting synthetic tool
+    responses for missing tool_call_ids AFTER all real tool responses in
+    the same turn. Each assistant's order is: assistant, real tools,
+    synthetic tools (for any IDs not seen).
 
-    This function repairs ALL incomplete turns, not just the last one.
-    Each missing tool response is inserted right after its assistant,
-    preserving the tool_call chain order for the API.
+    This avoids the previous bug where real tool responses were duplicated
+    by synthetic ones in the same turn.
     """
     msgs = deepcopy(checkpoint_messages)
-
     # Clean exit roles
     msgs = [m for m in msgs if m.get("role") != "exit"]
 
-    # Build result by processing turns in order
     result: list[dict] = []
-    pending_assistant = None
+    pending_assistant: dict | None = None
     pending_call_ids: list[str] = []
-    seen_tool_ids: set[str] = set()
+    pending_real_tools: list[dict] = []
 
     for m in msgs:
         role = m.get("role", "")
 
         if role == "assistant":
-            # If we have a pending assistant, flush it (checking for missed tools)
+            # Flush any previous turn (new assistant = boundary)
             if pending_assistant is not None:
-                _flush_turn(result, pending_assistant, pending_call_ids, seen_tool_ids)
-                pending_call_ids = []
+                _flush_turn(
+                    result, pending_assistant, pending_call_ids,
+                    pending_real_tools,
+                )
             pending_assistant = m
-            # Collect call IDs from both tool_calls and extra.actions
             pending_call_ids = _collect_call_ids(m)
-            # Also track any IDs seen so far in the result
-            for rm in result:
-                if rm.get("role") == "tool" and rm.get("tool_call_id"):
-                    seen_tool_ids.add(rm.get("tool_call_id"))
+            pending_real_tools = []
+
         elif role == "tool":
-            # CRITICAL: flush pending assistant BEFORE adding tool to result
-            # Otherwise the order is [tool, assistant] violating tool protocol
-            if pending_assistant is not None:
-                _flush_turn(result, pending_assistant, pending_call_ids, seen_tool_ids)
-                pending_assistant = None
-                pending_call_ids = []
-            tid = m.get("tool_call_id", "")
-            if tid:
-                seen_tool_ids.add(tid)
-            result.append(m)
+            # Collect tool for the current turn; do NOT flush yet
+            # (otherwise we'd lose the chance to add real tools after assistant)
+            pending_real_tools.append(m)
+
         else:
-            # Flush any pending assistant first
+            # User/system message: flush pending turn, then append this
             if pending_assistant is not None:
-                _flush_turn(result, pending_assistant, pending_call_ids, seen_tool_ids)
+                _flush_turn(
+                    result, pending_assistant, pending_call_ids,
+                    pending_real_tools,
+                )
                 pending_assistant = None
                 pending_call_ids = []
+                pending_real_tools = []
             result.append(m)
 
-    # Flush final pending assistant
+    # Flush final pending turn
     if pending_assistant is not None:
-        _flush_turn(result, pending_assistant, pending_call_ids, seen_tool_ids)
+        _flush_turn(
+            result, pending_assistant, pending_call_ids, pending_real_tools,
+        )
 
-    # 2. Inject FailureWitness
+    # FailureWitness
     if failure_witness:
         result.append({"role": "user", "content": _format_fw(failure_witness)})
 
-    # 3. Inject Diagnosis (ConDiag only)
+    # Diagnosis (ConDiag only)
     if style == "condiag" and diagnosis:
         result.append({"role": "user", "content": diagnosis})
 
@@ -88,13 +82,25 @@ def _flush_turn(
     result: list[dict],
     assistant: dict,
     call_ids: list[str],
-    seen_ids: set[str],
+    real_tools: list[dict],
 ) -> None:
-    """Append the assistant message and any missing synthetic tool responses."""
+    """Append one complete Turn in order: assistant, real tool responses,
+    then synthetic tool responses for any missing call_ids.
+    """
+    # Assistant first
     result.append(assistant)
+
+    # Real tool responses (preserving original order)
+    real_ids: set[str] = set()
+    for tool in real_tools:
+        result.append(tool)
+        tid = tool.get("tool_call_id", "")
+        if tid:
+            real_ids.add(tid)
+
+    # Synthetic responses for any missing IDs (deduped)
     for tid in call_ids:
-        if tid and tid not in seen_ids:
-            seen_ids.add(tid)
+        if tid and tid not in real_ids:
             result.append({"role": "tool", "tool_call_id": tid, "content": "(output)"})
 
 

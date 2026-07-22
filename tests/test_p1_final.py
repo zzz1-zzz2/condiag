@@ -86,6 +86,37 @@ class TestBranchBuilderOrder:
         assert result[-1]["role"] == "user"
         assert "Failed tests" in result[-1]["content"] or "err" in result[-1]["content"]
 
+    def test_existing_tool_response_not_duplicated(self):
+        """Real tool response must NOT be duplicated by synthetic one."""
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "function": {"name": "bash", "arguments": "ls"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "real_output"},
+        ]
+        result = build_branch_messages(msgs, failure_witness=None)
+        c1_responses = [m for m in result
+                       if m.get("role") == "tool" and m.get("tool_call_id") == "c1"]
+        assert len(c1_responses) == 1, f"Expected 1 c1 response, got {len(c1_responses)}"
+        assert c1_responses[0]["content"] == "real_output", \
+            f"Real response must be preserved, got {c1_responses[0]['content']}"
+
+    def test_parallel_real_responses_not_duplicated(self):
+        """Multiple real tool responses must each be unique."""
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "function": {"name": "bash", "arguments": "ls"}},
+                {"id": "c2", "function": {"name": "bash", "arguments": "pwd"}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "real1"},
+            {"role": "tool", "tool_call_id": "c2", "content": "real2"},
+        ]
+        result = build_branch_messages(msgs, failure_witness=None)
+        c1 = [m for m in result if m.get("role") == "tool" and m.get("tool_call_id") == "c1"]
+        c2 = [m for m in result if m.get("role") == "tool" and m.get("tool_call_id") == "c2"]
+        assert len(c1) == 1 and c1[0]["content"] == "real1"
+        assert len(c2) == 1 and c2[0]["content"] == "real2"
+
 
 class TestTrajectoryNoIDDedup:
     """Anonymous tool calls must dedup by content, not just by source:type."""
