@@ -1,27 +1,196 @@
-"""P1-3C: Search Contract — bounded, template-driven retrieval plans.
+"""P1-3C-5: Grounded Search Contracts.
 
-Each DiagnosisHypothesis is converted into a small set of SearchAction
-objects. The templates are deterministic: same hypothesis_id + same
-action template = same action list. No LLM. No free-text.
+This is the closure of the P1-3C core diagnostic layer. Beyond
+`DiagnosisHypothesis` (P1-3C-1) and the template engine (P1-3C-3),
+this module adds:
 
-Action types are a fixed enum — Router can dispatch by type without
-parsing strings.
+  - SearchTarget with kind (SYMBOL | FILE | TEST | TYPE_NAME | ...)
+  - EvidenceItem ledger with stable IDs and dereferenceable content
+  - ContractStatus enum (ACTIONABLE | ABSTAINED | INVALID)
+  - ContractValidator: target_kind × action_type compatibility rules
+  - Plan-level budget allocator (not just per-hypothesis)
+  - Shadow artifact writer
+
+The goal: Router must receive grounded targets (symbol, file, test)
+not arbitrary error-message tokens like `Time` or `float`.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterable
 
-from condiag.diagnosis.hypothesis import DiagnosisHypothesis
+from condiag.diagnosis.hypothesis import DiagnosisHypothesis, HypothesisStatus
+
+
+# ── Target kinds ───────────────────────────────────────────────────
+
+
+class SearchTargetKind(str, Enum):
+    """Closed enum of valid search-target kinds.
+
+    Router implementations must accept only the kinds listed for each
+    action type. Primitive literals (str, int, float, ...) are not
+    valid targets under any kind — they must be filtered.
+    """
+
+    SYMBOL = "SYMBOL"            # class/function/method/variable
+    FILE = "FILE"                # repo-relative path
+    TEST = "TEST"                # pytest test name (with [param] suffix)
+    TYPE_NAME = "TYPE_NAME"       # Python type name (e.g. Time, float)
+    FAILURE_SITE = "FAILURE_SITE"  # "file.py:42"
+    EVIDENCE = "EVIDENCE"        # pointer to a specific EvidenceItem
+    BEHAVIOR = "BEHAVIOR"        # semantic concept ("type_contract", "assertion_mismatch")
+
+
+# Python primitive types — never valid as search targets.
+# These are types commonly seen in error messages; FIND_CALLERS would
+# waste effort looking up callers of `int`, `float`, `str`, etc.
+_PRIMITIVE_TYPES = {
+    # Built-in types
+    "str", "int", "float", "complex",
+    "list", "tuple", "set", "frozenset", "dict", "bytes", "bytearray",
+    "bool", "object", "type", "NoneType", "None", "True", "False",
+    # Typing module generics
+    "Optional", "List", "Dict", "Tuple", "Set", "Type", "Any",
+    "Callable", "Union", "Iterable", "Iterator", "Generator",
+    # Common type names from numerical/time error messages
+    "Time", "Quantity", "Angle", "Unit", "Frame",
+    # Python keywords
+    "and", "or", "not", "is", "in",
+}
+
+# Identifier-shape detection (a-zA-Z_ followed by [a-zA-Z0-9_.]).
+import re as _re
+_RE_IDENTIFIER = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
+
+
+@dataclass
+class SearchTarget:
+    """A typed retrieval target with grounding metadata.
+
+    `resolved=False` indicates the target is a best-guess extracted
+    from error message tokens; `resolved=True` indicates it was
+    confirmed against the source code (file path, frame line, etc.).
+    """
+
+    value: str = ""
+    kind: SearchTargetKind = SearchTargetKind.SYMBOL
+    resolved: bool = False
+    source_evidence_ids: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "value": self.value,
+            "kind": self.kind.value,
+            "resolved": self.resolved,
+            "source_evidence_ids": list(self.source_evidence_ids),
+        }
+
+
+def is_primitive_literal(value: str) -> bool:
+    """True if `value` is a Python builtin type name or a string-typed literal."""
+    if not value:
+        return True
+    return value in _PRIMITIVE_TYPES
+
+
+def make_grounded_target(
+    value: str,
+    kind: SearchTargetKind,
+    *,
+    resolved: bool = False,
+    evidence_ids: Iterable[str] = (),
+) -> SearchTarget:
+    """Construct a SearchTarget, defaulting unresolved when value is suspect."""
+    return SearchTarget(
+        value=value,
+        kind=kind,
+        resolved=resolved,
+        source_evidence_ids=list(evidence_ids),
+    )
+
+
+# ── EvidenceItem ledger ───────────────────────────────────────────
+
+
+class EvidenceSource(str, Enum):
+    TEST_FAILURE = "TEST_FAILURE"
+    STACK_FRAME = "STACK_FRAME"
+    PATCH_EDIT = "PATCH_EDIT"
+    TRAJECTORY_VIEW = "TRAJECTORY_VIEW"
+    CALL_CHAIN = "CALL_CHAIN"
+    ASSERTION = "ASSERTION"
+    HYPOTHESIS_BRIDGE = "HYPOTHESIS_BRIDGE"
+
+
+@dataclass
+class EvidenceItem:
+    """Concrete evidence record that supports one or more hypotheses.
+
+    Stored in the global EvidenceLedger and dereferenced by
+    `evidence_id`. Every EvidenceReference in a hypothesis must
+    resolve to an EvidenceItem here.
+    """
+
+    evidence_id: str = ""
+    cluster_id: str = ""
+    source: EvidenceSource = EvidenceSource.TEST_FAILURE
+    kind: str = ""                    # finer-grained: test name, frame file, etc.
+    location: str = ""                # file:line or test::name
+    content: str = ""                 # human-readable description
+    strength: str = "supporting"      # supporting | contradicting | neutral
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "evidence_id": self.evidence_id,
+            "cluster_id": self.cluster_id,
+            "source": self.source.value,
+            "kind": self.kind,
+            "location": self.location,
+            "content": self.content,
+            "strength": self.strength,
+        }
+
+
+class EvidenceLedger:
+    """Global evidence store. Provides lookup by evidence_id."""
+
+    def __init__(self) -> None:
+        self._items: dict[str, EvidenceItem] = {}
+
+    def add(self, item: EvidenceItem) -> None:
+        if item.evidence_id in self._items:
+            return  # idempotent
+        self._items[item.evidence_id] = item
+
+    def get(self, evidence_id: str) -> EvidenceItem | None:
+        return self._items.get(evidence_id)
+
+    def has(self, evidence_id: str) -> bool:
+        return evidence_id in self._items
+
+    def items(self) -> list[EvidenceItem]:
+        return list(self._items.values())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "n_items": len(self._items),
+            "items": [it.to_dict() for it in self.items()],
+        }
+
+
+# ── Action types (closed enum, NO sentinels) ──────────────────────
 
 
 class SearchActionType(str, Enum):
-    """Closed enum of retrieval action types.
+    """Closed enum of executable retrieval actions.
 
-    Each action maps to one Router implementation. Adding a new type
-    is a deliberate, schema-versioned decision.
+    Sentinel values (ABSTAIN/NOOP) are NOT actions — they live in
+    SearchContract.status instead.
     """
 
     FIND_DEFINITION = "FIND_DEFINITION"
@@ -31,179 +200,292 @@ class SearchActionType(str, Enum):
     FIND_CALLERS = "FIND_CALLERS"
     FIND_REGISTRATION_SITE = "FIND_REGISTRATION_SITE"
     REHYDRATE_VIEWED_EVIDENCE = "REHYDRATE_VIEWED_EVIDENCE"
-    # Sentinel actions
-    ABSTAIN = "ABSTAIN"
-    NOOP = "NOOP"
+
+
+# ── Contract status ───────────────────────────────────────────────
+
+
+class ContractStatus(str, Enum):
+    ACTIONABLE = "ACTIONABLE"
+    ABSTAINED = "ABSTAINED"
+    INVALID = "INVALID"
+
+
+# ── Compatible (action_type, target_kind) pairs ────────────────────
+
+_ACTION_TARGET_KINDS: dict[SearchActionType, set[SearchTargetKind]] = {
+    SearchActionType.FIND_DEFINITION: {
+        SearchTargetKind.SYMBOL,
+        SearchTargetKind.FILE,
+        SearchTargetKind.FAILURE_SITE,
+    },
+    SearchActionType.FIND_PARALLEL_IMPLEMENTATION: {
+        SearchTargetKind.SYMBOL,
+        SearchTargetKind.FILE,
+        SearchTargetKind.BEHAVIOR,
+    },
+    SearchActionType.FIND_RELATED_TESTS: {
+        SearchTargetKind.SYMBOL,
+        SearchTargetKind.FILE,
+        SearchTargetKind.TEST,
+        SearchTargetKind.BEHAVIOR,
+    },
+    SearchActionType.FIND_CALLEES: {
+        SearchTargetKind.SYMBOL,
+    },
+    SearchActionType.FIND_CALLERS: {
+        SearchTargetKind.SYMBOL,
+    },
+    SearchActionType.FIND_REGISTRATION_SITE: {
+        SearchTargetKind.FILE,
+        SearchTargetKind.SYMBOL,
+    },
+    SearchActionType.REHYDRATE_VIEWED_EVIDENCE: {
+        SearchTargetKind.EVIDENCE,
+        SearchTargetKind.FILE,
+    },
+}
+
+
+# ── Action + Contract dataclasses ─────────────────────────────────
 
 
 @dataclass
 class SearchAction:
-    """One bounded retrieval action.
-
-    `target` is the symbol/file name the Router will look up.
-    `budget` is the maximum number of files/result the action may produce.
-    `stop_condition` describes when the Router should stop and report back.
-    """
+    """One grounded retrieval action."""
 
     action_id: str = ""
-    action_type: SearchActionType = SearchActionType.NOOP
-    target: str = ""
+    action_type: SearchActionType = SearchActionType.FIND_DEFINITION
+    target: SearchTarget = field(default_factory=SearchTarget)
     reason: str = ""
     cluster_ids: list[str] = field(default_factory=list)
     evidence_ids: list[str] = field(default_factory=list)
     budget: int = 2
     stop_condition: str = "one relevant result found"
-    abstained: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "action_id": self.action_id,
             "action_type": self.action_type.value,
-            "target": self.target,
+            "target": self.target.to_dict(),
             "reason": self.reason,
             "cluster_ids": list(self.cluster_ids),
             "evidence_ids": list(self.evidence_ids),
             "budget": self.budget,
             "stop_condition": self.stop_condition,
-            "abstained": self.abstained,
         }
 
 
 @dataclass
 class SearchContract:
-    """A complete retrieval plan for one hypothesis (or one cluster)."""
+    """A complete retrieval plan for one hypothesis.
+
+    `status` is ACTIONABLE only if there is at least one valid action
+    AND the validator accepted every action.
+    """
 
     hypothesis_id: str = ""
     actions: list[SearchAction] = field(default_factory=list)
-    abstained: bool = False  # True when no actions were generated
+    status: ContractStatus = ContractStatus.ABSTAINED
     abstention_reason: str = ""
     total_budget: int = 0
+    validation_issues: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "hypothesis_id": self.hypothesis_id,
             "actions": [a.to_dict() for a in self.actions],
-            "abstained": self.abstained,
+            "status": self.status.value,
             "abstention_reason": self.abstention_reason,
             "total_budget": self.total_budget,
+            "validation_issues": list(self.validation_issues),
         }
 
 
-# ── Templates ──────────────────────────────────────────────────────
+# ── Target selector helpers ────────────────────────────────────────
 
 
-# Each template: (subtype, action_type, target_selector, reason)
-# - target_selector: callable(hypothesis) → list of strings (target candidates)
-# - Each subtype can emit 1..N actions; budget applies globally.
-def _t_failure_site(hyp: DiagnosisHypothesis) -> list[tuple[SearchActionType, str, str]]:
-    """For frame/site failures: look up the symbol at the failure site."""
-    if not hyp.failure_sites:
-        return []
-    actions = []
+def _site_to_target(site: str, *, resolved: bool = False,
+                     evidence_ids: list[str] | None = None) -> SearchTarget | None:
+    """Convert a 'file.py:LINE' string into a FAILURE_SITE target.
+
+    Returns None if `site` is empty or malformed.
+    """
+    if not site:
+        return None
+    return SearchTarget(
+        value=site,
+        kind=SearchTargetKind.FAILURE_SITE,
+        resolved=resolved,
+        source_evidence_ids=evidence_ids or [],
+    )
+
+
+def _file_to_target(file_path: str, *, evidence_ids: list[str] | None = None) -> SearchTarget | None:
+    """Convert a file path to a FILE target."""
+    if not file_path:
+        return None
+    return SearchTarget(
+        value=file_path,
+        kind=SearchTargetKind.FILE,
+        resolved=True,
+        source_evidence_ids=evidence_ids or [],
+    )
+
+
+def _symbol_to_target(sym: str, *, evidence_ids: list[str] | None = None) -> SearchTarget | None:
+    """Convert a symbol to a SYMBOL target, filtering primitive literals."""
+    if not sym or is_primitive_literal(sym):
+        return None
+    if not _RE_IDENTIFIER.match(sym):
+        return None
+    return SearchTarget(
+        value=sym,
+        kind=SearchTargetKind.SYMBOL,
+        resolved=False,
+        source_evidence_ids=evidence_ids or [],
+    )
+
+
+def _test_to_target(test_name: str, *, evidence_ids: list[str] | None = None) -> SearchTarget | None:
+    """Convert a test name to a TEST target."""
+    if not test_name:
+        return None
+    return SearchTarget(
+        value=test_name,
+        kind=SearchTargetKind.TEST,
+        resolved=True,
+        source_evidence_ids=evidence_ids or [],
+    )
+
+
+def _evidence_to_target(evidence_id: str) -> SearchTarget | None:
+    if not evidence_id:
+        return None
+    return SearchTarget(
+        value=evidence_id,
+        kind=SearchTargetKind.EVIDENCE,
+        resolved=True,
+        source_evidence_ids=[evidence_id],
+    )
+
+
+def _behavior_to_target(label: str, *, evidence_ids: list[str] | None = None) -> SearchTarget:
+    return SearchTarget(
+        value=label,
+        kind=SearchTargetKind.BEHAVIOR,
+        resolved=False,
+        source_evidence_ids=evidence_ids or [],
+    )
+
+
+# ── Templates (return SearchTarget objects) ───────────────────────
+
+
+def _t_failure_site(hyp: DiagnosisHypothesis) -> list[SearchTarget]:
+    """Frame/site failures: look up the symbol/file at the failure site."""
+    out: list[SearchTarget] = []
     for site in hyp.failure_sites[:2]:
-        # Take the file name without the line number
+        target = _site_to_target(site, resolved=True, evidence_ids=hyp.supporting_evidence_ids)
+        if target:
+            out.append(target)
+    return out
+
+
+def _t_find_callers(hyp: DiagnosisHypothesis) -> list[SearchTarget]:
+    """For SYMBOL retrieval targets: who calls this?"""
+    out: list[SearchTarget] = []
+    for sym in hyp.retrieval_targets[:2]:
+        target = _symbol_to_target(sym, evidence_ids=hyp.supporting_evidence_ids)
+        if target:
+            out.append(target)
+    return out
+
+
+def _t_find_callees(hyp: DiagnosisHypothesis) -> list[SearchTarget]:
+    """For SYMBOL retrieval targets: what does this call?"""
+    out: list[SearchTarget] = []
+    for sym in hyp.retrieval_targets[:2]:
+        target = _symbol_to_target(sym, evidence_ids=hyp.supporting_evidence_ids)
+        if target:
+            out.append(target)
+    return out
+
+
+def _t_find_related_tests(hyp: DiagnosisHypothesis) -> list[SearchTarget]:
+    """Find tests for the failing function/symbol."""
+    out: list[SearchTarget] = []
+    # Prefer SYMBOL targets from retrieval_targets
+    for sym in hyp.retrieval_targets[:2]:
+        target = _symbol_to_target(sym, evidence_ids=hyp.supporting_evidence_ids)
+        if target:
+            out.append(target)
+    # Fall back to failure-site file
+    if not out:
+        for site in hyp.failure_sites[:1]:
+            file_part = site.split(":")[0] if ":" in site else site
+            t = _file_to_target(file_part, evidence_ids=hyp.supporting_evidence_ids)
+            if t:
+                out.append(t)
+    # Last resort: test name
+    if not out:
+        for tname in hyp.test_names[:1]:
+            t = _test_to_target(tname, evidence_ids=hyp.supporting_evidence_ids)
+            if t:
+                out.append(t)
+    return out
+
+
+def _t_find_parallel_implementation(hyp: DiagnosisHypothesis) -> list[SearchTarget]:
+    """Find existing parallel implementations."""
+    out: list[SearchTarget] = []
+    # Anchor on failure-site file
+    for site in hyp.failure_sites[:1]:
         file_part = site.split(":")[0] if ":" in site else site
-        if not file_part:
-            continue
-        actions.append((
-            SearchActionType.FIND_DEFINITION,
-            file_part,
-            f"failure site: {site}",
+        t = _file_to_target(file_part, evidence_ids=hyp.supporting_evidence_ids)
+        if t:
+            out.append(t)
+    # Fall back to BEHAVIOR target
+    if not out:
+        out.append(_behavior_to_target(
+            "similar pattern",
+            evidence_ids=hyp.supporting_evidence_ids,
         ))
-    return actions
+    return out
 
 
-def _t_find_callers(hyp: DiagnosisHypothesis) -> list[tuple[SearchActionType, str, str]]:
-    """For target symbols: who calls this?"""
-    actions = []
-    for sym in hyp.retrieval_targets[:2]:
-        if sym:
-            actions.append((
-                SearchActionType.FIND_CALLERS,
-                sym,
-                f"who calls {sym}",
-            ))
-    return actions
-
-
-def _t_find_callees(hyp: DiagnosisHypothesis) -> list[tuple[SearchActionType, str, str]]:
-    """For target symbols: what does this call?"""
-    actions = []
-    for sym in hyp.retrieval_targets[:2]:
-        if sym:
-            actions.append((
-                SearchActionType.FIND_CALLEES,
-                sym,
-                f"what does {sym} call",
-            ))
-    return actions
-
-
-def _t_find_related_tests(hyp: DiagnosisHypothesis) -> list[tuple[SearchActionType, str, str]]:
-    """Find tests that exercise the failing function/symbol."""
-    actions = []
-    for sym in hyp.retrieval_targets[:2]:
-        if sym:
-            actions.append((
-                SearchActionType.FIND_RELATED_TESTS,
-                sym,
-                f"tests for {sym}",
-            ))
-    return actions
-
-
-def _t_find_parallel_implementation(hyp: DiagnosisHypothesis) -> list[tuple[SearchActionType, str, str]]:
-    """Find existing parallel implementations of the same kind."""
-    actions = []
-    # Use the failure-site file as anchor
+def _t_find_registration_site(hyp: DiagnosisHypothesis) -> list[SearchTarget]:
+    """Find the registration site."""
+    out: list[SearchTarget] = []
     for site in hyp.failure_sites[:1]:
         file_part = site.split(":")[0] if ":" in site else site
-        if file_part:
-            # Anchor on the module path, not the line
-            actions.append((
-                SearchActionType.FIND_PARALLEL_IMPLEMENTATION,
-                file_part,
-                "find existing similar pattern",
-            ))
-    return actions
+        t = _file_to_target(file_part, evidence_ids=hyp.supporting_evidence_ids)
+        if t:
+            out.append(t)
+    return out
 
 
-def _t_find_registration_site(hyp: DiagnosisHypothesis) -> list[tuple[SearchActionType, str, str]]:
-    """Find the registration site (e.g. __init__.py exports)."""
-    actions = []
+def _t_rehydrate_viewed(hyp: DiagnosisHypothesis) -> list[SearchTarget]:
+    """Mark that the agent already saw a relevant file; Reshaping rehydrates."""
+    out: list[SearchTarget] = []
     for site in hyp.failure_sites[:1]:
-        file_part = site.split(":")[0] if ":" in site else site
-        if file_part:
-            actions.append((
-                SearchActionType.FIND_REGISTRATION_SITE,
-                file_part,
-                "registration site",
-            ))
-    return actions
+        t = _file_to_target(
+            site.split(":")[0] if ":" in site else site,
+            evidence_ids=hyp.supporting_evidence_ids,
+        )
+        if t:
+            out.append(t)
+    return out
 
 
-def _t_rehydrate_viewed(hyp: DiagnosisHypothesis) -> list[tuple[SearchActionType, str, str]]:
-    """Mark that the agent already saw a relevant file; Reshaping rehydrates it."""
-    actions = []
-    for site in hyp.failure_sites[:1]:
-        if site:
-            actions.append((
-                SearchActionType.REHYDRATE_VIEWED_EVIDENCE,
-                site,
-                "this was viewed but lost during compression",
-            ))
-    return actions
-
-
-def _t_noop(hyp: DiagnosisHypothesis) -> list[tuple[SearchActionType, str, str]]:
-    return [(SearchActionType.NOOP, "", "no actionable retrieval target")]
+def _t_no_targets(hyp: DiagnosisHypothesis) -> list[SearchTarget]:
+    """No grounded targets available; contract will abstain."""
+    return []
 
 
 # ── Subtype → template dispatch ─────────────────────────────────────
 
 
-# Ordered list of (subtype, template_fn).
-# First match wins; NOOP is the default.
 _TEMPLATE_DISPATCH: list[tuple[str, Any]] = [
     # ── API_DEFINITION subtypes ──
     ("FRAME_ATTRIBUTE_PROPAGATION", _t_failure_site),
@@ -232,10 +514,10 @@ _TEMPLATE_DISPATCH: list[tuple[str, Any]] = [
     ("EXPORT_MISSING", _t_find_registration_site),
     # ── DEPENDENCY ──
     ("MISSING_IMPORT", _t_failure_site),
-    ("MISSING_DATA_FILE", _t_noop),
-    ("MISSING_SYSTEM_DEP", _t_noop),
+    ("MISSING_DATA_FILE", _t_no_targets),
+    ("MISSING_SYSTEM_DEP", _t_no_targets),
     # ── Fallback ──
-    ("UNCLASSIFIED", _t_noop),
+    ("UNCLASSIFIED", _t_no_targets),
 ]
 
 
@@ -243,103 +525,368 @@ def _select_template(subtype: str):
     for s, fn in _TEMPLATE_DISPATCH:
         if s == subtype:
             return fn
-    return _t_noop
+    return _t_no_targets
 
 
-# ── Builder ─────────────────────────────────────────────────────────
+# ── Validator ─────────────────────────────────────────────────────
 
 
-def _make_action_id(hyp: DiagnosisHypothesis, action_type: SearchActionType, target: str) -> str:
-    raw = f"{hyp.hypothesis_id}|{action_type.value}|{target}"
+class ContractValidator:
+    """Validates each SearchAction against action_type × target_kind rules."""
+
+    def validate(
+        self,
+        contract: SearchContract,
+        *,
+        ledger: EvidenceLedger | None = None,
+    ) -> list[str]:
+        """Return a list of issues. Empty list means valid."""
+        issues: list[str] = []
+        for action in contract.actions:
+            issues.extend(self._validate_action(action, ledger))
+        return issues
+
+    def _validate_action(
+        self,
+        action: SearchAction,
+        ledger: EvidenceLedger | None,
+    ) -> list[str]:
+        issues: list[str] = []
+        target = action.target
+
+        if not target.value:
+            issues.append(f"{action.action_id}: empty target.value")
+        if is_primitive_literal(target.value):
+            issues.append(
+                f"{action.action_id}: target {target.value!r} is a primitive literal; "
+                "Router would search for a builtin"
+            )
+
+        allowed_kinds = _ACTION_TARGET_KINDS.get(action.action_type, set())
+        if allowed_kinds and target.kind not in allowed_kinds:
+            issues.append(
+                f"{action.action_id}: {action.action_type.value} requires "
+                f"target_kind in {[k.value for k in allowed_kinds]}, "
+                f"got {target.kind.value}"
+            )
+
+        if ledger is not None and target.kind == SearchTargetKind.EVIDENCE:
+            if not ledger.has(target.value):
+                issues.append(
+                    f"{action.action_id}: evidence target {target.value!r} "
+                    "not in ledger"
+                )
+
+        return issues
+
+
+# ── ID helpers ─────────────────────────────────────────────────────
+
+
+def make_action_id(hyp_id: str, action_type: SearchActionType, target_value: str) -> str:
+    raw = f"{hyp_id}|{action_type.value}|{target_value}"
     return "A" + hashlib.sha256(raw.encode()).hexdigest()[:8]
+
+
+# ── Per-hypothesis contract builder ────────────────────────────────
 
 
 def build_search_contract(
     hypothesis: DiagnosisHypothesis,
     *,
-    global_budget: int = 4,
+    max_actions: int = 3,
+    per_action_budget: int = 2,
+    ledger: EvidenceLedger | None = None,
 ) -> SearchContract:
     """Build a SearchContract from a single DiagnosisHypothesis.
 
-    Args:
-        hypothesis: One DiagnosisHypothesis from the Reasoner.
-        global_budget: Maximum total actions to emit for this hypothesis.
-
-    Rules:
-      - If the hypothesis is REJECTED or ABSTAINED, return an abstained
-        contract with NOOP explanation.
-      - Apply the subtype template; cap actions by global_budget.
-      - Each action's `budget` field defaults to 2; never > 5.
+    Returns ABSTAINED contract when no grounded targets exist.
+    Returns INVALID contract when validator finds issues.
     """
-    from condiag.diagnosis.hypothesis import HypothesisStatus
+    contract = SearchContract(hypothesis_id=hypothesis.hypothesis_id)
 
     if hypothesis.status in (HypothesisStatus.REJECTED, HypothesisStatus.ABSTAINED):
-        return SearchContract(
-            hypothesis_id=hypothesis.hypothesis_id,
-            actions=[],
-            abstained=True,
-            abstention_reason=f"hypothesis is {hypothesis.status.value}",
-            total_budget=0,
-        )
+        contract.status = ContractStatus.ABSTAINED
+        contract.abstention_reason = f"hypothesis is {hypothesis.status.value}"
+        return contract
 
-    if hypothesis.confidence == "low" and not hypothesis.retrieval_targets \
-            and not hypothesis.failure_sites:
-        return SearchContract(
-            hypothesis_id=hypothesis.hypothesis_id,
-            actions=[],
-            abstained=True,
-            abstention_reason="low confidence + no actionable targets",
-            total_budget=0,
-        )
+    if (
+        hypothesis.confidence == "low"
+        and not hypothesis.retrieval_targets
+        and not hypothesis.failure_sites
+    ):
+        contract.status = ContractStatus.ABSTAINED
+        contract.abstention_reason = "low confidence + no actionable targets"
+        return contract
 
     template = _select_template(hypothesis.subtype)
-    raw_actions = template(hypothesis)
+    targets = template(hypothesis)
+
+    if not targets:
+        contract.status = ContractStatus.ABSTAINED
+        contract.abstention_reason = "no grounded retrieval target"
+        return contract
+
+    # Group targets by (action_type, target.kind) to choose action type.
+    # For now, derive action_type from the FIRST template emission by
+    # matching the function name. Simpler: try the canonical action_type
+    # for the subtype (see below).
+    chosen_action_type = _subtype_to_action_type(hypothesis.subtype)
+    if chosen_action_type is None:
+        contract.status = ContractStatus.ABSTAINED
+        contract.abstention_reason = f"no template for subtype {hypothesis.subtype}"
+        return contract
 
     actions: list[SearchAction] = []
-    for action_type, target, reason in raw_actions:
-        if len(actions) >= global_budget:
-            break
-        action = SearchAction(
-            action_id=_make_action_id(hypothesis, action_type, target),
-            action_type=action_type,
-            target=target,
-            reason=reason,
+    for tgt in targets[:max_actions]:
+        if tgt.kind not in _ACTION_TARGET_KINDS[chosen_action_type]:
+            # Skip incompatible target kind for this action
+            continue
+        actions.append(SearchAction(
+            action_id=make_action_id(hypothesis.hypothesis_id, chosen_action_type, tgt.value),
+            action_type=chosen_action_type,
+            target=tgt,
+            reason=hypothesis.statement or hypothesis.reason,
             cluster_ids=list(hypothesis.cluster_ids),
-            evidence_ids=list(hypothesis.supporting_evidence_ids),
-            budget=2,
-        )
-        actions.append(action)
+            evidence_ids=list(tgt.source_evidence_ids)
+                        or list(hypothesis.supporting_evidence_ids),
+            budget=per_action_budget,
+            stop_condition=_stop_condition_for(chosen_action_type),
+        ))
 
-    return SearchContract(
-        hypothesis_id=hypothesis.hypothesis_id,
-        actions=actions,
-        abstained=not actions,
-        abstention_reason="" if actions else "no actionable targets",
-        total_budget=sum(a.budget for a in actions),
-    )
+    if not actions:
+        contract.status = ContractStatus.ABSTAINED
+        contract.abstention_reason = "no action-compatible targets"
+        return contract
+
+    contract.actions = actions
+    contract.total_budget = sum(a.budget for a in actions)
+    contract.status = ContractStatus.ACTIONABLE
+
+    # Validate
+    validator = ContractValidator()
+    issues = validator.validate(contract, ledger=ledger)
+    contract.validation_issues = issues
+    if issues:
+        contract.status = ContractStatus.INVALID
+    return contract
+
+
+_SUBTYPE_ACTION_TYPE: dict[str, SearchActionType] = {
+    # API_DEFINITION → look up the definition
+    "FRAME_ATTRIBUTE_PROPAGATION": SearchActionType.FIND_DEFINITION,
+    "FUNCTION_SIGNATURE_MISMATCH": SearchActionType.FIND_DEFINITION,
+    "CLASS_ATTRIBUTE_MISSING": SearchActionType.FIND_DEFINITION,
+    "METHOD_NOT_FOUND": SearchActionType.FIND_DEFINITION,
+    "MODULE_MEMBER_MISSING": SearchActionType.FIND_DEFINITION,
+    # INTERFACE_CONSTRAINT → call chain
+    "ARGUMENT_TYPE_MISMATCH": SearchActionType.FIND_CALLERS,
+    "FRAME_ATTRIBUTE_CONSTRAINT": SearchActionType.FIND_CALLERS,
+    # RELATED_TESTS
+    "NUMERICAL_MISMATCH": SearchActionType.FIND_RELATED_TESTS,
+    "ROUTE_COMPARISON_FAILURE": SearchActionType.FIND_PARALLEL_IMPLEMENTATION,
+    "EDGE_CASE_MISSING": SearchActionType.FIND_RELATED_TESTS,
+    "REGRESSION_DETECTED": SearchActionType.FIND_RELATED_TESTS,
+    # CALLER_CALLEE
+    "FRAME_MUTATION_IN_TRANSFORM": SearchActionType.FIND_CALLEES,
+    "ARGUMENT_FORWARDING_MISMATCH": SearchActionType.FIND_CALLEES,
+    # LOCALIZATION_DIRECTION
+    "WRONG_FILE_MODIFIED": SearchActionType.FIND_DEFINITION,
+    "WRONG_FUNCTION_MODIFIED": SearchActionType.FIND_DEFINITION,
+    "SYMPTOM_CAUSE_MISMATCH": SearchActionType.FIND_PARALLEL_IMPLEMENTATION,
+    # REGISTRATION_SITE
+    "TRANSFORM_NOT_REGISTERED": SearchActionType.FIND_REGISTRATION_SITE,
+    "CONFIG_NOT_UPDATED": SearchActionType.FIND_REGISTRATION_SITE,
+    "EXPORT_MISSING": SearchActionType.FIND_REGISTRATION_SITE,
+    # DEPENDENCY
+    "MISSING_IMPORT": SearchActionType.FIND_DEFINITION,
+}
+
+
+def _subtype_to_action_type(subtype: str) -> SearchActionType | None:
+    return _SUBTYPE_ACTION_TYPE.get(subtype)
+
+
+def _stop_condition_for(action_type: SearchActionType) -> str:
+    return {
+        SearchActionType.FIND_DEFINITION: "definition located; one file found",
+        SearchActionType.FIND_PARALLEL_IMPLEMENTATION: "one parallel implementation found",
+        SearchActionType.FIND_RELATED_TESTS: "one related test found",
+        SearchActionType.FIND_CALLEES: "one call site found",
+        SearchActionType.FIND_CALLERS: "one caller found",
+        SearchActionType.FIND_REGISTRATION_SITE: "registration site found",
+        SearchActionType.REHYDRATE_VIEWED_EVIDENCE: "evidence rehydrated",
+    }.get(action_type, "one result found")
 
 
 def build_search_contracts(
     hypotheses: list[DiagnosisHypothesis],
     *,
-    global_budget: int = 4,
+    max_actions: int = 3,
+    per_action_budget: int = 2,
+    ledger: EvidenceLedger | None = None,
 ) -> list[SearchContract]:
     """Build a SearchContract for each hypothesis."""
-    return [build_search_contract(h, global_budget=global_budget) for h in hypotheses]
+    return [
+        build_search_contract(
+            h,
+            max_actions=max_actions,
+            per_action_budget=per_action_budget,
+            ledger=ledger,
+        )
+        for h in hypotheses
+    ]
 
 
-# ── Plan serializer ─────────────────────────────────────────────────
+# ── Plan-level allocator ──────────────────────────────────────────
+
+
+@dataclass
+class PlanBudget:
+    """Plan-wide budget for all contracts."""
+
+    max_total_actions: int = 3
+    max_total_budget: int = 5
+
+
+def _hypothesis_priority(h: DiagnosisHypothesis) -> tuple:
+    """Lower rank = higher priority."""
+    conf_rank = {"high": 0, "medium": 1, "low": 2}.get(h.confidence, 3)
+    return (conf_rank, h.uncertainty, -len(h.cluster_ids))
+
+
+def build_search_plan(
+    hypotheses: list[DiagnosisHypothesis],
+    *,
+    budget: PlanBudget | None = None,
+    ledger: EvidenceLedger | None = None,
+) -> list[SearchContract]:
+    """Plan-level allocation.
+
+    Steps:
+      1. Build per-hypothesis contract (with default max_actions=3).
+      2. Sort by hypothesis priority (confidence asc, uncertainty asc).
+      3. Greedily add contracts while total_actions <= max_total_actions
+         AND total_budget <= max_total_budget.
+      4. Drop / abstain contracts that don't fit.
+    """
+    budget = budget or PlanBudget()
+    contracts = [
+        build_search_contract(h, ledger=ledger) for h in hypotheses
+    ]
+
+    # Sort by priority (higher priority first)
+    indexed = list(zip(hypotheses, contracts))
+    indexed.sort(key=lambda pair: _hypothesis_priority(pair[0]))
+
+    accepted: list[SearchContract] = []
+    n_actions = 0
+    total_budget = 0
+
+    for h, c in indexed:
+        if c.status != ContractStatus.ACTIONABLE:
+            accepted.append(c)  # keep abstained/invalid for transparency
+            continue
+        if n_actions + len(c.actions) > budget.max_total_actions:
+            # Demote to abstained
+            c.status = ContractStatus.ABSTAINED
+            c.abstention_reason = "exceeds plan-level action budget"
+            c.actions = []
+            c.total_budget = 0
+            accepted.append(c)
+            continue
+        if total_budget + c.total_budget > budget.max_total_budget:
+            c.status = ContractStatus.ABSTAINED
+            c.abstention_reason = "exceeds plan-level result budget"
+            c.actions = []
+            c.total_budget = 0
+            accepted.append(c)
+            continue
+        n_actions += len(c.actions)
+        total_budget += c.total_budget
+        accepted.append(c)
+
+    # Restore original order (don't return in priority-sorted order)
+    hyp_to_idx = {id(h): i for i, h in enumerate(hypotheses)}
+    accepted.sort(key=lambda c: hyp_to_idx.get(id(corresponding_hypothesis(c, hypotheses, indexed)), 0))
+    return accepted
+
+
+def corresponding_hypothesis(
+    contract: SearchContract,
+    hypotheses: list[DiagnosisHypothesis],
+    indexed_pairs: list[tuple],
+) -> DiagnosisHypothesis:
+    """Helper: find the hypothesis a contract was built from."""
+    for h, c in indexed_pairs:
+        if c is contract:
+            return h
+    return hypotheses[0]
+
+
+# ── Shadow artifact writer ────────────────────────────────────────
+
+
+def write_shadow_artifacts(
+    output_dir: str | Path,
+    *,
+    contracts: list[SearchContract],
+    hypotheses: list[DiagnosisHypothesis],
+    ledger: EvidenceLedger | None = None,
+    validation_report: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """Write Shadow artifacts to output_dir.
+
+    Produces:
+      - evidence_items.json  (if ledger provided)
+      - diagnosis_hypotheses.json
+      - search_contracts.json
+      - contract_validation.json
+
+    Returns the dict of paths written.
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, str] = {}
+
+    if ledger is not None:
+        p = out_dir / "evidence_items.json"
+        p.write_text(json.dumps(ledger.to_dict(), indent=2))
+        paths["evidence_items"] = str(p)
+
+    p = out_dir / "diagnosis_hypotheses.json"
+    p.write_text(json.dumps({"hypotheses": [h.to_dict() for h in hypotheses]}, indent=2))
+    paths["diagnosis_hypotheses"] = str(p)
+
+    p = out_dir / "search_contracts.json"
+    p.write_text(json.dumps(
+        {"contracts": [c.to_dict() for c in contracts]},
+        indent=2,
+    ))
+    paths["search_contracts"] = str(p)
+
+    if validation_report is not None:
+        p = out_dir / "contract_validation.json"
+        p.write_text(json.dumps(validation_report, indent=2))
+        paths["contract_validation"] = str(p)
+
+    return paths
+
+
+# ── Plan serializer (legacy compat) ─────────────────────────────────
 
 
 def serialize_plan(
     contracts: list[SearchContract],
     hypotheses: list[DiagnosisHypothesis],
 ) -> dict[str, Any]:
-    """Serialize a list of contracts + hypotheses as a Shadow artifact."""
+    """Lightweight serialization for in-memory passing."""
     return {
-        "version": "1",
+        "version": "2",
         "hypotheses": [h.to_dict() for h in hypotheses],
         "contracts": [c.to_dict() for c in contracts],
         "n_actions": sum(len(c.actions) for c in contracts),
-        "n_abstained": sum(1 for c in contracts if c.abstained),
+        "n_actionable": sum(1 for c in contracts if c.status == ContractStatus.ACTIONABLE),
+        "n_abstained": sum(1 for c in contracts if c.status == ContractStatus.ABSTAINED),
+        "n_invalid": sum(1 for c in contracts if c.status == ContractStatus.INVALID),
     }
