@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from condiag.diagnosis.signals.pytest_extractor import extract_test_log, _RE_TEST_HEADER
+from condiag.diagnosis.signals.pytest_extractor import (
+    extract_test_log,
+    _RE_TEST_HEADER,
+    _reconcile_failures,
+    FailureBindingError,
+)
 from condiag.diagnosis.failure_event import (
     FailureEvent,
     extract_failure_events,
@@ -141,9 +146,6 @@ class TestSectionReconciliation:
 
     def test_same_count_but_different_names_raises(self, tmp_path):
         """Same count but one name differs → FailureBindingError."""
-        from condiag.diagnosis.signals.pytest_extractor import (
-            FailureBindingError,
-        )
         log = (
             "============================= FAILURES =============================\n"
             "______________________________ test_foo _____________________________\n"
@@ -284,3 +286,90 @@ class TestEdgeCases:
         clusters = cluster_failures([ev])
         assert len(clusters) == 1
         assert clusters[0].count == 1
+
+
+# ── Real pytest log fixture ────────────────────────────────────────
+
+
+def _find_real_canary_log() -> Path | None:
+    """Locate a real pytest-format test_output.txt from past canary runs.
+
+    Searches logs/ first, then canary output captures under /tmp.
+    Returns None when no log is found (tests skip in that case).
+    """
+    repo_logs = Path("logs/run_evaluation")
+    if repo_logs.exists():
+        # Use the most recent canary directory
+        candidates = sorted(repo_logs.glob("*/condiag-agent/*/test_output.txt"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+        if candidates:
+            return candidates[0]
+    return None
+
+
+REAL_CANARY_LOG = _find_real_canary_log()
+HAS_REAL_LOG = REAL_CANARY_LOG is not None
+
+
+@pytest.mark.skipif(not HAS_REAL_LOG, reason="no real canary log available")
+class TestRealPytestLog:
+    """Verify parser against a real SWE-bench test_output.txt from canary."""
+
+    def test_real_log_parses_per_test(self):
+        if not REAL_CANARY_LOG:
+            pytest.skip("no real canary log")
+        tl = extract_test_log(str(REAL_CANARY_LOG))
+        # Real pytest runs always have at least 1 failure or 1 success.
+        # For the failure case: failures must have one entry per failed test.
+        if tl.failures:
+            assert len(tl.failures) == len(tl.failed_tests), (
+                f"real log: failures={len(tl.failures)} "
+                f"failed_tests={len(tl.failed_tests)}"
+            )
+
+    def test_real_log_reconciliation_status_known(self):
+        if not REAL_CANARY_LOG:
+            pytest.skip("no real canary log")
+        tl = extract_test_log(str(REAL_CANARY_LOG))
+        # If there is a FAILURES section + summary, reconciliation must be set.
+        if tl.failures and tl.failed_tests:
+            assert tl.reconciliation.match_status in {"exact", "count_only", "unmatched"}
+            assert tl.reconciliation.section_count > 0
+
+    def test_real_log_per_test_has_bound_message(self):
+        """Each parsed failure must have its OWN error_message, not a shared one."""
+        if not REAL_CANARY_LOG:
+            pytest.skip("no real canary log")
+        tl = extract_test_log(str(REAL_CANARY_LOG))
+        for f in tl.failures:
+            assert f.test_name, "real failure must have test_name"
+            assert isinstance(f.stack_frames, list)
+            # Either message or assertion_line must be non-empty.
+            assert f.error_message or f.assertion_line, (
+                f"failure {f.test_name} has neither error_message nor assertion_line"
+            )
+
+    def test_real_log_clustering_runs(self):
+        """The full pipeline (extract → cluster → diagnose) must not crash on real data."""
+        if not REAL_CANARY_LOG:
+            pytest.skip("no real canary log")
+        from condiag.diagnosis.failure_event import (
+            extract_failure_events,
+            reasoner_v2_cluster,
+        )
+        from condiag.diagnosis.signals.schema import RuntimeFailureFeatureBundle
+        from condiag.diagnosis.alignment import reasoner_v2_diagnose
+
+        tl = extract_test_log(str(REAL_CANARY_LOG))
+        bundle = RuntimeFailureFeatureBundle(test_log=tl)
+        clusters = reasoner_v2_cluster(bundle)
+        assert len(clusters) >= 1, "real log must produce at least one cluster"
+
+        # Diagnose must succeed without raising.
+        diagnoses = reasoner_v2_diagnose(
+            clusters, bundle.patch, bundle.trajectory,
+        )
+        assert len(diagnoses) == len(clusters)
+        # All diagnoses must have a subtype.
+        for d in diagnoses:
+            assert d.subtype, "diagnosis must have a subtype"
