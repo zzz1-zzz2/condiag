@@ -31,6 +31,7 @@ from typing import Optional
 
 from condiag.diagnosis.signals.enums import ErrorType, TestFramework
 from condiag.diagnosis.signals.schema import (
+    FailureReconciliation,
     StackFrame,
     TestFailureSignal,
     TestLogSignals,
@@ -230,6 +231,9 @@ def extract_test_log(test_log_path: str | Path) -> TestLogSignals:
     # Parse summary for FAILED/PASSED test lists
     _extract_from_summary(signals, lines)
 
+    # Reconcile section-parsed failures with summary entries
+    _reconcile_failures(signals)
+
     # Derive aggregate fields from per-test records
     _derive_aggregates(signals)
 
@@ -309,3 +313,75 @@ def _derive_aggregates(signals: TestLogSignals) -> None:
         signals.call_chains.append(rec.stack_frames)
 
     signals.error_types = error_type_counts
+
+
+class FailureBindingError(ValueError):
+    """Section-parsed failures do not reconcile with summary FAILED entries."""
+
+
+def _nodeid_leaf(nodeid: str) -> str:
+    """Extract the leaf test name from a full nodeid.
+
+    'astropy/tests/test_fake.py::test_foo[param]' → 'test_foo[param]'
+    'astropy/tests/test_fake.py::test_foo'        → 'test_foo'
+    'test_foo'                                    → 'test_foo'
+    """
+    return nodeid.split("::")[-1] if "::" in nodeid else nodeid
+
+
+def _reconcile_failures(signals: TestLogSignals) -> None:
+    """Match section-parsed failures to summary FAILED entries by leaf name.
+
+    Sets signals.reconciliation and raises FailureBindingError if
+    any section or summary entry cannot be matched.
+    """
+    section_names = [f.test_name for f in signals.failures]
+    summary_leafs = [_nodeid_leaf(n) for n in signals.failed_tests]
+
+    # Build parameterized‑aware matcher:
+    #   test_foo[x] in sections matches test_foo[x] or test_foo in summary
+    #   test_foo in sections matches test_foo in summary
+    unmatched_sections: list[str] = []
+    used_summary: set[int] = set()
+
+    for sname in section_names:
+        found = False
+        for j, lname in enumerate(summary_leafs):
+            if j in used_summary:
+                continue
+            # Exact match or param match
+            if sname == lname or sname.split("[")[0] == lname.split("[")[0]:
+                used_summary.add(j)
+                found = True
+                break
+        if not found:
+            unmatched_sections.append(sname)
+
+    unmatched_summary = [
+        signals.failed_tests[i]
+        for i in range(len(summary_leafs))
+        if i not in used_summary
+    ]
+
+    exact_matches = len(used_summary)
+    if not unmatched_sections and not unmatched_summary:
+        status = "exact"
+    elif exact_matches == len(section_names) == len(summary_leafs):
+        status = "count_only"
+    else:
+        status = "unmatched"
+        raise FailureBindingError(
+            f"Section/summary mismatch: {len(unmatched_sections)} unmatched sections, "
+            f"{len(unmatched_summary)} unmatched summary entries. "
+            f"Unmatched sections: {unmatched_sections}. "
+            f"Unmatched summary: {unmatched_summary}"
+        )
+
+    signals.reconciliation = FailureReconciliation(
+        section_count=len(section_names),
+        summary_failed_count=len(summary_leafs),
+        exact_matches=exact_matches,
+        unmatched_sections=unmatched_sections,
+        unmatched_summary_nodeids=unmatched_summary,
+        match_status=status,
+    )

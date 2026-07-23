@@ -77,6 +77,20 @@ class TestFailureSignal(BaseModel):
     raw_excerpt: str = Field(default="", description="Raw text of the failure section")
 
 
+class FailureReconciliation(BaseModel):
+    """Record of how section-parsed failures map to summary FAILED entries.
+
+    Produced by extract_test_log() after both sections and summary are parsed.
+    """
+
+    section_count: int = 0
+    summary_failed_count: int = 0
+    exact_matches: int = 0
+    unmatched_sections: list[str] = Field(default_factory=list)
+    unmatched_summary_nodeids: list[str] = Field(default_factory=list)
+    match_status: str = "unknown"  # exact | count_only | unmatched
+
+
 # ════════════════════════════════════════════════════════════════════
 # Layer 1: Raw extraction outputs (one per data source)
 # ════════════════════════════════════════════════════════════════════
@@ -151,6 +165,10 @@ class TestLogSignals(BaseModel):
                     "error_message/assertion_line/stack_frames bound to this test only. "
                     "Derived aggregate fields (failed_tests, error_messages, etc.) remain "
                     "for backward compatibility.",
+    )
+    reconciliation: FailureReconciliation = Field(
+        default_factory=FailureReconciliation,
+        description="Section↔summary matching report. empty when no FAILURES section.",
     )
 
 

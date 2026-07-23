@@ -280,8 +280,15 @@ def cluster_failures(events: list[FailureEvent]) -> list[FailureCluster]:
         if len(group) < 2:
             continue
         # Verify second signal: shared fingerprint, top frame, or call-chain overlap
-        sig1 = len({e.message_fingerprint for e in group if e.message_fingerprint not in _LOW_INFO_FINGERPRINTS}) <= 1
-        sig2 = len({e.top_repo_frame for e in group if e.top_repo_frame}) <= 1
+        # Each sig must be (a) non-empty AND (b) exactly one unique value across the group.
+        # An empty set (all events have low-info) is NOT a signal.
+        fingerprints = {e.message_fingerprint for e in group
+                        if e.message_fingerprint not in _LOW_INFO_FINGERPRINTS}
+        sig1 = bool(fingerprints) and len(fingerprints) == 1
+
+        top_frames = {e.top_repo_frame for e in group if e.top_repo_frame}
+        sig2 = bool(top_frames) and len(top_frames) == 1
+
         chain_sets = [set(e.call_chain) for e in group if e.call_chain]
         sig3 = False
         if len(chain_sets) >= 2:

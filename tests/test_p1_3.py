@@ -139,6 +139,32 @@ class TestSectionReconciliation:
         assert len(tl.failures) == 0
         assert tl.failed_tests == ["test_fake.py::test_b"]
 
+    def test_same_count_but_different_names_raises(self, tmp_path):
+        """Same count but one name differs → FailureBindingError."""
+        from condiag.diagnosis.signals.pytest_extractor import (
+            FailureBindingError,
+        )
+        log = (
+            "============================= FAILURES =============================\n"
+            "______________________________ test_foo _____________________________\n"
+            ">       assert 1\n"
+            "E       AssertionError:\n"
+            "\n"
+            "______________________________ test_bar _____________________________\n"
+            ">       x = 1\n"
+            "E       TypeError: bad\n"
+            "\n"
+            "=========================== short test summary info ============================\n"
+            "FAILED path/test.py::test_foo\n"
+            "FAILED path/test.py::test_baz\n"
+            "2 failed in 0.01s\n"
+        )
+        p = tmp_path / "mismatch.log"
+        p.write_text(log)
+        with pytest.raises(FailureBindingError) as excinfo:
+            extract_test_log(str(p))
+        assert "unmatched" in str(excinfo.value)
+
 
 # ── Clustering tests ────────────────────────────────────────────────
 
@@ -159,9 +185,10 @@ class TestClustering:
         )
 
     def test_param_family_clusters_together(self):
+        """Param tests in same family + same top frame merge."""
         events = [
-            self._make_event("test_a[x]", "AssertionError"),
-            self._make_event("test_a[y]", "AssertionError"),
+            self._make_event("test_a[x]", "AssertionError", frames=["mod.py:1"]),
+            self._make_event("test_a[y]", "AssertionError", frames=["mod.py:1"]),
         ]
         clusters = cluster_failures(events)
         assert len(clusters) == 1
@@ -173,6 +200,26 @@ class TestClustering:
         ]
         clusters = cluster_failures(events)
         assert len(clusters) == 2, "different param groups must not merge"
+
+    def test_parameterized_low_info_without_frames_stays_singleton(self):
+        """Param tests with same group, bare AssertionError, and no frames
+        must NOT merge — empty set is not a shared signal."""
+        events = [
+            self._make_event("test_a[p1]", "AssertionError", "AssertionError:"),
+            self._make_event("test_a[p2]", "AssertionError", "AssertionError:"),
+        ]
+        clusters = cluster_failures(events)
+        assert len(clusters) == 2, \
+            "low-info param tests without secondary signal must stay separate"
+
+    def test_param_shared_top_frame_merges(self):
+        """Param tests sharing the same top_repo_frame may merge."""
+        events = [
+            self._make_event("test_a[p1]", "TypeError", "err", frames=["base.py:1"]),
+            self._make_event("test_a[p2]", "TypeError", "err", frames=["base.py:1"]),
+        ]
+        clusters = cluster_failures(events)
+        assert len(clusters) == 1
 
     def test_same_message_fingerprint_clusters(self):
         events = [

@@ -313,17 +313,23 @@ def classify_cluster(
     if cluster.events:
         error_msg = cluster.events[0].message
 
-    # Flag: assert compares two computed paths/routes
-    route_comparison = any(
+    # Flag: numerical-comparison assertion (allclose/almost_equal).
+    # Plain assertEqual is excluded — it can be any value/type comparison,
+    # not specifically a numerical precision check.
+    numerical_comparison = any(
         e.assertion_line
-        and any(kw in e.assertion_line.lower() for kw in ["allclose", "almost_equal", "assertequal"])
+        and any(kw in e.assertion_line.lower()
+                for kw in ["allclose", "almost_equal", "assert_almost_equal", "assert_allclose"])
         for e in cluster.events
     )
-    # Also check for assertions comparing two named routes in the error message
-    route_comparison = route_comparison or any(
-        "via" in e.message.lower()
+    # Also detect "via X" or "via Y" pattern in assertion text — only
+    # that upgrades to ROUTE_COMPARISON (route-equivalence).
+    route_hint = any(
+        e.assertion_line
+        and " via " in e.assertion_line.lower()
         for e in cluster.events
     )
+    route_comparison = numerical_comparison and route_hint
 
     # Flag: "unexpected keywords" about frame construction
     frame_kw_mismatch = any("unexpected keyword" in e.message.lower()
@@ -338,19 +344,35 @@ def classify_cluster(
 
     # ═════ Decision Tree ─────────────────────────────────────────
 
-    # ── NUMERICAL_MISMATCH: assertion compares computed values ──
+    # ── ROUTE_COMPARISON: numerical assertion comparing two routes ──
     if route_comparison:
         return SubtypedDiagnosis(
             type=ContextDeficiencyType.RELATED_TESTS,
-            subtype="NUMERICAL_MISMATCH",
+            subtype="ROUTE_COMPARISON_FAILURE",
             confidence="high",
             target_symbols=alignment.error_symbols[:5],
             key_location=cluster.root_cause,
             evidence_alignment=alignment,
             reason=(
+                "Numerical assertion compared values computed via two different "
+                "execution paths and they disagree. The new code introduces "
+                "an inconsistency with the existing route."
+            ),
+        )
+
+    # ── NUMERICAL_MISMATCH: numerical assertion failed ──
+    if numerical_comparison:
+        return SubtypedDiagnosis(
+            type=ContextDeficiencyType.RELATED_TESTS,
+            subtype="NUMERICAL_MISMATCH",
+            confidence="medium",
+            target_symbols=alignment.error_symbols[:5],
+            key_location=cluster.root_cause,
+            evidence_alignment=alignment,
+            reason=(
                 "Numerical assertion failed — a computed value did not match "
-                "the expected result. This may indicate a logic error or "
-                "route inconsistency in the modified code."
+                "the expected result. Could indicate a logic error or "
+                "numerical precision issue in the modified code."
             ),
         )
 
