@@ -23,7 +23,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable
 
-from condiag.diagnosis.hypothesis import DiagnosisHypothesis, HypothesisStatus
+from condiag.diagnosis.hypothesis import (
+    DiagnosisHypothesis,
+    HypothesisStatus,
+    make_evidence_id,
+)
 
 
 # ── Target kinds ───────────────────────────────────────────────────
@@ -618,6 +622,96 @@ class ContractValidator:
 def make_action_id(hyp_id: str, action_type: SearchActionType, target_value: str) -> str:
     raw = f"{hyp_id}|{action_type.value}|{target_value}"
     return "A" + hashlib.sha256(raw.encode()).hexdigest()[:8]
+
+
+def build_evidence_ledger(
+    clusters,
+    diagnoses,
+    bundle=None,
+) -> EvidenceLedger:
+    """Build a real EvidenceLedger from clusters + diagnoses + (optional) bundle.
+
+    Each evidence item carries its real `kind` (failure_site, target_symbol,
+    test_failure, assertion, patch_edit, trajectory_view) — never inferred
+    from hash-id strings. ID collisions between clusters are silently
+    absorbed; collisions within the same semantic context raise
+    EvidenceConflictError (fail-fast).
+
+    Returns the populated ledger.
+    """
+    ledger = EvidenceLedger()
+
+    for cluster, sub in zip(clusters, diagnoses):
+        cluster_id = cluster.cluster_id
+        # failure_site evidence
+        if sub.key_location:
+            ledger.add(EvidenceItem(
+                evidence_id=make_evidence_id(
+                    "failure_site", sub.key_location, sub.reason,
+                ),
+                cluster_id=cluster_id,
+                source=EvidenceSource.STACK_FRAME,
+                kind="failure_site",
+                location=sub.key_location,
+                content=sub.reason,
+                strength="supporting",
+            ))
+        # target_symbol evidence (one per symbol)
+        for sym in sub.target_symbols[:5]:
+            ledger.add(EvidenceItem(
+                evidence_id=make_evidence_id(
+                    "target_symbol", sub.key_location or cluster_id, sym,
+                ),
+                cluster_id=cluster_id,
+                source=EvidenceSource.ASSERTION,
+                kind="target_symbol",
+                location=sub.key_location or "",
+                content=sym,
+                strength="supporting",
+            ))
+        # test_failure evidence
+        for tname in cluster.test_names[:5]:
+            ledger.add(EvidenceItem(
+                evidence_id=make_evidence_id(
+                    "test_failure", cluster_id, tname,
+                ),
+                cluster_id=cluster_id,
+                source=EvidenceSource.TEST_FAILURE,
+                kind="test_failure",
+                location=tname,
+                content=f"failed test in cluster {cluster_id}",
+                strength="supporting",
+            ))
+        # assertion evidence
+        for ev in cluster.events[:3]:
+            if ev.assertion_line:
+                ledger.add(EvidenceItem(
+                    evidence_id=make_evidence_id(
+                        "assertion", cluster_id, ev.assertion_line,
+                    ),
+                    cluster_id=cluster_id,
+                    source=EvidenceSource.ASSERTION,
+                    kind="assertion",
+                    location=ev.top_repo_frame or "",
+                    content=ev.assertion_line,
+                    strength="supporting",
+                ))
+        # patch_edit evidence
+        if bundle is not None:
+            for edited in bundle.patch.edited_files[:5]:
+                ledger.add(EvidenceItem(
+                    evidence_id=make_evidence_id(
+                        "patch_edit", cluster_id, edited,
+                    ),
+                    cluster_id=cluster_id,
+                    source=EvidenceSource.PATCH_EDIT,
+                    kind="patch_edit",
+                    location=edited,
+                    content=f"R1 patch edited {edited}",
+                    strength="neutral",
+                ))
+
+    return ledger
 
 
 # ── Per-hypothesis contract builder ────────────────────────────────

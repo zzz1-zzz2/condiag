@@ -275,7 +275,6 @@ def run_experiment(
         # ═══════ Diagnosis (CD only) ═══════
         diagnosis = None
         diag_text = None
-        shadow_diagnosis = None
         if run_cd:
             from condiag.diagnosis.taxonomy import ContextDeficiencyType
             from condiag.diagnosis.failure_event import (
@@ -284,10 +283,8 @@ def run_experiment(
             from condiag.diagnosis.alignment import reasoner_v2_diagnose
             from condiag.diagnosis.hypothesis import from_subtyped_diagnosis
             from condiag.diagnosis.search_contract import (
-                EvidenceItem,
-                EvidenceLedger,
-                EvidenceSource,
                 PlanBudget,
+                build_evidence_ledger,
                 build_search_plan,
                 write_shadow_artifacts,
             )
@@ -417,16 +414,15 @@ def run_experiment(
             out.cd_run = False
 
         # ═══════ P1-3C Shadow Artifacts ═══════
-        # If we ran the CD branch, build hypotheses + contracts from the
-        # same bundle and write Shadow artifacts. This is the wiring step
-        # that closes P1-3C-5: every real episode now produces artifacts.
-        if run_cd and shadow_diagnosis is not None:
+        # If we ran the CD branch, build hypotheses + contracts + ledger
+        # and write Shadow artifacts. This wiring closes P1-3C-5: every
+        # real episode produces cd/p1_3c_shadow/*.json.
+        if run_cd:
+            shadow_error: dict | None = None
             try:
                 from condiag.diagnosis.search_contract import (
-                    EvidenceItem,
-                    EvidenceLedger,
-                    EvidenceSource,
                     PlanBudget,
+                    build_evidence_ledger,
                     build_search_plan,
                     write_shadow_artifacts,
                 )
@@ -434,11 +430,7 @@ def run_experiment(
                     reasoner_v2_cluster,
                 )
                 from condiag.diagnosis.alignment import reasoner_v2_diagnose
-                from condiag.diagnosis.hypothesis import (
-                    from_subtyped_diagnosis,
-                    make_evidence_id,
-                )
-                from condiag.diagnosis.taxonomy import ContextDeficiencyType
+                from condiag.diagnosis.hypothesis import from_subtyped_diagnosis
 
                 shadow_clusters = reasoner_v2_cluster(bundle)
                 shadow_dx_list = reasoner_v2_diagnose(
@@ -448,23 +440,9 @@ def run_experiment(
                     from_subtyped_diagnosis(d, c.cluster_id, c.test_names)
                     for c, d in zip(shadow_clusters, shadow_dx_list)
                 ]
-                # Build evidence ledger from each hypothesis's supporting IDs
-                ledger = EvidenceLedger()
-                for hyp in shadow_hyps:
-                    loc = hyp.failure_sites[0] if hyp.failure_sites else ""
-                    for eid in hyp.supporting_evidence_ids:
-                        try:
-                            ledger.add(EvidenceItem(
-                                evidence_id=eid,
-                                cluster_id=hyp.cluster_ids[0] if hyp.cluster_ids else "C0",
-                                source=EvidenceSource.HYPOTHESIS_BRIDGE,
-                                kind="target_symbol" if "symbol" in eid else "failure_site",
-                                location=loc,
-                                content=hyp.reason,
-                            ))
-                        except Exception:
-                            pass  # skip ledger collisions
-
+                ledger = build_evidence_ledger(
+                    shadow_clusters, shadow_dx_list, bundle=bundle,
+                )
                 shadow_contracts = build_search_plan(
                     shadow_hyps,
                     budget=PlanBudget(max_total_actions=3, max_total_budget=8),
@@ -496,7 +474,19 @@ def run_experiment(
                     shadow_dir,
                 )
             except Exception as e:
-                logger.warning("[%s] P1-3C shadow build failed: %s", instance_id, e)
+                # Capture but do not swallow: write shadow_build_error.json
+                # so downstream audit can see what went wrong.
+                shadow_error = {
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "stage": "p1_3c_shadow_build",
+                }
+                logger.warning("[%s] P1-3C shadow build failed: %s: %s",
+                              instance_id, type(e).__name__, e)
+            if shadow_error is not None:
+                err_path = inst_dir / "cd" / "p1_3c_shadow" / "shadow_build_error.json"
+                err_path.parent.mkdir(parents=True, exist_ok=True)
+                err_path.write_text(json.dumps(shadow_error, indent=2))
 
         # ═══════ Fairness Check ═══════
         # BLOCKING tracked-code gate: SHAs must match across R1, SF, CD.
