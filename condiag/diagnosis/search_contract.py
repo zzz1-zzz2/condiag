@@ -46,9 +46,11 @@ class SearchTargetKind(str, Enum):
     BEHAVIOR = "BEHAVIOR"        # semantic concept ("type_contract", "assertion_mismatch")
 
 
-# Python primitive types — never valid as search targets.
-# These are types commonly seen in error messages; FIND_CALLERS would
-# waste effort looking up callers of `int`, `float`, `str`, etc.
+# Python primitive types — never valid as search targets for
+# "who-calls / who-is-called-by" type actions. Domain-specific
+# types (e.g. Astropy's Time/Quantity, NumPy ndarray, etc.) are NOT
+# in this list — they should be classified as TYPE_NAME targets
+# and filtered via the action × target_kind compatibility matrix.
 _PRIMITIVE_TYPES = {
     # Built-in types
     "str", "int", "float", "complex",
@@ -57,9 +59,7 @@ _PRIMITIVE_TYPES = {
     # Typing module generics
     "Optional", "List", "Dict", "Tuple", "Set", "Type", "Any",
     "Callable", "Union", "Iterable", "Iterator", "Generator",
-    # Common type names from numerical/time error messages
-    "Time", "Quantity", "Angle", "Unit", "Frame",
-    # Python keywords
+    # Python keywords (not callable targets)
     "and", "or", "not", "is", "in",
 }
 
@@ -163,9 +163,18 @@ class EvidenceLedger:
         self._items: dict[str, EvidenceItem] = {}
 
     def add(self, item: EvidenceItem) -> None:
-        if item.evidence_id in self._items:
-            return  # idempotent
-        self._items[item.evidence_id] = item
+        existing = self._items.get(item.evidence_id)
+        if existing is None:
+            self._items[item.evidence_id] = item
+            return
+        # Content-addressed IDs are supposed to be stable. If two
+        # items collide, fail-fast — silent overwrites hide bugs.
+        if existing != item:
+            raise EvidenceConflictError(
+                f"evidence_id={item.evidence_id!r} collides with existing item "
+                f"(existing.kind={existing.kind!r}, new.kind={item.kind!r})"
+            )
+        # Same item; idempotent.
 
     def get(self, evidence_id: str) -> EvidenceItem | None:
         return self._items.get(evidence_id)
@@ -181,6 +190,10 @@ class EvidenceLedger:
             "n_items": len(self._items),
             "items": [it.to_dict() for it in self.items()],
         }
+
+
+class EvidenceConflictError(ValueError):
+    """Two distinct EvidenceItems collided on the same ID."""
 
 
 # ── Action types (closed enum, NO sentinels) ──────────────────────
@@ -213,11 +226,17 @@ class ContractStatus(str, Enum):
 
 # ── Compatible (action_type, target_kind) pairs ────────────────────
 
+# TYPE_NAME is allowed for FIND_DEFINITION so a hypothesis can ask
+# "where is Time/Quantity defined in this codebase?" without that
+# question being silently dropped. TYPE_NAME is rejected for
+# FIND_CALLERS / FIND_CALLEES because calling built-in class names
+# never makes sense.
 _ACTION_TARGET_KINDS: dict[SearchActionType, set[SearchTargetKind]] = {
     SearchActionType.FIND_DEFINITION: {
         SearchTargetKind.SYMBOL,
         SearchTargetKind.FILE,
         SearchTargetKind.FAILURE_SITE,
+        SearchTargetKind.TYPE_NAME,
     },
     SearchActionType.FIND_PARALLEL_IMPLEMENTATION: {
         SearchTargetKind.SYMBOL,
@@ -334,14 +353,27 @@ def _file_to_target(file_path: str, *, evidence_ids: list[str] | None = None) ->
 
 
 def _symbol_to_target(sym: str, *, evidence_ids: list[str] | None = None) -> SearchTarget | None:
-    """Convert a symbol to a SYMBOL target, filtering primitive literals."""
+    """Convert a token to a SYMBOL or TYPE_NAME target.
+
+    Heuristic: if the leaf identifier starts with an uppercase letter
+    (CamelCase / PascalCase), treat as TYPE_NAME — these are class
+    names seen in error messages, not callable candidates.
+
+    Returns None for primitive literals or invalid identifiers.
+    """
     if not sym or is_primitive_literal(sym):
         return None
     if not _RE_IDENTIFIER.match(sym):
         return None
+    leaf = sym.split(".")[-1]
+    kind = (
+        SearchTargetKind.TYPE_NAME
+        if (leaf and leaf[0].isupper())
+        else SearchTargetKind.SYMBOL
+    )
     return SearchTarget(
         value=sym,
-        kind=SearchTargetKind.SYMBOL,
+        kind=kind,
         resolved=False,
         source_evidence_ids=evidence_ids or [],
     )

@@ -132,6 +132,24 @@ class TestEvidenceLedger:
         ledger.add(item)
         assert len(ledger.items()) == 1
 
+    def test_conflict_raises_on_different_content(self):
+        """Two distinct items with the same evidence_id must fail-fast."""
+        from condiag.diagnosis.search_contract import EvidenceConflictError
+        ledger = EvidenceLedger()
+        ledger.add(EvidenceItem(
+            evidence_id="E123",
+            cluster_id="C1",
+            kind="frame",
+            content="original",
+        ))
+        with pytest.raises(EvidenceConflictError):
+            ledger.add(EvidenceItem(
+                evidence_id="E123",
+                cluster_id="C1",
+                kind="frame",
+                content="different content",
+            ))
+
 
 class TestSearchTarget:
     def test_file_target_resolved(self):
@@ -144,12 +162,23 @@ class TestSearchTarget:
         from condiag.diagnosis.search_contract import _symbol_to_target
         # 'float' is a primitive — should be filtered
         assert _symbol_to_target("float") is None
-        # 'Time' is in our primitives list (common type-name confusion)
-        assert _symbol_to_target("Time") is None
-        # Regular identifier passes through
-        t = _symbol_to_target("process_data")
+        # 'Time' (CamelCase) becomes TYPE_NAME, not SYMBOL
+        t = _symbol_to_target("Time")
         assert t is not None
+        assert t.kind.value == "TYPE_NAME"
         assert not t.resolved
+        # 'process_data' (lowercase) stays SYMBOL
+        t2 = _symbol_to_target("process_data")
+        assert t2 is not None
+        assert t2.kind.value == "SYMBOL"
+        assert not t2.resolved
+        # 'MyClass.process_data' is dotted but ends in lowercase
+        t3 = _symbol_to_target("MyClass.process_data")
+        assert t3 is not None
+        assert t3.kind.value == "SYMBOL"
+        # Identifiers with spaces/invalid chars are rejected
+        assert _symbol_to_target("hello world") is None
+        assert _symbol_to_target("") is None
 
     def test_identifier_shape_required(self):
         from condiag.diagnosis.search_contract import _symbol_to_target
@@ -257,7 +286,7 @@ class TestBuildContract:
 
     def test_primitive_targets_filtered(self):
         """Critical regression: ARGUMENT_TYPE_MISMATCH with [Time, float] must
-        NOT produce FIND_CALLERS(Time/float) — they are primitives."""
+        NOT produce FIND_CALLERS(Time/float) — they are primitives or TYPE_NAME."""
         h = _make_hyp(
             subtype="ARGUMENT_TYPE_MISMATCH",
             retrieval_targets=["Time", "float"],
@@ -269,6 +298,26 @@ class TestBuildContract:
         for action in contract.actions:
             assert action.target.value not in ("Time", "float"), \
                 f"primitive target leaked: {action.target.value}"
+            if action.action_type in (
+                SearchActionType.FIND_CALLERS,
+                SearchActionType.FIND_CALLEES,
+            ):
+                assert action.target.kind.value != "TYPE_NAME", \
+                    f"FIND_CALLERS on TYPE_NAME leaked: {action.target.value}"
+
+    def test_typename_allowed_in_find_definition(self):
+        """FIND_DEFINITION accepts TYPE_NAME so we can ask 'where is Time defined?'."""
+        h = _make_hyp(
+            subtype="FRAME_ATTRIBUTE_PROPAGATION",
+            retrieval_targets=["MyClass"],
+            failure_sites=[],
+        )
+        contract = build_search_contract(h, max_actions=3)
+        if contract.status.value == "ACTIONABLE":
+            action = contract.actions[0]
+            if action.target.value == "MyClass":
+                # Should be allowed because FIND_DEFINITION accepts TYPE_NAME
+                assert action.target.kind.value == "TYPE_NAME"
 
     def test_numerical_mismatch_emits_related_tests_or_falls_back(self):
         h = _make_hyp(

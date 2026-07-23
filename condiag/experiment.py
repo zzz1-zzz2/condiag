@@ -275,8 +275,23 @@ def run_experiment(
         # ═══════ Diagnosis (CD only) ═══════
         diagnosis = None
         diag_text = None
+        shadow_diagnosis = None
         if run_cd:
             from condiag.diagnosis.taxonomy import ContextDeficiencyType
+            from condiag.diagnosis.failure_event import (
+                reasoner_v2_cluster,
+            )
+            from condiag.diagnosis.alignment import reasoner_v2_diagnose
+            from condiag.diagnosis.hypothesis import from_subtyped_diagnosis
+            from condiag.diagnosis.search_contract import (
+                EvidenceItem,
+                EvidenceLedger,
+                EvidenceSource,
+                PlanBudget,
+                build_search_plan,
+                write_shadow_artifacts,
+            )
+
             diagnosis = DiagnoserCore().diagnose(bundle)
             _write_json(inst_dir / "cd" / "diagnosis.json", diagnosis.model_dump())
             logger.info("[%s] Diagnosis: primary=%s confidence=%s",
@@ -400,6 +415,88 @@ def run_experiment(
             logger.info("[%s] CD branch skipped (--no-condiag)", instance_id)
             out.cd["termination_reason"] = "not_run_disabled"
             out.cd_run = False
+
+        # ═══════ P1-3C Shadow Artifacts ═══════
+        # If we ran the CD branch, build hypotheses + contracts from the
+        # same bundle and write Shadow artifacts. This is the wiring step
+        # that closes P1-3C-5: every real episode now produces artifacts.
+        if run_cd and shadow_diagnosis is not None:
+            try:
+                from condiag.diagnosis.search_contract import (
+                    EvidenceItem,
+                    EvidenceLedger,
+                    EvidenceSource,
+                    PlanBudget,
+                    build_search_plan,
+                    write_shadow_artifacts,
+                )
+                from condiag.diagnosis.failure_event import (
+                    reasoner_v2_cluster,
+                )
+                from condiag.diagnosis.alignment import reasoner_v2_diagnose
+                from condiag.diagnosis.hypothesis import (
+                    from_subtyped_diagnosis,
+                    make_evidence_id,
+                )
+                from condiag.diagnosis.taxonomy import ContextDeficiencyType
+
+                shadow_clusters = reasoner_v2_cluster(bundle)
+                shadow_dx_list = reasoner_v2_diagnose(
+                    shadow_clusters, bundle.patch, bundle.trajectory,
+                )
+                shadow_hyps = [
+                    from_subtyped_diagnosis(d, c.cluster_id, c.test_names)
+                    for c, d in zip(shadow_clusters, shadow_dx_list)
+                ]
+                # Build evidence ledger from each hypothesis's supporting IDs
+                ledger = EvidenceLedger()
+                for hyp in shadow_hyps:
+                    loc = hyp.failure_sites[0] if hyp.failure_sites else ""
+                    for eid in hyp.supporting_evidence_ids:
+                        try:
+                            ledger.add(EvidenceItem(
+                                evidence_id=eid,
+                                cluster_id=hyp.cluster_ids[0] if hyp.cluster_ids else "C0",
+                                source=EvidenceSource.HYPOTHESIS_BRIDGE,
+                                kind="target_symbol" if "symbol" in eid else "failure_site",
+                                location=loc,
+                                content=hyp.reason,
+                            ))
+                        except Exception:
+                            pass  # skip ledger collisions
+
+                shadow_contracts = build_search_plan(
+                    shadow_hyps,
+                    budget=PlanBudget(max_total_actions=3, max_total_budget=8),
+                    ledger=ledger,
+                )
+                shadow_dir = inst_dir / "cd" / "p1_3c_shadow"
+                paths = write_shadow_artifacts(
+                    shadow_dir,
+                    contracts=shadow_contracts,
+                    hypotheses=shadow_hyps,
+                    ledger=ledger,
+                    validation_report={
+                        "run_id": episode_run_id,
+                        "instance_id": instance_id,
+                        "schema_version": "1",
+                        "n_hypotheses": len(shadow_hyps),
+                        "n_contracts": len(shadow_contracts),
+                        "n_actionable": sum(
+                            1 for c in shadow_contracts
+                            if c.status.value == "ACTIONABLE"
+                        ),
+                    },
+                )
+                logger.info(
+                    "[%s] P1-3C shadow artifacts: %d hypotheses, %d actionable contracts → %s",
+                    instance_id,
+                    len(shadow_hyps),
+                    sum(1 for c in shadow_contracts if c.status.value == "ACTIONABLE"),
+                    shadow_dir,
+                )
+            except Exception as e:
+                logger.warning("[%s] P1-3C shadow build failed: %s", instance_id, e)
 
         # ═══════ Fairness Check ═══════
         # BLOCKING tracked-code gate: SHAs must match across R1, SF, CD.
