@@ -1,7 +1,9 @@
 # P1 Runtime Freeze
 
 > Declared: 2026-07-23
-> HEAD: c49a27f
+> Runtime-tested baseline: c49a27f
+> Freeze record commit: 2a05cf8
+> Post-freeze fixes: ... (see git log)
 > Canary: astropy__astropy-13398 (SWE-bench Verified)
 
 ## Freeze Scope
@@ -42,7 +44,7 @@ Audit metadata:  untracked manifest + restore status (recorded, not blocking)
 ## Local Tests
 
 ```text
-183 passed, 4 skipped, 0 failures
+185 passed, 4 skipped, 0 failures
 (1 pre-existing: test_execution_policy — missing frozen pool file)
 ```
 

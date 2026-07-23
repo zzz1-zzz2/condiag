@@ -201,7 +201,7 @@ class TestGitApplyIndexNewFile:
         ])
         return hashlib.sha256(r.stdout.encode("utf-8")).hexdigest()[:16]
 
-    def _apply_and_verify(self, repo, base_commit, apply_args, patch_workdir, patch_path):
+    def _apply_and_verify(self, repo, base_commit, apply_args, patch_path):
         """Reset, apply diff, return SHA. patch_path must be outside repo to survive `git clean -fd`."""
         self._git(repo, ["git", "reset", "--hard", base_commit])
         self._git(repo, ["git", "clean", "-fd", "-q"])
@@ -209,7 +209,10 @@ class TestGitApplyIndexNewFile:
         return self._diff_sha(repo, base_commit)
 
     def test_apply_with_index_new_file(self, tmp_path):
-        """New file: git apply --index must reproduce the same SHA."""
+        """New file: git apply --index must reproduce the same SHA;
+        bare git apply produces a DIFFERENT SHA because the new file
+        ends up untracked and invisible to `git diff base` comparison
+        against the commit tree in certain environments (Docker)."""
         repo = tmp_path / "r1"
         repo.mkdir()
         self._git(repo, ["git", "init", "-q"])
@@ -222,15 +225,32 @@ class TestGitApplyIndexNewFile:
 
         (repo / "f.py").write_text("modified\n")
         (repo / "new.py").write_text("import os\n")
-        sha_orig = self._diff_sha(repo, base)
+
+        # Make the untracked file appear in git diff without staging its content
+        self._git(repo, ["git", "add", "-N", "new.py"])
+
         diff_before = self._git(repo, [
             "git", "diff", "--binary", "--no-ext-diff", base,
         ]).stdout
+
+        # Pre-conditions: diff must actually contain the new file
+        assert "new.py" in diff_before, "diff must contain new.py (git add -N required)"
+        assert "new file mode" in diff_before, "diff must mark new.py as new file"
+
+        sha_orig = hashlib.sha256(diff_before.encode("utf-8")).hexdigest()[:16]
         patch_path = str(tmp_path / "restore.patch")
         Path(patch_path).write_text(diff_before)
 
-        sha_with_index = self._apply_and_verify(repo, base, ["--index"], tmp_path, patch_path)
-        assert sha_orig == sha_with_index, "--index: SHA mismatch for new file"
+        # Bare git apply: new file ends up untracked → SHA differs
+        sha_without = self._apply_and_verify(repo, base, [], patch_path)
+        assert sha_without != sha_orig, (
+            "bare git apply must produce different SHA "
+            "(new file not in tracked diff)"
+        )
+
+        # git apply --index: new file enters index → SHA matches
+        sha_with = self._apply_and_verify(repo, base, ["--index"], patch_path)
+        assert sha_with == sha_orig, "git apply --index must reproduce original SHA"
 
     def test_apply_with_index_existing_file(self, tmp_path):
         """Existing file only: SHA matches either way."""
@@ -252,7 +272,7 @@ class TestGitApplyIndexNewFile:
         patch_path = str(tmp_path / "ex_restore.patch")
         Path(patch_path).write_text(diff_before)
 
-        sha_without = self._apply_and_verify(repo, base, [], tmp_path, patch_path)
+        sha_without = self._apply_and_verify(repo, base, [], patch_path)
         assert sha_orig == sha_without, "bare apply: SHA mismatch"
-        sha_with = self._apply_and_verify(repo, base, ["--index"], tmp_path, patch_path)
+        sha_with = self._apply_and_verify(repo, base, ["--index"], patch_path)
         assert sha_orig == sha_with, "--index: SHA mismatch"
