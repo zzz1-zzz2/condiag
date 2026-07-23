@@ -1,8 +1,10 @@
 """P0 acceptance integration tests: archive failure pre-block, preflight fairness gate."""
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -81,7 +83,7 @@ class TestPreflightFairnessGate:
                 return subprocess.CompletedProcess(cmd, returncode=0, stdout=b"", stderr=b"")
             return original_subprocess_run(cmd, **kwargs)
 
-        def fake_restore_workspace(agent, snapshot, base_commit):
+        def fake_restore_workspace(agent, snapshot, base_commit, **kwargs):
             return RestoreResult(ok=True, workspace_sha=snapshot.workspace_state_sha)
 
         def fake_capture_workspace_fingerprint(agent, base_commit):
@@ -179,3 +181,78 @@ class TestFingerprintCapture:
         snapshot_dir = workdir / "snapshot_pf"
         result = archive_untracked_files(agent_a, snapshot_dir)
         assert result == "", f"Expected empty string on pipeline failure, got {result!r}"
+
+
+
+class TestGitApplyIndexNewFile:
+    """Regression guard: `git apply --index` keeps tracked-diff SHA stable."""
+
+    def _git(self, workdir, cmd, check=True):
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, cwd=workdir,
+        )
+        if check and r.returncode != 0:
+            raise RuntimeError(f"git {' '.join(cmd)}: {r.stderr[:200]}")
+        return r
+
+    def _diff_sha(self, workdir, base_commit) -> str:
+        r = self._git(workdir, [
+            "git", "diff", "--binary", "--no-ext-diff", base_commit,
+        ])
+        return hashlib.sha256(r.stdout.encode("utf-8")).hexdigest()[:16]
+
+    def _apply_and_verify(self, repo, base_commit, apply_args, patch_workdir, patch_path):
+        """Reset, apply diff, return SHA. patch_path must be outside repo to survive `git clean -fd`."""
+        self._git(repo, ["git", "reset", "--hard", base_commit])
+        self._git(repo, ["git", "clean", "-fd", "-q"])
+        self._git(repo, ["git", "apply", "--whitespace=nowarn", *apply_args, patch_path])
+        return self._diff_sha(repo, base_commit)
+
+    def test_apply_with_index_new_file(self, tmp_path):
+        """New file: git apply --index must reproduce the same SHA."""
+        repo = tmp_path / "r1"
+        repo.mkdir()
+        self._git(repo, ["git", "init", "-q"])
+        self._git(repo, ["git", "config", "user.email", "t@t"])
+        self._git(repo, ["git", "config", "user.name", "t"])
+        (repo / "f.py").write_text("base\n")
+        self._git(repo, ["git", "add", "."])
+        self._git(repo, ["git", "commit", "-q", "-m", "init"])
+        base = self._git(repo, ["git", "rev-parse", "HEAD"]).stdout.strip()
+
+        (repo / "f.py").write_text("modified\n")
+        (repo / "new.py").write_text("import os\n")
+        sha_orig = self._diff_sha(repo, base)
+        diff_before = self._git(repo, [
+            "git", "diff", "--binary", "--no-ext-diff", base,
+        ]).stdout
+        patch_path = str(tmp_path / "restore.patch")
+        Path(patch_path).write_text(diff_before)
+
+        sha_with_index = self._apply_and_verify(repo, base, ["--index"], tmp_path, patch_path)
+        assert sha_orig == sha_with_index, "--index: SHA mismatch for new file"
+
+    def test_apply_with_index_existing_file(self, tmp_path):
+        """Existing file only: SHA matches either way."""
+        repo = tmp_path / "r2"
+        repo.mkdir()
+        self._git(repo, ["git", "init", "-q"])
+        self._git(repo, ["git", "config", "user.email", "t@t"])
+        self._git(repo, ["git", "config", "user.name", "t"])
+        (repo / "f.py").write_text("original\n")
+        self._git(repo, ["git", "add", "."])
+        self._git(repo, ["git", "commit", "-q", "-m", "init"])
+        base = self._git(repo, ["git", "rev-parse", "HEAD"]).stdout.strip()
+
+        (repo / "f.py").write_text("modified\n")
+        sha_orig = self._diff_sha(repo, base)
+        diff_before = self._git(repo, [
+            "git", "diff", "--binary", "--no-ext-diff", base,
+        ]).stdout
+        patch_path = str(tmp_path / "ex_restore.patch")
+        Path(patch_path).write_text(diff_before)
+
+        sha_without = self._apply_and_verify(repo, base, [], tmp_path, patch_path)
+        assert sha_orig == sha_without, "bare apply: SHA mismatch"
+        sha_with = self._apply_and_verify(repo, base, ["--index"], tmp_path, patch_path)
+        assert sha_orig == sha_with, "--index: SHA mismatch"
