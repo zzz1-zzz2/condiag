@@ -1,0 +1,239 @@
+"""Tests for P1-3A/B: failure event extraction, clustering, alignment."""
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+
+from condiag.diagnosis.signals.pytest_extractor import extract_test_log, _RE_TEST_HEADER
+from condiag.diagnosis.failure_event import (
+    FailureEvent,
+    extract_failure_events,
+    cluster_failures,
+    normalize_message,
+    _param_group,
+)
+
+
+# ── Normalization tests ─────────────────────────────────────────────
+
+
+class TestNormalizeMessage:
+    def test_unexpected_keywords(self):
+        assert normalize_message(
+            "TypeError: Coordinate frame ITRS got unexpected keywords: ['location']"
+        ) == "TypeError: Coordinate frame ITRS got unexpected keywords: ['<KW>']"
+
+    def test_unsupported_operand(self):
+        assert normalize_message(
+            "TypeError: unsupported operand type(s) for -: 'Time' and 'float'"
+        ) == "TypeError: unsupported operand type(s) for -: '<A>' and '<B>'"
+
+    def test_import_name(self):
+        assert normalize_message(
+            "ImportError: cannot import name 'foo' from 'bar.baz'"
+        ) == "ImportError: cannot import name '<NAME>' from '<PACKAGE>'"
+
+    def test_module_attr(self):
+        assert normalize_message(
+            "AttributeError: module 'astropy' has no attribute 'foo'"
+        ) == "AttributeError: module '<MOD>' has no attribute '<ATTR>'"
+
+    def test_numbers_replaced(self):
+        assert normalize_message("line 42 failed") == "line <N> failed"
+
+    def test_filepaths_replaced(self):
+        n = normalize_message("failed in /home/user/project/file.py:42")
+        assert "<path>" in n
+
+    def test_hex_replaced(self):
+        assert normalize_message("at 0x7f123456") == "at <hex>"
+
+    def test_empty(self):
+        assert normalize_message("") == ""
+
+    def test_no_double_bracket(self):
+        """Regression: unexpected keywords replacement must not double the closing bracket."""
+        n = normalize_message(
+            "TypeError: Coordinate frame ITRS got unexpected keywords: ['location']"
+        )
+        assert n.count("]") == 1, f"expected 1 bracket, got: {n}"
+
+    def test_low_information_returned_as_is(self):
+        """Bare AssertionError:  must not crash."""
+        assert normalize_message("AssertionError:") == "AssertionError:"
+
+
+# ── Section parser reconciliation tests ─────────────────────────────
+
+
+class TestSectionReconciliation:
+    """Verify that every section header matches a summary FAILED entry."""
+
+    def _make_test_log(self, sections, summary_fails, summary_passes=0):
+        """Build a synthetic test_output.txt with given sections and summary."""
+        lines = [
+            "============================= FAILURES =============================",
+        ]
+        for name, body in sections:
+            header = f"_____________________________ {name} _____________________________"
+            lines.append(header)
+            lines.extend(body.split("\n"))
+            lines.append("")
+
+        summary_line = f"=========================== short test summary info ============================"
+        lines.append(summary_line)
+        for name in summary_fails:
+            lines.append(f"FAILED astropy/tests/test_fake.py::{name}")
+        for _ in range(summary_passes):
+            lines.append(f"PASSED astropy/tests/test_fake.py::test_pass")
+        lines.append(f"{summary_passes} passed, {len(summary_fails)} failed in 0.01s")
+
+        return "\n".join(lines)
+
+    def test_basic_reconciliation(self, tmp_path):
+        """10 sections matching 10 summary FAILED entries = all bound."""
+        sections = [
+            ("test_foo", ">       assert 1\nE       AssertionError:"),
+            ("test_bar", ">       x = a + b\nE       TypeError: unsupported operand"),
+        ]
+        log = self._make_test_log(
+            sections,
+            summary_fails=["test_foo", "test_bar"],
+            summary_passes=5,
+        )
+        p = tmp_path / "test.log"
+        p.write_text(log)
+        tl = extract_test_log(str(p))
+        assert len(tl.failures) == 2, f"Expected 2 failures, got {len(tl.failures)}"
+        assert len(tl.failed_tests) == 2
+
+    def test_section_name_vs_nodeid_mismatch(self, tmp_path):
+        """Section name may differ from summary nodeid (bare vs test_file.py::test)."""
+        sections = [
+            ("test_baz", ">       raise ValueError\nE       ValueError: bad"),
+        ]
+        log = self._make_test_log(
+            sections,
+            summary_fails=["test_baz"],
+        )
+        p = tmp_path / "test2.log"
+        p.write_text(log)
+        tl = extract_test_log(str(p))
+        assert len(tl.failures) == 1
+        assert len(tl.failed_tests) == 1
+
+    def test_no_failures_section_returns_empty_failures(self, tmp_path):
+        """Log with no FAILURES section but with FAILED summary lines."""
+        log = "\n".join([
+            "PASSED test_fake.py::test_a",
+            "FAILED test_fake.py::test_b",
+            "1 passed, 1 failed in 0.01s",
+        ])
+        p = tmp_path / "test3.log"
+        p.write_text(log)
+        tl = extract_test_log(str(p))
+        # No FAILURES section → no per-test parse → failures field is empty
+        assert len(tl.failures) == 0
+        assert tl.failed_tests == ["test_fake.py::test_b"]
+
+
+# ── Clustering tests ────────────────────────────────────────────────
+
+
+class TestClustering:
+    def _make_event(self, test_name, exc_type, msg="", frames=None, assertion=""):
+        return FailureEvent(
+            test_name=test_name,
+            exception_type=exc_type,
+            error_class="TYPE_ERROR" if "Type" in exc_type else "ASSERTION_ERROR",
+            message=msg,
+            message_fingerprint=normalize_message(msg),
+            assertion_line=assertion,
+            call_chain=frames or [],
+            top_repo_frame=frames[0] if frames else "",
+            is_parameterized="[" in test_name,
+            param_group=_param_group(test_name),
+        )
+
+    def test_param_family_clusters_together(self):
+        events = [
+            self._make_event("test_a[x]", "AssertionError"),
+            self._make_event("test_a[y]", "AssertionError"),
+        ]
+        clusters = cluster_failures(events)
+        assert len(clusters) == 1
+
+    def test_different_param_groups_stay_separate(self):
+        events = [
+            self._make_event("test_a[x]", "AssertionError"),
+            self._make_event("test_b[x]", "AssertionError"),
+        ]
+        clusters = cluster_failures(events)
+        assert len(clusters) == 2, "different param groups must not merge"
+
+    def test_same_message_fingerprint_clusters(self):
+        events = [
+            self._make_event("test_a", "TypeError", "TypeError: 'A' and 'B'"),
+            self._make_event("test_b", "TypeError", "TypeError: 'A' and 'B'"),
+        ]
+        clusters = cluster_failures(events)
+        assert len(clusters) == 1
+
+    def test_low_info_message_does_not_merge(self):
+        """Bare AssertionError:  fingerprint must not cause merge."""
+        events = [
+            self._make_event("test_a", "AssertionError", "AssertionError:"),
+            self._make_event("test_b", "AssertionError", "AssertionError:"),
+        ]
+        clusters = cluster_failures(events)
+        assert len(clusters) == 2, \
+            "bare AssertionError must not merge events"
+
+    def test_singleton_fallback(self):
+        """Unrelated events must each become their own cluster."""
+        events = [
+            self._make_event("test_a", "TypeError", "TypeError: A", frames=["file.py:1"]),
+            self._make_event("test_b", "TypeError", "TypeError: B", frames=["other.py:2"]),
+            self._make_event("test_c", "AssertionError", "AssertionError:",
+                             frames=["test.py:3"]),
+        ]
+        clusters = cluster_failures(events)
+        assert len(clusters) == 3, "each unrelated event must be a singleton"
+
+    def test_deterministic_id(self):
+        events1 = [
+            self._make_event("test_foo", "TypeError", "bad value"),
+        ]
+        events2 = [
+            self._make_event("test_foo", "TypeError", "bad value"),
+        ]
+        c1 = cluster_failures(events1)
+        c2 = cluster_failures(events2)
+        assert c1[0].cluster_id == c2[0].cluster_id, "same events → same ID"
+
+    def test_call_chain_overlap_merge(self):
+        """Events sharing ≥2 call chain frames merge."""
+        frames = ["base.py:1", "transform.py:2", "core.py:3"]
+        events = [
+            self._make_event("test_a", "TypeError", "err", frames=frames),
+            self._make_event("test_b", "TypeError", "err", frames=frames),
+        ]
+        clusters = cluster_failures(events)
+        assert len(clusters) == 1
+
+
+# ── Edge case tests ────────────────────────────────────────────────
+
+
+class TestEdgeCases:
+    def test_empty_events(self):
+        assert cluster_failures([]) == []
+
+    def test_single_event(self):
+        ev = FailureEvent(test_name="t1", exception_type="TypeError", error_class="TYPE_ERROR")
+        clusters = cluster_failures([ev])
+        assert len(clusters) == 1
+        assert clusters[0].count == 1

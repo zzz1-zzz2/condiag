@@ -25,27 +25,27 @@ from condiag.diagnosis.signals.schema import (
 # ── Regex patterns for normalizing messages ─────────────────────────
 
 # "Coordinate frame ITRS got unexpected keywords: ['location']"
-#   → "Coordinate frame X got unexpected keywords: ['Y']"
+#   → "Coordinate frame X got unexpected keywords: ['<KW>']"
 _RE_UNEXPECTED_KW = re.compile(
-    r"(unexpected keywords?:\s*\[)[^\]]+(\])"
+    r"(unexpected keywords?: \[)[^\]]+(\])"
 )
 
 # "unsupported operand type(s) for -: 'Time' and 'float'"
-#   → "unsupported operand type(s) for -: 'A' and 'B'"
+#   → "unsupported operand type(s) for -: '<A>' and '<B>'"
 _RE_OPERAND_TYPES = re.compile(
     r"(unsupported operand type\(s\) for[^:]+:)\s*'[^']*'\s*and\s*'[^']*'"
 )
 
 # "cannot import name 'X' from 'Y'"
-#   → "cannot import name 'N' from 'P'"
+#   → "cannot import name '<NAME>' from '<PACKAGE>'"
 _RE_IMPORT_NAME = re.compile(
-    r"(cannot import name\s+')'[^']*(' from\s+')'[^']*(')"
+    r"(cannot import name\s+)'([^']+)'\s+from\s+'([^']+)'"
 )
 
 # "module 'X' has no attribute 'Y'"
-#   → "module 'N' has no attribute 'A'"
+#   → "module '<MOD>' has no attribute '<ATTR>'"
 _RE_MODULE_ATTR = re.compile(
-    r"(module\s+')'[^']*(' has no attribute\s+')'[^']*(')"
+    r"(module\s+)'([^']+)'\s+has no attribute\s+'([^']+)'"
 )
 
 # number literals → <N>
@@ -63,10 +63,10 @@ _RE_LINENO = re.compile(r"(:)(\d+)\b")
 
 def normalize_message(msg: str) -> str:
     """Collapse variable parts of error messages into placeholders."""
-    msg = _RE_UNEXPECTED_KW.sub(r"\1'<KW>'\2]", msg)
+    msg = _RE_UNEXPECTED_KW.sub(r"\1'<KW>'\2", msg)
     msg = _RE_OPERAND_TYPES.sub(r"\1 '<A>' and '<B>'", msg)
-    msg = _RE_IMPORT_NAME.sub(r"\1'<NAME>'\2'<PACKAGE>'\3", msg)
-    msg = _RE_MODULE_ATTR.sub(r"\1'<MOD>'\2'<ATTR>'\3", msg)
+    msg = _RE_IMPORT_NAME.sub(r"\1'<NAME>' from '<PACKAGE>'", msg)
+    msg = _RE_MODULE_ATTR.sub(r"\1'<MOD>' has no attribute '<ATTR>'", msg)
     msg = _RE_NUMBER.sub("<N>", msg)
     msg = _RE_FILEPATH.sub("<path>", msg)
     msg = _RE_HEX.sub("<hex>", msg)
@@ -203,9 +203,15 @@ def extract_failure_events(
     # Prefer structured per-test records (P1-3A extractor)
     records = list(tl.failures) if tl.failures else []
 
-    # Fallback for old-format bundles without per-test records
+    # Require per-test records. Old aggregate arrays cannot reliably
+    # reconstruct per-test bindings (error_messages deduplicated, frames
+    # divided naively). Re-extract from raw test_log instead.
     if not records:
-        return _legacy_extract(bundle)
+        raise ValueError(
+            "extract_failure_events: bundle has 0 per-test failure records. "
+            "Use pytest_extractor.extract_test_log() on the raw test_output.txt "
+            "to produce structured TestFailureSignals before clustering."
+        )
 
     events: list[FailureEvent] = []
     for rec in records:
@@ -228,12 +234,17 @@ def extract_failure_events(
     return events
 
 
-def _legacy_extract(bundle: RuntimeFailureFeatureBundle) -> list[FailureEvent]:
-    """Fallback for old-format bundles without per-test records."""
-    tl = bundle.test_log
-
-
 # ── Deterministic clustering ────────────────────────────────────────
+
+
+# ── Low-information fingerprints that should never trigger merge ────
+
+_LOW_INFO_FINGERPRINTS = {
+    "AssertionError:",
+    "AssertionError",
+    "Error:",
+    "",
+}
 
 
 def cluster_failures(events: list[FailureEvent]) -> list[FailureCluster]:
@@ -258,22 +269,35 @@ def cluster_failures(events: list[FailureEvent]) -> list[FailureCluster]:
             unassigned.remove(e)
         return matched
 
-    # 1. Parameterized families
+    # 1. Parameterized families — only merge if they also share at least
+    #    one more signal (message fingerprint, top frame, or call-chain frame)
     param_groups: dict[str, list[FailureEvent]] = {}
     for e in unassigned:
         if e.is_parameterized:
             key = (e.param_group, e.error_class)
             param_groups.setdefault(str(key), []).append(e)
     for key, group in param_groups.items():
+        if len(group) < 2:
+            continue
+        # Verify second signal: shared fingerprint, top frame, or call-chain overlap
+        sig1 = len({e.message_fingerprint for e in group if e.message_fingerprint not in _LOW_INFO_FINGERPRINTS}) <= 1
+        sig2 = len({e.top_repo_frame for e in group if e.top_repo_frame}) <= 1
+        chain_sets = [set(e.call_chain) for e in group if e.call_chain]
+        sig3 = False
+        if len(chain_sets) >= 2:
+            common = set.intersection(*chain_sets)
+            sig3 = len(common) >= 1
+        if not (sig1 or sig2 or sig3):
+            continue  # insufficient evidence to merge
         for e in group:
             unassigned.remove(e)
         _finish_cluster(clusters, group)
 
-    # 2. Message fingerprint (non-empty, non-trivial)
+    # 2. Message fingerprint (non-empty, non-trivial, not low-information)
     fingerprint_groups: dict[str, list[FailureEvent]] = {}
     for e in unassigned:
         fp = e.message_fingerprint
-        if fp and fp not in ("", "?"):
+        if fp and fp not in ("", "?") and fp not in _LOW_INFO_FINGERPRINTS:
             fingerprint_groups.setdefault(fp, []).append(e)
     for fp, group in fingerprint_groups.items():
         if len(group) < 2:

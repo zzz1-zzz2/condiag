@@ -251,7 +251,7 @@ SUBTYPE_REGISTRY: dict[str, list[str]] = {
         "ARGUMENT_TYPE_MISMATCH",
     ],
     "RELATED_TESTS": [
-        "ROUTE_COMPARISON_FAILURE",
+        "NUMERICAL_MISMATCH",
         "EDGE_CASE_MISSING",
         "REGRESSION_DETECTED",
     ],
@@ -338,18 +338,19 @@ def classify_cluster(
 
     # ═════ Decision Tree ─────────────────────────────────────────
 
-    # ── ROUTE_COMPARISON: two paths give different results ──
+    # ── NUMERICAL_MISMATCH: assertion compares computed values ──
     if route_comparison:
         return SubtypedDiagnosis(
             type=ContextDeficiencyType.RELATED_TESTS,
-            subtype="ROUTE_COMPARISON_FAILURE",
+            subtype="NUMERICAL_MISMATCH",
             confidence="high",
             target_symbols=alignment.error_symbols[:5],
             key_location=cluster.root_cause,
             evidence_alignment=alignment,
             reason=(
-                "Two different code paths produce differing results. "
-                "A newly introduced path conflicts with an existing one."
+                "Numerical assertion failed — a computed value did not match "
+                "the expected result. This may indicate a logic error or "
+                "route inconsistency in the modified code."
             ),
         )
 
@@ -398,40 +399,7 @@ def classify_cluster(
             evidence_alignment=alignment,
             reason=(
                 "Multiple type contract violations across tests suggest "
-                "a frame attribute or coordinate representation mismatch "
-                "in the new transform path."
-            ),
-        )
-
-    # ── Default: alignment summary ──
-    if alignment.missing_provider_files:
-        return SubtypedDiagnosis(
-            type=ContextDeficiencyType.API_DEFINITION,
-            subtype="MODULE_MEMBER_MISSING",
-            confidence="low",
-            target_symbols=alignment.missing_provider_files,
-            key_location=cluster.root_cause,
-            evidence_alignment=alignment,
-            reason=(
-                f"Symbols in error not found in trajectory views. "
-                f"Missing provider files: {alignment.missing_provider_files}"
-            ),
-        )
-
-    # ── Environment: IERS / polar motion / ephemeris errors ──
-    if any("iers" in e.top_repo_frame.lower() or "erfa" in e.top_repo_frame.lower()
-           for e in cluster.events):
-        return SubtypedDiagnosis(
-            type=ContextDeficiencyType.DEPENDENCY,
-            subtype="MISSING_DATA_FILE",
-            confidence="low",
-            target_symbols=["iers", "erfa"],
-            key_location=cluster.root_cause,
-            evidence_alignment=alignment,
-            reason=(
-                "Failure traces through IERS or ERFA code — likely an "
-                "environment-dependent data file or time-system issue "
-                "not related to context deficiency."
+                "a shared interface or data flow issue in the modified code."
             ),
         )
 
