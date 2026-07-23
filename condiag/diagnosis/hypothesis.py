@@ -142,11 +142,11 @@ def from_subtyped_diagnosis(
     if sub.target_symbols:
         for sym in sub.target_symbols:
             supporting_ids.append(
-                make_evidence_id("target_symbol", sub.key_location, sym)
+                make_evidence_id("target_symbol", f"{cluster_id}|{sub.key_location}", sym)
             )
     if sub.key_location:
         supporting_ids.append(
-            make_evidence_id("failure_site", sub.key_location, sub.reason)
+            make_evidence_id("failure_site", f"{cluster_id}|{sub.key_location}", sub.reason)
         )
 
     return DiagnosisHypothesis(

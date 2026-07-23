@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -487,6 +488,91 @@ def run_experiment(
                 err_path = inst_dir / "cd" / "p1_3c_shadow" / "shadow_build_error.json"
                 err_path.parent.mkdir(parents=True, exist_ok=True)
                 err_path.write_text(json.dumps(shadow_error, indent=2))
+
+        # ═══════ P1-3D Router Shadow ═══════
+        # Execute every ACTIONABLE contract's actions through the Router.
+        # This is the P1-3D-1 wiring: every real episode runs Router in
+        # shadow mode (no R2 injection) and saves acquisition_results.json.
+        if run_cd:
+            try:
+                from condiag.diagnosis.search_contract import (
+                    ContractStatus,
+                    PlanBudget,
+                    build_evidence_ledger,
+                    build_search_plan,
+                )
+                from condiag.diagnosis.failure_event import reasoner_v2_cluster
+                from condiag.diagnosis.alignment import reasoner_v2_diagnose
+                from condiag.diagnosis.hypothesis import from_subtyped_diagnosis
+                from condiag.acquisition.router import AcquisitionRouter
+                from condiag.acquisition.artifact_writer import (
+                    write_acquisition_artifacts,
+                )
+
+                _clusters = reasoner_v2_cluster(bundle)
+                _diagnoses = reasoner_v2_diagnose(
+                    _clusters, bundle.patch, bundle.trajectory,
+                )
+                _hyps = [
+                    from_subtyped_diagnosis(d, c.cluster_id, c.test_names)
+                    for c, d in zip(_clusters, _diagnoses)
+                ]
+                _ledger = build_evidence_ledger(_clusters, _diagnoses, bundle=bundle)
+                _contracts = build_search_plan(
+                    _hyps,
+                    budget=PlanBudget(max_total_actions=3, max_total_budget=8),
+                    ledger=_ledger,
+                )
+                # Read R1 trajectory viewed_files (from bundle) for already_seen.
+                _viewed = list(getattr(bundle.trajectory, "viewed_files", []) or [])
+                _failed = []
+                for _c in _clusters:
+                    _failed.extend(_c.test_names)
+                # We do NOT have a real repo path here — use the swe-bench
+                # canonical repo root if available, else skip Router.
+                _repo_root = None
+                try:
+                    from condiag.instance_registry import InstanceRegistry
+                    _reg = InstanceRegistry()
+                    _spec = _reg.get_instance(instance_id)
+                    if _spec is not None and getattr(_spec, "repo", None):
+                        # Use env.DOCKER_REPO_ROOT if available, else skip
+                        import os as _os
+                        _root = _os.environ.get("CONDIAG_REPO_ROOT")
+                        if _root and Path(_root).exists():
+                            _repo_root = Path(_root)
+                except Exception:
+                    pass
+                if _repo_root is not None:
+                    _router = AcquisitionRouter(
+                        _repo_root,
+                        r1_viewed_files=_viewed,
+                        failed_test_names=_failed,
+                    )
+                    _all_results = []
+                    for _contract in _contracts:
+                        _all_results.extend(_router.dispatch_contract(_contract))
+                    write_acquisition_artifacts(
+                        inst_dir / "cd" / "p1_3d_shadow",
+                        _all_results,
+                        _repo_root,
+                        run_id=episode_run_id,
+                    )
+                    logger.info(
+                        "[%s] P1-3D router shadow: %d results → %s",
+                        instance_id, len(_all_results),
+                        inst_dir / "cd" / "p1_3d_shadow",
+                    )
+                else:
+                    logger.info(
+                        "[%s] P1-3D router shadow skipped: no CONDIAG_REPO_ROOT",
+                        instance_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[%s] P1-3D router shadow failed: %s: %s",
+                    instance_id, type(e).__name__, e,
+                )
 
         # ═══════ Fairness Check ═══════
         # BLOCKING tracked-code gate: SHAs must match across R1, SF, CD.

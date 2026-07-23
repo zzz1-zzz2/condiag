@@ -647,7 +647,7 @@ def build_evidence_ledger(
         if sub.key_location:
             ledger.add(EvidenceItem(
                 evidence_id=make_evidence_id(
-                    "failure_site", sub.key_location, sub.reason,
+                    "failure_site", f"{cluster_id}|{sub.key_location}", sub.reason,
                 ),
                 cluster_id=cluster_id,
                 source=EvidenceSource.STACK_FRAME,
@@ -660,7 +660,7 @@ def build_evidence_ledger(
         for sym in sub.target_symbols[:5]:
             ledger.add(EvidenceItem(
                 evidence_id=make_evidence_id(
-                    "target_symbol", sub.key_location or cluster_id, sym,
+                    "target_symbol", f"{cluster_id}|{sub.key_location or ''}", sym,
                 ),
                 cluster_id=cluster_id,
                 source=EvidenceSource.ASSERTION,
