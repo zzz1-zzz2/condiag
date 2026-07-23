@@ -137,6 +137,16 @@ def astropy_like_repo(tmp_path_factory) -> Path:
 class TestAstropySmoke:
     """Router shadow smoke against a real astropy-like repo."""
 
+    def _check_provenance(self, action: SearchAction, result) -> None:
+        """Verify action_id and action_type survive through dispatch."""
+        assert result.action_id == action.action_id, \
+            f"provenance: expected {action.action_id}, got {result.action_id}"
+        assert result.action_type == action.action_type, \
+            f"provenance: expected {action.action_type}, got {result.action_type}"
+        for hit in result.hits:
+            assert hit.action_id == action.action_id, \
+                f"hit provenance: expected {action.action_id}, got {hit.action_id}"
+
     def test_find_definition_failure_site(self, astropy_like_repo):
         """FAILURE_SITE target inside itrs_to_observed → returns AST-enclosing function."""
         router = AcquisitionRouter(astropy_like_repo)
@@ -150,8 +160,36 @@ class TestAstropySmoke:
             budget=2,
         )
         result = router.dispatch(action)
+        self._check_provenance(action, result)
         assert result.status.value == "FOUND"
         assert result.hits[0].symbol in ("itrs_to_observed", "itrs_to_observed_mat")
+
+    def test_find_definition_budget_limit_set(self, astropy_like_repo):
+        """Result must set budget_limit and not exceed it."""
+        router = AcquisitionRouter(astropy_like_repo)
+        action = SearchAction(
+            action_id="A_budget_1",
+            action_type=SearchActionType.FIND_DEFINITION,
+            target=SearchTarget(value="ITRS", kind=SearchTargetKind.SYMBOL),
+            budget=2,
+        )
+        result = router.dispatch(action)
+        assert result.budget_limit == 2, f"expected budget_limit=2, got {result.budget_limit}"
+        assert result.budget_used <= result.budget_limit
+
+    def test_related_tests_budget_limit_set(self, astropy_like_repo):
+        """Result sets scan_limit and restricts budget_used."""
+        router = AcquisitionRouter(astropy_like_repo)
+        action = SearchAction(
+            action_id="A_budget_2",
+            action_type=SearchActionType.FIND_RELATED_TESTS,
+            target=SearchTarget(value="ITRS", kind=SearchTargetKind.SYMBOL),
+            budget=3,
+        )
+        result = router.dispatch(action)
+        # scan_limit should be at least 200
+        assert result.scan_limit >= 200
+        assert result.budget_used <= result.budget_limit
 
     def test_find_definition_symbol(self, astropy_like_repo):
         """SYMBOL target 'ITRS' → finds the class definition."""

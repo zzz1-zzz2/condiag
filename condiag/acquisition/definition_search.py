@@ -205,20 +205,28 @@ def _find_definition_for_symbol(
     pattern_def = f"def {sym}("
     pattern_class = f"class {sym}"
 
-    # Bounded file walk — .py files only, skip hidden dirs
-    candidates: list[Path] = []
-    for path in abs_repo.rglob("*.py"):
-        rel = path.relative_to(abs_repo)
-        parts = rel.parts
-        if any(p.startswith(".") for p in parts):
-            continue
-        if any(p in ("__pycache__", "build", "dist", "node_modules") for p in parts):
-            continue
-        candidates.append(path)
-        if len(candidates) >= 200:
-            break
+    # Bounded file walk — deterministic ordering, .py files only
+    sym = target.value.split(".")[-1]
+    abs_repo = repo_root.resolve()
+    max_files_examined = budget * 20
+    files_examined = 0
+    hits: list[AcquisitionHit] = []
+    pattern_def = f"def {sym}("
+    pattern_class = f"class {sym}"
+
+    candidates = sorted(
+        [c for c in abs_repo.rglob("*.py")
+         if not any(part.startswith(".") for part in c.relative_to(abs_repo).parts)
+         and not any(skip in c.parts for skip in ("__pycache__", "build", "dist", "node_modules"))],
+        key=lambda c: str(c.relative_to(abs_repo)),
+    )
 
     for path in candidates:
+        if len(hits) >= budget:
+            break
+        files_examined += 1
+        if files_examined > max_files_examined:
+            break
         if len(hits) >= budget:
             break
         files_examined += 1
@@ -244,12 +252,29 @@ def _find_definition_for_symbol(
         target=target,
         status=AcquisitionStatus.FOUND if hits else AcquisitionStatus.NOT_FOUND,
         hits=hits, files_examined=files_examined, budget_used=len(hits),
+        budget_limit=budget,
+        scan_limit=max_files_examined,
         stop_reason="budget" if hits else "no matches in repo",
     )
 
 
 def find_definition(action: SearchAction, repo_root: Path) -> AcquisitionResult:
-    """Executor for SearchActionType.FIND_DEFINITION."""
+    """Executor for SearchActionType.FIND_DEFINITION.
+
+    Wraps the internal dispatch, guaranteeing action_id and action_type
+    provenance are set even when the dispatcher returns early.
+    """
+    _result = _dispatch_definition(action, repo_root)
+    _result.action_id = action.action_id
+    _result.action_type = action.action_type
+    for _hit in _result.hits:
+        _hit.action_id = action.action_id
+    _result.target = action.target
+    return _result
+
+
+def _dispatch_definition(action: SearchAction, repo_root: Path) -> AcquisitionResult:
+    """Internal dispatch — may return early before provenance is set."""
     target = action.target
     if target.kind == SearchTargetKind.FAILURE_SITE:
         result = _find_definition_for_failure_site(repo_root, target)
@@ -287,5 +312,4 @@ def find_definition(action: SearchAction, repo_root: Path) -> AcquisitionResult:
             target=target, status=AcquisitionStatus.UNSUPPORTED,
             errors=[f"FIND_DEFINITION does not accept target_kind={target.kind.value}"],
         )
-    result.action_id = action.action_id
     return result

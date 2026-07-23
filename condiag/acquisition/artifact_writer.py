@@ -73,8 +73,21 @@ def validate_results(
             rep.n_invalid += 1
         elif r.status == AcquisitionStatus.ERROR:
             rep.n_error += 1
-        if r.budget_used > r.files_examined + 100:
-            rep.budget_violations.append(r.action_id)
+        # Budget violation: budget_used must not exceed budget_limit (when set)
+        if r.budget_limit > 0 and r.budget_used > r.budget_limit:
+            rep.budget_violations.append(
+                f"{r.action_id}: {r.budget_used} hits > budget_limit {r.budget_limit}"
+            )
+        # Scan violation: files_examined must not exceed scan_limit (when set)
+        if r.scan_limit > 0 and r.files_examined > r.scan_limit:
+            rep.budget_violations.append(
+                f"{r.action_id}: scanned {r.files_examined} files > scan_limit {r.scan_limit}"
+            )
+        # Hit count violation: len(hits) must not exceed budget_limit (when set)
+        if r.budget_limit > 0 and len(r.hits) > r.budget_limit:
+            rep.budget_violations.append(
+                f"{r.action_id}: {len(r.hits)} hits > budget_limit {r.budget_limit}"
+            )
     return rep
 
 

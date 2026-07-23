@@ -76,14 +76,15 @@ def _score_test(
     target: SearchTarget,
     target_module_hint: str,
     r1_viewed: set[str],
+    repo_root: Path,
 ) -> tuple[int, str]:
     """Return (score, reason) for one test file vs one target."""
     sym = target.value.split(".")[-1]
-    rel = str(test_path.relative_to(test_path.parent.parent.parent.resolve())) if False \
-        else str(test_path.name)  # simple placeholder
-
-    rel = str(test_path.name)
-    test_module = _module_of(test_path, test_path.parent.parent)
+    try:
+        rel = str(test_path.relative_to(repo_root.resolve()))
+    except ValueError:
+        rel = str(test_path.name)
+    test_module = _module_of(test_path, repo_root)
 
     # 1. Symbol appears in test body
     if sym and sym in test_text:
@@ -130,37 +131,49 @@ def find_related_tests(
     r1_viewed = set(r1_viewed_files or [])
     failed_set = set(failed_test_names or [])
     budget = action.budget
+    max_files = max(budget * 40, 200)
 
     # Test paths adjacent to a failing test get a +20 proximity bonus.
-    failed_dirs: set[Path] = set()
+    # (v2 will refine using SWE-bench FAIL_TO_PASS)
+    failed_dirs: set[str] = set()
     for ftname in failed_set:
-        # ftname may be "pkg.path::test_foo" — derive dir from repo-relative path
-        # (very approximate; v2 will refine using the SWE-bench FAIL_TO_PASS)
         parts = ftname.split("::")
         if len(parts) == 2:
-            failed_dirs.add(Path(parts[0]))
+            failed_dirs.add(str(Path(parts[0])))
 
-    scored: list[tuple[int, str, Path, str]] = []  # (score, reason, path, text)
+    scored: list[tuple[int, str, Path, str]] = []
     files_examined = 0
-    for path in _iter_py_files(repo_root):
+
+    # Deterministic file walk: sort candidates for cross-fs stability.
+    _d_candidates = sorted(
+        _iter_py_files(repo_root),
+        key=lambda p: str(p.relative_to(repo_root.resolve())),
+    )
+
+    for path in _d_candidates:
         if not _is_test_file(path):
             continue
         text = _read(path)
         if text is None:
             continue
         files_examined += 1
-        score, reason = _score_test(path, text, target, target_module_hint, r1_viewed)
+        if files_examined > max_files:
+            break
+        score, reason = _score_test(path, text, target, target_module_hint, r1_viewed, repo_root)
+
+        # Proximity bonus: only apply when there IS a valid score.
+        if score > 0:
+            try:
+                rel = str(path.relative_to(repo_root.resolve()))
+                pdir = str(path.parent)
+                if rel in failed_dirs or pdir in failed_dirs:
+                    score += 20
+                    reason = f"{reason}; proximity to failed test"
+            except (ValueError, OSError):
+                pass
+
         if score > 0:
             scored.append((score, reason, path, text))
-
-        # Proximity bonus
-        try:
-            if path in failed_dirs or any(
-                str(path).endswith(str(fd)) for fd in failed_dirs
-            ):
-                scored[-1] = (score + 20, "proximity to failed test", path, text)
-        except Exception:
-            pass
 
     scored.sort(key=lambda x: -x[0])
 
@@ -189,5 +202,7 @@ def find_related_tests(
         hits=hits,
         files_examined=files_examined,
         budget_used=len(hits),
+        budget_limit=budget,
+        scan_limit=max_files,
         stop_reason="budget" if hits else "no ranked matches",
     )

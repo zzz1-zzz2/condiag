@@ -60,6 +60,8 @@ class AcquisitionResult:
 
     files_examined: int = 0
     budget_used: int = 0
+    budget_limit: int = 0       # maximum hits Router may return
+    scan_limit: int = 0         # maximum files Router may scan
     stop_reason: str = ""
     errors: list[str] = field(default_factory=list)
 
@@ -72,6 +74,8 @@ class AcquisitionResult:
             "hits": [h.to_dict() for h in self.hits],
             "files_examined": self.files_examined,
             "budget_used": self.budget_used,
+            "budget_limit": self.budget_limit,
+            "scan_limit": self.scan_limit,
             "stop_reason": self.stop_reason,
             "errors": list(self.errors),
         }
