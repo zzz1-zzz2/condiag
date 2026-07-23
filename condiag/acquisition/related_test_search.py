@@ -79,7 +79,14 @@ def _score_test(
     repo_root: Path,
 ) -> tuple[int, str]:
     """Return (score, reason) for one test file vs one target."""
-    sym = target.value.split(".")[-1]
+    # For FILE-kind targets, use the file stem as the "symbol".
+    # Never split a file path on '.' — that produces 'py' from '.py'.
+    if target.kind.value == "FILE" and "/" in target.value:
+        sym = Path(target.value).stem
+    elif target.kind.value == "FILE":
+        sym = target.value.replace(".py", "")
+    else:
+        sym = target.value.split(".")[-1]
     try:
         rel = str(test_path.relative_to(repo_root.resolve()))
     except ValueError:
@@ -128,7 +135,11 @@ def find_related_tests(
         to match test imports against.
     """
     target = action.target
-    sym = target.value.split(".")[-1] if target.value else ""
+    # Never dot-split a file path — '.py' becomes 'py'.
+    if target.kind.value == "FILE":
+        sym = Path(target.value).stem
+    else:
+        sym = target.value.split(".")[-1] if target.value else ""
     r1_viewed = set(r1_viewed_files or [])
     failed_set = set(failed_test_names or [])
     budget = action.budget
@@ -160,6 +171,17 @@ def find_related_tests(
             break
         files_examined += 1
         score, reason = _score_test(path, text, target, target_module_hint, r1_viewed, repo_root)
+
+        # Proximity bonus for FILE targets: same directory as target
+        if score > 0 and target.kind.value == "FILE":
+            try:
+                target_dir = Path(target.value).parent
+                test_dir = str(path.relative_to(repo_root.resolve()).parent)
+                if test_dir == str(target_dir):
+                    score += 30
+                    reason = f"{reason}; same dir as target FILE"
+            except (ValueError, OSError):
+                pass
 
         # Proximity bonus: only apply when there IS a valid score.
         if score > 0:
