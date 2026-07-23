@@ -115,6 +115,7 @@ def find_related_tests(
     r1_viewed_files: Iterable[str] | None = None,
     failed_test_names: Iterable[str] | None = None,
     target_module_hint: str = "",
+    max_files_examined: int = 200,
 ) -> AcquisitionResult:
     """Executor for SearchActionType.FIND_RELATED_TESTS.
 
@@ -131,15 +132,14 @@ def find_related_tests(
     r1_viewed = set(r1_viewed_files or [])
     failed_set = set(failed_test_names or [])
     budget = action.budget
-    max_files = max(budget * 40, 200)
+    max_files = max_files_examined
 
     # Test paths adjacent to a failing test get a +20 proximity bonus.
-    # (v2 will refine using SWE-bench FAIL_TO_PASS)
     failed_dirs: set[str] = set()
     for ftname in failed_set:
         parts = ftname.split("::")
-        if len(parts) == 2:
-            failed_dirs.add(str(Path(parts[0])))
+        if len(parts) == 2 and parts[0]:
+            failed_dirs.add(str(Path(parts[0]).parent))
 
     scored: list[tuple[int, str, Path, str]] = []
     files_examined = 0
@@ -156,17 +156,16 @@ def find_related_tests(
         text = _read(path)
         if text is None:
             continue
-        files_examined += 1
-        if files_examined > max_files:
+        if files_examined >= max_files:
             break
+        files_examined += 1
         score, reason = _score_test(path, text, target, target_module_hint, r1_viewed, repo_root)
 
         # Proximity bonus: only apply when there IS a valid score.
         if score > 0:
             try:
-                rel = str(path.relative_to(repo_root.resolve()))
-                pdir = str(path.parent)
-                if rel in failed_dirs or pdir in failed_dirs:
+                rel_dir = str(path.relative_to(repo_root.resolve()).parent)
+                if rel_dir in failed_dirs:
                     score += 20
                     reason = f"{reason}; proximity to failed test"
             except (ValueError, OSError):

@@ -30,21 +30,27 @@ class AcquisitionRouter:
         repo_root: Path | str,
         r1_viewed_files: Iterable[str] | None = None,
         failed_test_names: Iterable[str] | None = None,
+        max_files_examined: int = 200,
     ) -> None:
         self.repo_root = Path(repo_root)
         self.r1_viewed_files = set(r1_viewed_files or [])
         self.failed_test_names = list(failed_test_names or [])
+        self.max_files_examined = max_files_examined
 
     def dispatch(self, action: SearchAction) -> AcquisitionResult:
         """Execute one SearchAction against the repo."""
         if action.action_type == SearchActionType.FIND_DEFINITION:
-            return find_definition(action, self.repo_root)
+            return find_definition(
+                action, self.repo_root,
+                max_files_examined=self.max_files_examined,
+            )
         if action.action_type == SearchActionType.FIND_RELATED_TESTS:
             return find_related_tests(
                 action,
                 self.repo_root,
                 r1_viewed_files=self.r1_viewed_files,
                 failed_test_names=self.failed_test_names,
+                max_files_examined=self.max_files_examined,
             )
         return AcquisitionResult(
             action_id=action.action_id,

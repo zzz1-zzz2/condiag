@@ -196,6 +196,7 @@ def _find_definition_for_symbol(
     repo_root: Path,
     target: SearchTarget,
     budget: int = 3,
+    max_files_examined: int = 200,
 ) -> AcquisitionResult:
     """Resolve SYMBOL/TYPE_NAME → grep for `def name` or `class name`."""
     sym = target.value.split(".")[-1]
@@ -224,10 +225,7 @@ def _find_definition_for_symbol(
     for path in candidates:
         if len(hits) >= budget:
             break
-        files_examined += 1
-        if files_examined > max_files_examined:
-            break
-        if len(hits) >= budget:
+        if files_examined >= max_files_examined:
             break
         files_examined += 1
         text = _read_file_safe(path)
@@ -258,13 +256,17 @@ def _find_definition_for_symbol(
     )
 
 
-def find_definition(action: SearchAction, repo_root: Path) -> AcquisitionResult:
+def find_definition(
+    action: SearchAction,
+    repo_root: Path,
+    max_files_examined: int = 200,
+) -> AcquisitionResult:
     """Executor for SearchActionType.FIND_DEFINITION.
 
     Wraps the internal dispatch, guaranteeing action_id and action_type
     provenance are set even when the dispatcher returns early.
     """
-    _result = _dispatch_definition(action, repo_root)
+    _result = _dispatch_definition(action, repo_root, max_files_examined=max_files_examined)
     _result.action_id = action.action_id
     _result.action_type = action.action_type
     for _hit in _result.hits:
@@ -273,13 +275,19 @@ def find_definition(action: SearchAction, repo_root: Path) -> AcquisitionResult:
     return _result
 
 
-def _dispatch_definition(action: SearchAction, repo_root: Path) -> AcquisitionResult:
+def _dispatch_definition(
+    action: SearchAction, repo_root: Path,
+    max_files_examined: int = 200,
+) -> AcquisitionResult:
     """Internal dispatch — may return early before provenance is set."""
     target = action.target
     if target.kind == SearchTargetKind.FAILURE_SITE:
         result = _find_definition_for_failure_site(repo_root, target)
     elif target.kind in (SearchTargetKind.SYMBOL, SearchTargetKind.TYPE_NAME):
-        result = _find_definition_for_symbol(repo_root, target, budget=action.budget)
+        result = _find_definition_for_symbol(
+            repo_root, target, budget=action.budget,
+            max_files_examined=max_files_examined,
+        )
     elif target.kind == SearchTargetKind.FILE:
         # Return the FILE's top-level definitions (no AST node = empty hit
         # for now; concrete FILE handling lives in v2).

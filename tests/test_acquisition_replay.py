@@ -56,6 +56,7 @@ def astropy_like_repo(tmp_path: Path) -> Path:
 def _build_minimal_bundle(tmp_path: Path) -> Path:
     """Create a valid bundle JSON file for testing."""
     p = tmp_path / "bundle.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
     bundle = RuntimeFailureFeatureBundle(
         test_log=TestLogSignals(
             framework="pytest",
@@ -181,8 +182,9 @@ class TestReplayBasic:
 
     def test_provenance_on_router_hits(self, astropy_like_repo, tmp_path):
         """Every Router hit must have non-empty action_id matching its action."""
-        bundle_path = _build_minimal_bundle(tmp_path)
-        out = tmp_path / "out5"
+        bundle_path = _build_minimal_bundle(tmp_path.parent)
+        repo = astropy_like_repo
+        out = tmp_path.parent / "p_out5"
         summary = run_replay(
             bundle_path=bundle_path,
             repo_root=astropy_like_repo,
@@ -230,9 +232,10 @@ class TestReplayRealCanary:
             ),
             instance=RuntimeInstanceSignals(instance_id="astropy__astropy-13398"),
         )
-        bundle_path = tmp_path / "real_bundle.json"
+        bundle_path = tmp_path.parent / "real_bundle.json"
+        bundle_path.parent.mkdir(parents=True, exist_ok=True)
         bundle_path.write_text(bundle.model_dump_json())
-        out = tmp_path / "real_out"
+        out = tmp_path.parent / "real_out_replay"
         summary = run_replay(
             bundle_path=bundle_path,
             repo_root=astropy_like_repo,

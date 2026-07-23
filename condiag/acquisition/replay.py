@@ -23,9 +23,19 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+
+import pydantic
 
 logger = logging.getLogger("condiag.acquisition.replay")
+
+
+class ReplayInputError(ValueError):
+    """User input error — maps to exit code 2."""
+
+
+class ReplayInvariantError(RuntimeError):
+    """Invariant violation — maps to exit code 4."""
 
 
 # ── ReplaySummary ───────────────────────────────────────────────────
@@ -139,18 +149,60 @@ def run_replay(
         raise FileNotFoundError(f"bundle not found: {bundle_path}")
     if not repo_root.is_dir():
         raise NotADirectoryError(f"repo_root not a directory: {repo_root}")
+    if not (repo_root / ".git").exists():
+        raise ReplayInputError(f"repo_root is not a git repository: {repo_root}")
+    if not _git_is_clean(repo_root):
+        raise ReplayInputError(
+            f"repo_root has uncommitted changes; "
+            f"replay requires a clean checkout before start"
+        )
+    # Output dir must NOT be inside repo_root (Replay would dirty the repo)
+    try:
+        output_dir.resolve().relative_to(repo_root.resolve())
+        raise ReplayInputError(
+            f"output_dir must not be inside repo_root: "
+            f"{output_dir.resolve()} is inside {repo_root.resolve()}"
+        )
+    except ValueError:
+        pass  # expected — output_dir outside repo_root is correct
 
     # ── Capture pre-replay repo state ──
     bundle_raw = bundle_path.read_bytes()
     bundle_sha = hashlib.sha256(bundle_raw).hexdigest()[:16]
     repo_head = _git_head(repo_root)
-    repo_was_clean = _git_is_clean(repo_root)
+    repo_was_clean = True  # enforced above
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Load bundle ──
-    from condiag.diagnosis.signals.schema import RuntimeFailureFeatureBundle
-    bundle = RuntimeFailureFeatureBundle.model_validate_json(bundle_raw)
+    from pydantic import ValidationError as PydanticValidationError
+    try:
+        from condiag.diagnosis.signals.schema import RuntimeFailureFeatureBundle
+        bundle = RuntimeFailureFeatureBundle.model_validate_json(bundle_raw)
+    except (json.JSONDecodeError, PydanticValidationError, KeyError) as e:
+        raise ReplayInputError(f"invalid bundle: {e}")
+
+    # ── Verify base_commit matches repo HEAD ──
+    bundle_base = ""
+    if bundle.instance and bundle.instance.base_commit:
+        bundle_base = bundle.instance.base_commit
+    if bundle_base and repo_head and bundle_base != repo_head:
+        raise ReplayInvariantError(
+            f"bundle base_commit ({bundle_base}) != repo HEAD ({repo_head}). "
+            f"Replay requires the exact commit the canary ran on."
+        )
+
+    # ── Workspace diff SHA ──
+    workspace_diff_sha = ""
+    try:
+        r = subprocess.run(
+            ["git", "diff", "--binary", "--no-ext-diff", "HEAD"],
+            capture_output=True, text=True, timeout=30, cwd=repo_root,
+        )
+        if r.returncode == 0:
+            workspace_diff_sha = hashlib.sha256(r.stdout.encode()).hexdigest()[:16]
+    except Exception:
+        pass
 
     # ── P1-3A/B: Cluster → Diagnose ──
     from condiag.diagnosis.failure_event import reasoner_v2_cluster
@@ -212,6 +264,7 @@ def run_replay(
         repo_root,
         r1_viewed_files=viewed,
         failed_test_names=failed_names,
+        max_files_examined=max_files_examined,
     )
 
     results = []
@@ -316,18 +369,18 @@ def main() -> None:
             max_total_budget=args.max_total_budget,
             max_files_examined=args.max_files_examined,
         )
+    except ReplayInputError as e:
+        logger.error("Input error: %s", e)
+        sys.exit(2)
     except FileNotFoundError as e:
         logger.error("Input error: %s", e)
         sys.exit(2)
     except NotADirectoryError as e:
         logger.error("Input error: %s", e)
         sys.exit(2)
-    except RuntimeError as e:
-        if "modified the repo" in str(e):
-            logger.error("Invariant violation: %s", e)
-            sys.exit(4)
-        logger.exception("Runtime error: %s", e)
-        sys.exit(3)
+    except ReplayInvariantError as e:
+        logger.error("Invariant violation: %s", e)
+        sys.exit(4)
     except KeyboardInterrupt:
         sys.exit(130)
     except Exception as e:
