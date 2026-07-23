@@ -1,15 +1,26 @@
-"""Pytest test_log extractor — parse SWE-bench evaluation stdout for pytest instances.
+"""Pytest test_log extractor — parse per-test failure sections.
 
-Extracts structured signals from the raw test_output.txt produced by
-swebench.harness.run_instance() when the project uses pytest.
+The test_log (test_output.txt) has this structure:
 
-Two frame formats handled:
-  1. Pytest short format:  astropy/x.py:42: in func_name  (was MISSED in v4)
-  2. File format:          File "/path/x.py", line 42, in func_name (pip build frames only)
+  ==== FAILURES ====
+  ________ test_name_A ________
+    [test code context]
+    >   assert_something()
+    repo/path.py:LINE: in func
+    repo/path.py:LINE: in func
+    E   TypeError: message
 
-The key fix over v4's extract_witness:
-  - v4 only matched format 2 (all 14 frames were pip build frames, 0 test frames extracted)
-  - v5 matches BOTH formats and separates build frames from test failure frames
+  ________ test_name_B ________
+    ...
+
+  ==== short test summary info ====
+  FAILED test_name_A
+  FAILED test_name_B
+  PASSED test_name_C
+  ...
+
+Each failure section has its OWN error message, stack frames, and assertion.
+This parser creates one TestFailureSignal per section with correctly bound data.
 """
 from __future__ import annotations
 
@@ -21,264 +32,280 @@ from typing import Optional
 from condiag.diagnosis.signals.enums import ErrorType, TestFramework
 from condiag.diagnosis.signals.schema import (
     StackFrame,
+    TestFailureSignal,
     TestLogSignals,
 )
 from condiag.diagnosis.signals.frame_normalizer import normalize_frame
 
 logger = logging.getLogger("condiag.diagnosis.signals.pytest_extractor")
 
-# ── Patterns ────────────────────────────────────────────────────────
+# ── Section boundaries ──────────────────────────────────────────────
 
-# Test result lines
-_RE_FAILED = re.compile(r"^FAILED\s+(\S+(?:::\S+)?(?:\S*)?)")
-_RE_PASSED = re.compile(r"^PASSED\s+(\S+(?:::\S+)?)\s*$")
+# FAILURES header (trailing ... due to line length in some logs)
+_RE_FAILURES_HEADER = re.compile(r"^==+.*FAILURES.*==+")
+# short test summary header
+_RE_SUMMARY_HEADER = re.compile(r"^==+.*short test summary.*==+")
+# Per-test section header: _________ test_name _________
+_RE_TEST_HEADER = re.compile(r"_{3,}\s+(.+?)\s+_{3,}")
 
-# Stack frame: pytest short format (the main test failure format)
-# Example: astropy/coordinates/baseframe.py:1202: in transform_to
-_RE_PYTEST_FRAME = re.compile(r"^(\S+?)\.py:(\d+): in (\w+)")
+# ── Frame / error patterns (per-test section) ──────────────────────
 
-# Stack frame: File "..." format (pip/build errors, NOT test failures)
-# Example: File "/opt/.../build_meta.py", line 317, in run_setup
-_RE_FILE_FRAME = re.compile(
-    r'File\s+"([^"]+)",\s*line\s+(\d+)(?:,\s*in\s+(\w+))?'
-)
+# Pytest short format: path/file.py:LINE: in func_name
+# Also: path/file.py:LINE:                    (no func name on continuation lines)
+# Also: path/file.py:LINE: TypeError          (last line of the traceback)
+_RE_PYTEST_FRAME = re.compile(r"^(\S+?)\.py:(\d+):(?:\s+in\s+(\w+))?")
 
-# Error lines
-_RE_ERROR_LINE = re.compile(r"E\s+(?:\s+)?(\w+(?:Error|Exception|Failure))(?::\s*(.*))?")
-_RE_ERROR_GENERIC = re.compile(
-    r"(AssertionError|AttributeError|TypeError|ValueError|ImportError|"
-    r"ModuleNotFoundError|KeyError|IndexError|RuntimeError|OSError|"
-    r"StopIteration)[^:\n]*:\s*([^\n]+)"
-)
+# Error line: E       TypeError: message
+_RE_ERROR_LINE = re.compile(r"^\s*E\s+(\w+(?:Error|Exception|Failure))(?::\s*(.*))?")
 
-# Assertion detail (the source code line that failed)
+# Assertion line: >       assert_something(...)
 _RE_ASSERTION_LINE = re.compile(r"^>\s+\S")
+
+# Stack separator line: _ _ _ _ _ ... (NOT a test section header)
+_RE_STACK_SEPARATOR = re.compile(r"^_{3,}\s*$")
+
+
+def _resolve_repo_path(short_path: str) -> str:
+    """Resolve a short pytest-style path to a reasonable repo-relative path."""
+    if short_path.startswith("."):
+        short_path = short_path.lstrip("./")
+    return short_path
+
+
+def _first_repo_frame(frames: list[StackFrame]) -> str:
+    for f in frames:
+        if f.is_repo_frame and not f.is_test_file:
+            return f"{f.file}:{f.line}"
+    return ""
+
+
+# ── Section parser ──────────────────────────────────────────────────
+
+
+def _parse_test_section(lines: list[str], start: int) -> tuple[TestFailureSignal | None, int]:
+    """Parse one failure section starting at a '____ test_name ____' header.
+
+    Returns (TestFailureSignal, line_after_section_end).
+    Returns (None, end_line) if the section is not a test failure.
+    """
+    # Extract test name from header
+    m = _RE_TEST_HEADER.match(lines[start].strip())
+    if not m:
+        return None, start + 1
+    test_name = m.group(1).strip()
+
+    frames: list[StackFrame] = []
+    error_msg = ""
+    exception_type = "Unknown"
+    assertion_lines: list[str] = []
+    section_lines: list[str] = []
+
+    i = start + 1
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.rstrip("\n")
+
+        # Stop at next test header, FAILURES header, or summary
+        if _RE_TEST_HEADER.match(stripped) and i != start:
+            break
+        if _RE_SUMMARY_HEADER.match(stripped):
+            break
+
+        section_lines.append(stripped)
+
+        # Assertion line: >       code_that_failed
+        # Collect ALL assertion lines, then pick the best candidate later
+        if _RE_ASSERTION_LINE.match(stripped):
+            assertion_lines.append(stripped)
+
+        # Error line: E       TypeError: message
+        em = _RE_ERROR_LINE.match(stripped)
+        if em:
+            etype = em.group(1)
+            msg = em.group(2) or ""
+            full = f"{etype}: {msg}"
+            # Use the FIRST E line as the primary error for this test
+            if not error_msg:
+                exception_type = etype
+                error_msg = full
+
+        # Stack frame: path/file.py:LINE: in func_name
+        # Also matches continuation lines (no in func) and final lines (file.py:LINE: ErrorType)
+        fm = _RE_PYTEST_FRAME.match(stripped)
+        if fm:
+            fpath = fm.group(1) + ".py"
+            if not fpath.startswith("/"):
+                fpath = _resolve_repo_path(fpath)
+            frame = normalize_frame(
+                fpath, int(fm.group(2)),
+                fm.group(3) or "",
+            )
+            frames.append(frame)
+
+        # File format frame: File "path", line N, in func
+        # (less common in test sections, but handle)
+        ff = re.match(r'File\s+"([^"]+)",\s*line\s+(\d+)(?:,\s*in\s+(\w+))?', stripped)
+        if ff:
+            fpath2 = ff.group(1)
+            if fpath2.startswith("/testbed/"):
+                fpath2 = fpath2[len("/testbed/"):]
+            frame2 = normalize_frame(fpath2, line=int(ff.group(2)), function=ff.group(3) or "")
+            frames.append(frame2)
+
+        i += 1
+
+    # Pick the best assertion line: prefer the one with "assert",
+    # "allclose", "==", or similar comparison keywords; else the first.
+    best_assertion = ""
+    if assertion_lines:
+        priority = [
+            a for a in assertion_lines
+            if any(k in a.lower() for k in ["assert_", "assert ", "==", "!="])
+        ]
+        best_assertion = priority[0] if priority else assertion_lines[-1]
+
+    record = TestFailureSignal(
+        test_name=test_name,
+        exception_type=exception_type,
+        error_message=error_msg,
+        assertion_line=best_assertion,
+        stack_frames=frames,
+        root_frame=_first_repo_frame(frames),
+        raw_excerpt="\n".join(section_lines),
+    )
+    return record, i
+
+
+# ── Main parser ─────────────────────────────────────────────────────
 
 
 def extract_test_log(test_log_path: str | Path) -> TestLogSignals:
-    """Extract all signals from a pytest-format test_log file.
-
-    Args:
-        test_log_path: Path to test_output.txt from SWE-bench evaluation.
-
-    Returns:
-        TestLogSignals with all extractable fields populated.
-    """
+    """Extract per-test failure records from a pytest-format test_log file."""
     raw = Path(test_log_path).read_text(encoding="utf-8", errors="replace")
     lines = raw.split("\n")
 
     signals = TestLogSignals(framework=TestFramework.PYTEST)
 
-    _extract_test_results(signals, lines)
-    _extract_stack_frames(signals, raw, lines)
-    _extract_errors(signals, lines)
-    _extract_call_chains(signals)
+    # Find FAILURES section start and summary section start
+    failures_start = None
+    summary_start = None
+    for i, line in enumerate(lines):
+        if _RE_FAILURES_HEADER.match(line.strip()):
+            failures_start = i + 1
+        if failures_start is not None and _RE_SUMMARY_HEADER.match(line.strip()):
+            summary_start = i
+            break
+
+    # If no FAILURES section, parse test sections from the entire file
+    if failures_start is None or summary_start is None:
+        _extract_from_summary(signals, lines)
+        # Try parsing sections from whole file
+        i = 0
+        while i < len(lines):
+            if _RE_TEST_HEADER.match(lines[i].strip()):
+                # Found a test header outside FAILURES section
+                # Find the next test header or end of file
+                j = i + 1
+                while j < len(lines):
+                    if _RE_TEST_HEADER.match(lines[j].strip()) and j != i:
+                        break
+                    j += 1
+                section_lines = lines[i:j]
+                record, _ = _parse_test_section(section_lines, 0)
+                if record is not None:
+                    signals.failures.append(record)
+                i = j
+            else:
+                i += 1
+        _derive_aggregates(signals)
+        return signals
+
+    # Parse each test section between FAILURES header and summary
+    i = failures_start
+    while i < summary_start:
+        record, i = _parse_test_section(lines, i)
+        if record is not None:
+            signals.failures.append(record)
+
+    # Parse summary for FAILED/PASSED test lists
+    _extract_from_summary(signals, lines)
+
+    # Derive aggregate fields from per-test records
+    _derive_aggregates(signals)
 
     return signals
 
 
-# ── Internal: test results ──────────────────────────────────────────
+# ── Summary parser ──────────────────────────────────────────────────
 
 
-def _extract_test_results(signals: TestLogSignals, lines: list[str]) -> None:
-    """Extract FAILED and PASSED test lists."""
+_RE_FAILED_LINE = re.compile(r"^FAILED\s+(\S+(?:::\S+)?(?:\S*)?)")
+_RE_PASSED_LINE = re.compile(r"^PASSED\s+(\S+(?:::\S+)?)\s*$")
+
+
+def _extract_from_summary(signals: TestLogSignals, lines: list[str]) -> None:
+    """Extract FAILED/PASSED test names and counts from summary."""
     for line in lines:
         stripped = line.strip()
 
-        m = _RE_FAILED.match(stripped)
+        m = _RE_FAILED_LINE.match(stripped)
         if m:
             signals.failed_tests.append(m.group(1))
             continue
 
-        m = _RE_PASSED.match(stripped)
+        m = _RE_PASSED_LINE.match(stripped)
         if m:
             signals.passed_tests.append(m.group(1))
             continue
 
-    # Count total tests from the summary line
+    # Total test count from summary line
     for line in reversed(lines):
-        m = re.search(r"(\d+)\s+passed", line)
-        n = re.search(r"(\d+)\s+failed", line)
-        if m or n:
-            total = int(m.group(1)) if m else 0
-            total += int(n.group(1)) if n else 0
+        m_passed = re.search(r"(\d+)\s+passed", line)
+        m_failed = re.search(r"(\d+)\s+failed", line)
+        if m_passed or m_failed:
+            total = int(m_passed.group(1)) if m_passed else 0
+            total += int(m_failed.group(1)) if m_failed else 0
             signals.num_tests_run = total
             break
 
 
-# ── Internal: stack frames ──────────────────────────────────────────
+# ── Aggregate derivation ────────────────────────────────────────────
 
 
-def _extract_stack_frames(
-    signals: TestLogSignals, raw: str, lines: list[str]
-) -> None:
-    """Extract stack frames, separating test failures from build errors.
+def _derive_aggregates(signals: TestLogSignals) -> None:
+    """Derive legacy aggregate fields from per-test failure records.
 
-    CRITICAL FIX over v4 extract_witness:
-      v4 only matched 'File "..."' format, which finds ONLY pip build frames.
-      pytest short format frames ('file.py:N: in func') were completely missed.
+    This ensures backward compatibility with code that reads
+    error_types, error_messages, stack_frames, call_chains, etc.
     """
-    # Find FAILURES section boundaries
-    # The pytest FAILURES header looks like:
-    #   =================================== FAILURES ===================================
-    # NOT starting with "FAILURES". So we check for "FAILURES" anywhere in the line.
-    failure_start = None
-    summary_start = None
-    for i, line in enumerate(lines):
-        if "FAILURES" in line and "===" in line:
-            failure_start = i
-        if failure_start is not None and "short test summary" in line:
-            summary_start = i
-            break
-    if failure_start is None:
-        failure_start = 0
-    if summary_start is None:
-        summary_start = len(lines)
-
-    # Isolate the test execution region vs build/setup region
-    # Build region: before the tests start (~ the "pytest -rA" command)
-    test_start = None
-    for i, line in enumerate(lines):
-        if "pytest" in line and "-rA" in line and "test_" in line:
-            test_start = i
-            break
-        # Also detect git checkout of test patch
-        if "git checkout" in line and "test_" in line:
-            test_start = i + 10  # a few lines after checkout
-            break
-    if test_start is None:
-        test_start = 0
-
-    # Parse frames in test failure region (between FAILURES and summary)
-    for i in range(failure_start, summary_start):
-        line = lines[i] if i < len(lines) else ""
-
-        # Pytest short format: astropy/utils/iers/iers.py:271: in mjd_utc
-        m = _RE_PYTEST_FRAME.search(line)
-        if m:
-            fpath = m.group(1) + ".py"  # regex consumes .py, restore it
-            if not fpath.startswith("/"):
-                fpath = _resolve_repo_path(fpath)
-            signals.stack_frames.append(
-                normalize_frame(fpath, int(m.group(2)), m.group(3))
-            )
-            continue
-
-        # File "..." format in failure section (unusual for pytest, but handle it)
-        m = _RE_FILE_FRAME.search(line)
-        if m:
-            fpath = m.group(1)
-            if fpath.startswith("/testbed/"):
-                fpath = fpath[len("/testbed/"):]
-            signals.stack_frames.append(
-                normalize_frame(fpath, int(m.group(2)), m.group(3) or "")
-            )
-            continue
-
-    # Build frames: File "..." format in the setup phase (before test section)
-    for i in range(0, test_start):
-        line = lines[i] if i < len(lines) else ""
-        m = _RE_FILE_FRAME.search(line)
-        if m:
-            fpath = m.group(1)
-            signals.build_frames.append(
-                normalize_frame(fpath, line=int(m.group(2)), function=m.group(3) or "")
-            )
-
-
-# ── Internal: error extraction ──────────────────────────────────────
-
-
-def _extract_errors(signals: TestLogSignals, lines: list[str]) -> None:
-    """Extract error types, messages, and assertion details."""
-    error_type_counts: dict[str, int] = {}
-
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-
-        # Error lines: E       TypeError: ...
-        m = _RE_ERROR_LINE.search(stripped)
-        if m:
-            etype = m.group(1)
-            msg = m.group(2) or ""
-            error_type_counts[etype] = error_type_counts.get(etype, 0) + 1
-            full_msg = f"{etype}: {msg}"
-            if not signals.first_error_message:
-                signals.first_error_message = full_msg
-            if full_msg not in signals.error_messages:
-                signals.error_messages.append(full_msg)
-            continue
-
-        # Fallback: also match error message in summary lines
-        m = _RE_ERROR_GENERIC.search(stripped)
-        if m and "FAILURES" not in stripped:
-            etype = m.group(1)
-            msg = m.group(2) or ""
-            error_type_counts[etype] = error_type_counts.get(etype, 0) + 1
-            full_msg = f"{etype}: {msg}"
-            if not signals.first_error_message:
-                signals.first_error_message = full_msg
-            if full_msg not in signals.error_messages:
-                signals.error_messages.append(full_msg)
-
-        # Assertion detail lines: >       cirsnod = inod.transform_to(cframe1)
-        if _RE_ASSERTION_LINE.search(stripped):
-            signals.failure_assertions.append(stripped)
-
-    signals.error_types = error_type_counts
-
-
-# ── Internal: call chains ────────────────────────────────────────────
-
-
-def _extract_call_chains(signals: TestLogSignals) -> None:
-    """Group stack frames into per-failure call chains.
-
-    Heuristic: frames are separated by blank lines or failure headers
-    (________________________________ test_name ________________________________).
-    """
-    if not signals.stack_frames:
+    if not signals.failures:
         return
 
-    n_failed = max(len(signals.failed_tests), 1)
-    total = len(signals.stack_frames)
-    per_chain = total // n_failed if n_failed > 0 else total
-    remainder = total % n_failed
-    idx = 0
-    for i in range(n_failed):
-        size = per_chain + (1 if i < remainder else 0)
-        chain = list(signals.stack_frames[idx:idx + size])
-        signals.call_chains.append(chain)
-        idx += size
+    # error_types: count across all failures
+    error_type_counts: dict[str, int] = {}
+    seen_messages: set[str] = set()
 
+    for rec in signals.failures:
+        # Error type counts
+        etype = rec.exception_type if rec.exception_type != "Unknown" else "Error"
+        error_type_counts[etype] = error_type_counts.get(etype, 0) + 1
 
-# ── Helpers ──────────────────────────────────────────────────────────
+        # Error messages (deduplicate for backward compat)
+        if rec.error_message and rec.error_message not in seen_messages:
+            seen_messages.add(rec.error_message)
+            signals.error_messages.append(rec.error_message)
 
+        if not signals.first_error_message and rec.error_message:
+            signals.first_error_message = rec.error_message
 
-def _is_system_path(path: str) -> bool:
-    """Check if path is a system/site-packages path (not repo code)."""
-    return any(
-        prefix in path
-        for prefix in [
-            "/opt/",
-            "/usr/",
-            "/lib/",
-            "site-packages/",
-            "dist-packages/",
-        ]
-    )
+        # Stack frames (ALL frames from ALL failures, in order)
+        signals.stack_frames.extend(rec.stack_frames)
 
+        # Assertion lines
+        if rec.assertion_line:
+            signals.failure_assertions.append(rec.assertion_line)
 
-def _resolve_repo_path(short_path: str) -> str:
-    """Resolve a short pytest-style path to a reasonable repo-relative path.
+        # Call chains (per-test)
+        signals.call_chains.append(rec.stack_frames)
 
-    Pytest sometimes produces paths like:
-      astropy/coordinates/baseframe.py:1202: in transform_to
-    These are already repo-relative. Just return as-is.
-
-    But some paths might be even shorter (just a filename). In that case,
-    prefix with the module structure if possible.
-    """
-    if short_path.startswith("."):
-        short_path = short_path.lstrip("./")
-    return short_path
+    signals.error_types = error_type_counts

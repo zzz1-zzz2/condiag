@@ -57,27 +57,6 @@ def _extract_symbols_from_patch(patch: PatchSignals) -> list[str]:
     return syms
 
 
-# ── Domain knowledge: which file provides which symbol ──────────────
-
-# For SWE-bench tasks, known provider-file mappings.
-# This is the one place where minimal domain knowledge is encoded.
-# Extended per-task type as needed; kept small for generalization.
-KNOWN_PROVIDERS: dict[str, str] = {
-    "ITRS": "astropy/coordinates/builtin_frames/itrs.py",
-    "AltAz": "astropy/coordinates/builtin_frames/altaz.py",
-    "HADec": "astropy/coordinates/builtin_frames/hadec.py",
-    "EarthLocation": "astropy/coordinates/earth.py",
-    "rotation_matrix": "astropy/coordinates/matrix_utilities.py",
-    "frame_transform_graph": "astropy/coordinates/baseframe.py",
-    "FunctionTransformWithFiniteDifference": "astropy/coordinates/transformations.py",
-}
-
-
-def _known_symbol_file(symbol: str) -> str | None:
-    """Return known file path for a symbol, or None."""
-    return KNOWN_PROVIDERS.get(symbol)
-
-
 # ── EvidenceAlignment data structure ────────────────────────────────
 
 
@@ -187,12 +166,13 @@ def align_evidence(
         ):
             symbols_not_viewed.append(sym)
 
-    # Provider files not visited
-    missing_providers: list[str] = []
-    for sym in error_symbols:
-        provider = _known_symbol_file(sym)
-        if provider and provider not in viewed_files:
-            missing_providers.append(provider)
+    # Files grouped by whether trajectory showed them
+    # (provider-file lookup intentionally omitted — that's Router's job)
+    err_files_in_view: list[str] = []
+    for frame_key in deduped_frames:
+        fname = frame_key.split(":")[0] if ":" in frame_key else frame_key
+        if any(fname in vf for vf in viewed_files):
+            err_files_in_view.append(frame_key)
 
     # Files viewed but never patched
     edited_dir_parts = {
@@ -204,20 +184,20 @@ def align_evidence(
         and f.endswith(".py")
     ][:10]  # cap
 
-    # Assumptions the patch makes that the error contradicts
+    # Generic assumption analysis: if patch edits differ from error frames
     patch_assumptions: list[str] = []
     contradictory_evidence: list[str] = []
-
-    # Check: patch adds new transform but error shows frame mismatch
-    if len(patch.edited_files) >= 2:
-        patch_assumptions.append(
-            "R1 introduces direct ITRS↔observed transforms"
-        )
-    if any("frame" in m.lower() or "ITRS" in m for m in [e.message for e in cluster.events]):
-        contradictory_evidence.append(
-            "Error shows ITRS frame constructor rejects parameters "
-            "used by the new transform"
-        )
+    if patch.edited_files and error_files_in_cluster:
+        error_basenames = {f.split("/")[-1] for f in error_files_in_cluster if "/" in f}
+        patch_basenames = {f.split("/")[-1] for f in patch.edited_files if "/" in f}
+        overlap = error_basenames & patch_basenames
+        if not overlap:
+            patch_assumptions.append(
+                "R1 edits files not directly referenced in the error stack"
+            )
+            contradictory_evidence.append(
+                "Error stack frames point to different files than the patch edits"
+            )
 
     return EvidenceAlignment(
         cluster_id=cluster.cluster_id,
@@ -240,7 +220,6 @@ def align_evidence(
         ],
         symbols_in_error_not_viewed=symbols_not_viewed,
         symbols_in_error_not_viewed_provider=[],
-        missing_provider_files=missing_providers,
         patch_assumptions=patch_assumptions,
         contradictory_evidence=contradictory_evidence,
     )
@@ -334,12 +313,15 @@ def classify_cluster(
     if cluster.events:
         error_msg = cluster.events[0].message
 
-    # Flag: assert_allclose comparing two routes
+    # Flag: assert compares two computed paths/routes
     route_comparison = any(
-        "viaicrs" in e.assertion_line.lower() or "viaitrs" in e.assertion_line.lower()
+        e.assertion_line
+        and any(kw in e.assertion_line.lower() for kw in ["allclose", "almost_equal", "assertequal"])
         for e in cluster.events
-    ) or any(
-        "viaicrs" in e.message.lower() or "viaitrs" in e.message.lower()
+    )
+    # Also check for assertions comparing two named routes in the error message
+    route_comparison = route_comparison or any(
+        "via" in e.message.lower()
         for e in cluster.events
     )
 
@@ -350,9 +332,6 @@ def classify_cluster(
     # Flag: "unsupported operand" type contract
     type_contract = any("unsupported operand" in e.message.lower()
                         for e in cluster.events)
-
-    # Flag: ITRS frame in error
-    itrs_in_error = any("ITRS" in e.message for e in cluster.events)
 
     # Flag: agent added new file (detected from alignment)
     added_new_file = alignment.patch_introduced_new_file
@@ -365,19 +344,17 @@ def classify_cluster(
             type=ContextDeficiencyType.RELATED_TESTS,
             subtype="ROUTE_COMPARISON_FAILURE",
             confidence="high",
-            target_symbols=["itrs_to_observed_mat", "itrs_to_observed", "observed_to_itrs"],
+            target_symbols=alignment.error_symbols[:5],
             key_location=cluster.root_cause,
             evidence_alignment=alignment,
             reason=(
-                "Direct ITRS↔observed transform produces different results "
-                "than the existing path through CIRS. The rotation matrix or "
-                "position offset in the new transform is numerically inconsistent "
-                "with Astropy's established route."
+                "Two different code paths produce differing results. "
+                "A newly introduced path conflicts with an existing one."
             ),
         )
 
-    # ── FRAME_ATTRIBUTE: ITRS constructor rejects location ──
-    if frame_kw_mismatch and itrs_in_error:
+    # ── FRAME_ATTRIBUTE: constructor rejects keyword argument ──
+    if frame_kw_mismatch:
         symbols = list(dict.fromkeys(
             _extract_symbols_from_message(error_msg)
         ))
@@ -385,14 +362,13 @@ def classify_cluster(
             type=ContextDeficiencyType.API_DEFINITION,
             subtype="FRAME_ATTRIBUTE_PROPAGATION",
             confidence="high",
-            target_symbols=symbols or ["ITRS"],
+            target_symbols=symbols or ["<unknown>"],
             key_location=alignment.shared_frames[0] if alignment.shared_frames else "",
             evidence_alignment=alignment,
             reason=(
-                "ITRS frame constructor rejects `location` — it uses "
-                "`obsgeoloc`/`obsgeovel`. The agent's transform code passes "
-                "frame attributes incorrectly. Existing CIRS→observed "
-                "transforms handle this differently."
+                "A frame/class constructor rejects a keyword argument that "
+                "the agent's code passes. The constructor's interface may "
+                "differ from what the agent assumed."
             ),
         )
 

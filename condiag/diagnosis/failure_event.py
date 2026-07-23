@@ -192,53 +192,45 @@ def _param_group(test_name: str) -> str:
 def extract_failure_events(
     bundle: RuntimeFailureFeatureBundle,
 ) -> list[FailureEvent]:
-    """Build one FailureEvent per failed test from the bundle."""
+    """Build one FailureEvent per failed test from the bundle.
+
+    Uses the per-test TestFailureSignal records (P1-3A refactored extractor).
+    Each event has its own error_message, assertion_line, and stack_frames
+    correctly bound to that specific test.
+    """
     tl = bundle.test_log
+
+    # Prefer structured per-test records (P1-3A extractor)
+    records = list(tl.failures) if tl.failures else []
+
+    # Fallback for old-format bundles without per-test records
+    if not records:
+        return _legacy_extract(bundle)
+
     events: list[FailureEvent] = []
-
-    # Build index of call_chains by ordinal position
-    # (index 0 → first failed test, etc.)
-    chain_by_idx = list(tl.call_chains or [])
-
-    for i, test_name in enumerate(tl.failed_tests):
-        # Pick the matching call chain (if available), else empty
-        chain = chain_by_idx[i] if i < len(chain_by_idx) else []
-        all_frames = list(chain)  # chain is the frames for this failure
-        # If chain is empty, fall back to top-level stack_frames
-        if not all_frames:
-            all_frames = list(tl.stack_frames or [])
-
-        # First error message for this test (use global first if needed)
-        msg_index = i if i < len(tl.error_messages) else 0
-        msg = tl.error_messages[msg_index] if tl.error_messages else ""
-        assertion = tl.failure_assertions[i] if i < len(tl.failure_assertions) else ""
-
-        # Determine exception type per-event from the assertion
-        # If assertion_line is present, it's likely an AssertionError
-        has_assertion_text = bool(assertion and assertion.strip())
-        if has_assertion_text and "TypeError" not in msg:
-            exc_type = "AssertionError"
-        else:
-            # Pick top error type from the shared error_types dict
-            error_types_sorted = sorted(tl.error_types.items(), key=lambda x: -x[1])
-            exc_type = error_types_sorted[0][0] if error_types_sorted else "Unknown"
-
+    for rec in records:
+        normalized = normalize_message(rec.error_message)
         ev = FailureEvent(
-            test_name=test_name,
-            exception_type=exc_type,
-            error_class=classify_error_type(exc_type),
-            message=msg,
-            message_fingerprint=normalize_message(msg),
-            assertion_line=assertion,
-            stack_frames=all_frames,
-            call_chain=_call_chain_file_list(all_frames),
-            top_repo_frame=_first_repo_frame(all_frames),
-            is_parameterized="[" in test_name,
-            param_group=_param_group(test_name),
+            test_name=rec.test_name,
+            exception_type=rec.exception_type,
+            error_class=classify_error_type(rec.exception_type),
+            message=rec.error_message,
+            message_fingerprint=normalized,
+            assertion_line=rec.assertion_line,
+            stack_frames=list(rec.stack_frames),
+            call_chain=_call_chain_file_list(rec.stack_frames),
+            top_repo_frame=rec.root_frame,
+            is_parameterized="[" in rec.test_name,
+            param_group=_param_group(rec.test_name),
         )
         events.append(ev)
 
     return events
+
+
+def _legacy_extract(bundle: RuntimeFailureFeatureBundle) -> list[FailureEvent]:
+    """Fallback for old-format bundles without per-test records."""
+    tl = bundle.test_log
 
 
 # ── Deterministic clustering ────────────────────────────────────────
@@ -303,7 +295,7 @@ def cluster_failures(events: list[FailureEvent]) -> list[FailureCluster]:
             unassigned.remove(e)
         _finish_cluster(clusters, group)
 
-    # 4. Same error_class + call-chain overlap ≥ 2
+    # 4. Same error_class + call-chain overlap ≥ 2 (conservative: must share ≥2 frames)
     unused_here = list(unassigned)
     for e1 in unused_here:
         if e1 not in unassigned:
@@ -318,14 +310,11 @@ def cluster_failures(events: list[FailureEvent]) -> list[FailureCluster]:
                     unassigned.remove(e2)
         _finish_cluster(clusters, group)
 
-    # 5. Remaining unassigned → one cluster per error_class
-    remaining_by_class: dict[str, list[FailureEvent]] = {}
-    for e in unassigned:
-        remaining_by_class.setdefault(e.error_class, []).append(e)
-    for ec, group in remaining_by_class.items():
-        for e in group:
-            unassigned.remove(e)
-        _finish_cluster(clusters, group)
+    # 5. Remaining: each event is its OWN singleton cluster
+    # NEVER force-merge by error class alone — evidence is insufficient.
+    for e in list(unassigned):
+        unassigned.remove(e)
+        _finish_cluster(clusters, [e])
 
     return clusters
 
@@ -347,18 +336,23 @@ def _finish_cluster(
         for frame_key in e.call_chain:
             call_chains_seen.add(frame_key)
 
-    # Shared frames: find frames present in ALL events' call chains
+    # Shared frames: find frames present in ALL events' call chains.
+    # Preserve order from the FIRST event's call chain for determinism.
     if len(events) > 1:
         chain_sets = [set(e.call_chain) for e in events]
         common = chain_sets[0]
         for cs in chain_sets[1:]:
             common &= cs
-        call_chain_common = sorted(common, key=lambda x: list(chain_sets[0]).index(x) if x in chain_sets[0] else 99)
+        # Order by first event's call chain (deterministic since list order is stable)
+        ordered_common = [f for f in events[0].call_chain if f in common]
+        call_chain_common = ordered_common
+    else:
+        call_chain_common = list(events[0].call_chain)
 
     first = events[0]
     cluster = FailureCluster(
         events=events,
-        cluster_id=_cluster_id(first, events),
+        cluster_id=_cluster_id(events),
         primary_error_class=first.error_class,
         shared_top_frame=first.top_repo_frame or "",
         message_fingerprint=first.message_fingerprint,
@@ -373,11 +367,14 @@ def _finish_cluster(
     clusters.append(cluster)
 
 
-def _cluster_id(first: FailureEvent, events: list[FailureEvent]) -> str:
-    """Deterministic short ID for this cluster."""
+def _cluster_id(events: list[FailureEvent]) -> str:
+    """Deterministic cluster ID from sorted canonical members."""
+    canonical = sorted(
+        f"{e.test_name}|{e.error_class}|{e.message_fingerprint}|{e.top_repo_frame}"
+        for e in events
+    )
     import hashlib
-    raw = first.error_class + "|" + first.message_fingerprint + "|" + str(len(events))
-    return "C" + hashlib.sha256(raw.encode()).hexdigest()[:7]
+    return "C" + hashlib.sha256("\n".join(canonical).encode()).hexdigest()[:7]
 
 
 # ── API ─────────────────────────────────────────────────────────────

@@ -45,6 +45,38 @@ class StackFrame(BaseModel):
     is_repo_frame: bool = Field(True, description="False if from site-packages or system libs")
 
 
+class TestFailureSignal(BaseModel):
+    """One failed test with its own error message, stack, and traceback.
+
+    Parsed from a single pytest failure section:
+      _________________ test_name _________________
+      ...
+      E  TypeError: ...
+      ...
+      path/file.py:LINE: in func_name
+      ...
+
+    This is the per-test record that P1-3A clustering uses.
+    All aggregate fields in TestLogSignals are derived from these records.
+    """
+
+    test_name: str = Field(description="Full test name (e.g. test_icrs_cirs)")
+    exception_type: str = Field(default="Unknown", description="Python exception class name")
+    error_message: str = Field(default="", description="Full error line text")
+    error_message_normalized: str = Field(default="", description="Normalized/fingerprinted message")
+    assertion_line: str = Field(
+        default="",
+        description="The source code line that triggered the failure (the '>       ' line)",
+    )
+    stack_frames: list[StackFrame] = Field(
+        default_factory=list,
+        description="Stack frames for THIS test only, in order of appearance",
+    )
+    # Earliest non-test, non-system frame = most likely root cause
+    root_frame: str = Field(default="", description="First repo frame beyond test infrastructure")
+    raw_excerpt: str = Field(default="", description="Raw text of the failure section")
+
+
 # ════════════════════════════════════════════════════════════════════
 # Layer 1: Raw extraction outputs (one per data source)
 # ════════════════════════════════════════════════════════════════════
@@ -110,6 +142,15 @@ class TestLogSignals(BaseModel):
     call_chains: list[list[StackFrame]] = Field(
         default_factory=list,
         description="Each failure's call chain as an ordered list of frames; one entry per FAILED test",
+    )
+
+    # -- Per-test failure records (P1-3A structured format) --
+    failures: list[TestFailureSignal] = Field(
+        default_factory=list,
+        description="Per-test parsed failure records; one per failed test, with correct "
+                    "error_message/assertion_line/stack_frames bound to this test only. "
+                    "Derived aggregate fields (failed_tests, error_messages, etc.) remain "
+                    "for backward compatibility.",
     )
 
 
