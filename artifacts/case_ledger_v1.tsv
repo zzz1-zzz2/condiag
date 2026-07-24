@@ -1,0 +1,3 @@
+instance_id	repo	R1_status	patch_valid	witness_valid	bundle	eligible	result	failure_count	calls	note
+astropy__astropy-13398	astropy/astropy	submitted	yes	yes	yes	yes	ELIGIBLE_CODE_FAILURE	10	51	
+django__django-13513	django/django	submitted	empty	no	no	no	INVALID_INFRA	0	59	R1 only created empty patch.txt; harness errored
