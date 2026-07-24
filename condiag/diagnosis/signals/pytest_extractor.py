@@ -144,6 +144,41 @@ def _parse_test_section(lines: list[str], start: int) -> tuple[TestFailureSignal
             frames.append(frame)
 
         # File format frame: File "path", line N, in func
+        # Strip leading whitespace because sympy traceback has "  File..."
+        ff = re.match(
+            r'File\s+"([^"]+)",\s*line\s+(\d+)(?:,\s*in\s+(\w+))?',
+            stripped if stripped.startswith("File") else stripped.lstrip(),
+        )
+        if ff:
+            fpath2 = ff.group(1)
+            if fpath2.startswith("/testbed/"):
+                fpath2 = fpath2[len("/testbed/"):]
+            frame2 = normalize_frame(fpath2, line=int(ff.group(2)), function=ff.group(3) or "")
+            frames.append(frame2)
+            # If we see a File format frame and the error is not set yet,
+            # look ahead for a bare assert line or error name (sympy-style)
+            if not error_msg:
+                ji = i + 1
+                # Skip blank lines
+                while ji < len(lines) and not lines[ji].strip():
+                    ji += 1
+                if ji < len(lines):
+                    nxt = lines[ji].strip()
+                    # bare assert line without ">" prefix (sympy style)
+                    if nxt.startswith("assert "):
+                        assertion_lines.append(f">       {nxt}")
+                        # Check one more line for bare error name
+                        ji2 = ji + 1
+                        while ji2 < len(lines) and not lines[ji2].strip():
+                            ji2 += 1
+                        if ji2 < len(lines):
+                            nxt2 = lines[ji2].strip()
+                            em2 = re.match(r"^(\w+(?:Error|Exception|Failure))\s*", nxt2)
+                            if em2:
+                                exception_type = em2.group(1)
+                                error_msg = f"{em2.group(1)}:"
+
+        # File format frame: File "path", line N, in func
         # (less common in test sections, but handle)
         ff = re.match(r'File\s+"([^"]+)",\s*line\s+(\d+)(?:,\s*in\s+(\w+))?', stripped)
         if ff:
@@ -248,15 +283,33 @@ _RE_PASSED_LINE = re.compile(r"^PASSED\s+(\S+(?:::\S+)?)\s*$")
 
 
 def _extract_from_summary(signals: TestLogSignals, lines: list[str]) -> None:
-    """Extract FAILED/PASSED test names and counts from summary."""
+    """Extract FAILED/PASSED test names and counts from summary.
+
+    Supports multiple formats:
+      - Standard pytest:  FAILED path/to/test.py::test_name
+      - SymPy pytest:     test_name ok [FAIL]  (inline suffix)
+      - Standard pytest:  PASSED path/to/test.py::test_name
+    """
     for line in lines:
         stripped = line.strip()
 
+        # Standard FAILED lines: FAILED path/to/test.py::test_name
         m = _RE_FAILED_LINE.match(stripped)
         if m:
             signals.failed_tests.append(m.group(1))
             continue
 
+        # SymPy-style inline [FAIL]: "test_xxx ok [FAIL]"
+        if "[FAIL]" in stripped and not stripped.startswith("#"):
+            # Extract test name: fields before 'ok' or similar
+            parts = stripped.split()
+            if parts and not parts[0].startswith("__"):
+                test_name = parts[0]
+                if test_name not in signals.failed_tests:
+                    signals.failed_tests.append(test_name)
+            continue
+
+        # Standard PASSED lines
         m = _RE_PASSED_LINE.match(stripped)
         if m:
             signals.passed_tests.append(m.group(1))
