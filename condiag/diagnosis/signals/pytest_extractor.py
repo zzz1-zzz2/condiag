@@ -40,6 +40,16 @@ from condiag.diagnosis.signals.frame_normalizer import normalize_frame
 
 logger = logging.getLogger("condiag.diagnosis.signals.pytest_extractor")
 
+# ── ANSI escape code stripping ────────────────────────────────────
+
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape codes from a string."""
+    return _ANSI_ESCAPE.sub("", text)
+
+
 # ── Section boundaries ──────────────────────────────────────────────
 
 # FAILURES header (trailing ... due to line length in some logs)
@@ -218,6 +228,8 @@ def _parse_test_section(lines: list[str], start: int) -> tuple[TestFailureSignal
 def extract_test_log(test_log_path: str | Path) -> TestLogSignals:
     """Extract per-test failure records from a pytest-format test_log file."""
     raw = Path(test_log_path).read_text(encoding="utf-8", errors="replace")
+    # Strip ANSI escape codes (colorized pytest output)
+    raw = _strip_ansi(raw)
     lines = raw.split("\n")
 
     signals = TestLogSignals(framework=TestFramework.PYTEST)
@@ -421,6 +433,9 @@ def _reconcile_failures(signals: TestLogSignals) -> None:
         status = "exact"
     elif exact_matches == len(section_names) == len(summary_leafs):
         status = "count_only"
+    elif not section_names and summary_leafs:
+        # No FAILURES section but summary has FAILED entries (ANSI-stripped output)
+        status = "summary_only"
     else:
         status = "unmatched"
         raise FailureBindingError(

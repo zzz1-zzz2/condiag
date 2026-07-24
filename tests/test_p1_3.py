@@ -294,15 +294,21 @@ class TestEdgeCases:
 def _find_real_canary_log() -> Path | None:
     """Locate a real pytest-format test_output.txt from past canary runs.
 
-    Searches logs/ first, then canary output captures under /tmp.
-    Returns None when no log is found (tests skip in that case).
+    Searches logs/ first. Prefers logs with proper FAILURES sections
+    (classic pytest format with test sections).
+    Returns None when no log is found (tests skip).
     """
     repo_logs = Path("logs/run_evaluation")
     if repo_logs.exists():
-        # Use the most recent canary directory
         candidates = sorted(repo_logs.glob("*/condiag-agent/*/test_output.txt"),
                             key=lambda p: p.stat().st_mtime, reverse=True)
         if candidates:
+            # Prefer astropy-style logs with FAILURES sections over
+            # ANSI-colored or sympy-style bare summaries
+            for c in candidates:
+                text = c.read_text(encoding="utf-8", errors="replace")
+                if "FAILURES" in text and "FAILED" in text:
+                    return c
             return candidates[0]
     return None
 

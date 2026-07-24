@@ -202,10 +202,25 @@ def extract_failure_events(
 
     # Prefer structured per-test records (P1-3A extractor)
     records = list(tl.failures) if tl.failures else []
+    events: list[FailureEvent] = []
 
-    # Require per-test records. Old aggregate arrays cannot reliably
-    # reconstruct per-test bindings (error_messages deduplicated, frames
-    # divided naively). Re-extract from raw test_log instead.
+    # Fallback: if no per-test records but failed_tests exist (summary-only
+    # logs without FAILURES sections, like ANSI-stripped output), build
+    # minimal events from the plain test name list.
+    if not records and tl.failed_tests:
+        for tn in tl.failed_tests:
+            events.append(FailureEvent(
+                test_name=tn,
+                exception_type="Unknown",
+                error_class=classify_error_type("Unknown"),
+                message="",
+                message_fingerprint="",
+                is_parameterized="[" in tn,
+                param_group=_param_group(tn),
+            ))
+        return events
+
+    # Require per-test records for proper analysis.
     if not records:
         raise ValueError(
             "extract_failure_events: bundle has 0 per-test failure records. "
@@ -213,7 +228,6 @@ def extract_failure_events(
             "to produce structured TestFailureSignals before clustering."
         )
 
-    events: list[FailureEvent] = []
     for rec in records:
         normalized = normalize_message(rec.error_message)
         ev = FailureEvent(
