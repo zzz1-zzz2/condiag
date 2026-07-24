@@ -94,10 +94,23 @@ class OfficialHarnessGateway:
         swe_instance = self._build_swebench_instance(instance_spec)
 
         from swebench.harness.test_spec.test_spec import make_test_spec
-        try:
-            test_spec = make_test_spec(swe_instance, namespace=SWEBENCH_NAMESPACE)
-        except Exception as e:
-            return EvalResult(status="ERROR", error_info=f"make_test_spec: {e}", duration_seconds=time.time() - t0)
+        # Retry make_test_spec up to 3 times — the requirements download
+        # from raw.githubusercontent.com has intermittent SSL errors
+        # through certain proxy configurations.
+        test_spec = None
+        _last_error = None
+        for _attempt in range(3):
+            try:
+                test_spec = make_test_spec(swe_instance, namespace=SWEBENCH_NAMESPACE)
+                break
+            except Exception as e:
+                _last_error = e
+                logger.info("make_test_spec attempt %d failed: %s", _attempt + 1, e)
+                import time
+                time.sleep(2)
+        if test_spec is None:
+            return EvalResult(status="ERROR", error_info=f"make_test_spec: {_last_error}",
+                              duration_seconds=time.time() - t0)
 
         # Verify images exist locally (reuse check)
         client = self.docker_client
