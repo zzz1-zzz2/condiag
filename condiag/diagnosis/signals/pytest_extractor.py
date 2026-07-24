@@ -434,16 +434,15 @@ def _reconcile_failures(signals: TestLogSignals) -> None:
     elif exact_matches == len(section_names) == len(summary_leafs):
         status = "count_only"
     elif not section_names and summary_leafs:
-        # No FAILURES section but summary has FAILED entries (ANSI-stripped output)
+        # No FAILURES section but summary has FAILED entries (ANSI-stripped or sympy format)
         status = "summary_only"
+    elif section_names and not summary_leafs:
+        # Sections exist but summary is empty (weird format) — use sections as source of truth
+        status = "section_only"
     else:
-        status = "unmatched"
-        raise FailureBindingError(
-            f"Section/summary mismatch: {len(unmatched_sections)} unmatched sections, "
-            f"{len(unmatched_summary)} unmatched summary entries. "
-            f"Unmatched sections: {unmatched_sections}. "
-            f"Unmatched summary: {unmatched_summary}"
-        )
+        # Partial mismatch — still record as mismatched but don't crash the pipeline.
+        # The extractor keeps both sources; callers can decide which to trust.
+        status = "partial_mismatch"
 
     signals.reconciliation = FailureReconciliation(
         section_count=len(section_names),
