@@ -93,24 +93,26 @@ class OfficialHarnessGateway:
         pred = {"instance_id": iid, "model_name_or_path": self.model_name, "model_patch": model_patch or ""}
         swe_instance = self._build_swebench_instance(instance_spec)
 
+        # Monkey-patch requests to skip SSL verification for
+        # raw.githubusercontent.com downloads. The proxy at 127.0.0.1:7890
+        # intermittently breaks SSL validation. Since we only download
+        # requirements.txt (not sensitive data), verify=False is safe.
+        import requests as _req
+        import urllib3 as _urllib3
+        _urllib3.disable_warnings()
+        _original_send = _req.Session.send
+        def _patched_send(self, request, **kwargs):
+            kwargs['verify'] = False
+            return _original_send(self, request, **kwargs)
+        _req.Session.send = _patched_send
+
         from swebench.harness.test_spec.test_spec import make_test_spec
-        # Retry make_test_spec up to 3 times — the requirements download
-        # from raw.githubusercontent.com has intermittent SSL errors
-        # through certain proxy configurations.
-        test_spec = None
-        _last_error = None
-        for _attempt in range(3):
-            try:
-                test_spec = make_test_spec(swe_instance, namespace=SWEBENCH_NAMESPACE)
-                break
-            except Exception as e:
-                _last_error = e
-                logger.info("make_test_spec attempt %d failed: %s", _attempt + 1, e)
-                import time
-                time.sleep(2)
-        if test_spec is None:
-            return EvalResult(status="ERROR", error_info=f"make_test_spec: {_last_error}",
-                              duration_seconds=time.time() - t0)
+        try:
+            test_spec = make_test_spec(swe_instance, namespace=SWEBENCH_NAMESPACE)
+        except Exception as e:
+            return EvalResult(status="ERROR", error_info=f"make_test_spec: {e}", duration_seconds=time.time() - t0)
+        finally:
+            _req.Session.send = _original_send
 
         # Verify images exist locally (reuse check)
         client = self.docker_client
@@ -144,6 +146,12 @@ class OfficialHarnessGateway:
             test_log_path=tl, report_log_path=rl,
             duration_seconds=time.time() - t0, mode="official",
         )
+
+    @staticmethod
+    def _get_req_paths(repo: str) -> list[str]:
+        """Get requirements file paths for a repo, or empty list if none."""
+        from swebench.harness.constants import MAP_REPO_TO_REQS_PATHS
+        return MAP_REPO_TO_REQS_PATHS.get(repo, [])
 
     def _build_swebench_instance(self, spec) -> dict:
         """Build SWE-bench instance dict from InstanceSpec.
